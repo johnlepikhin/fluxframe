@@ -5,6 +5,7 @@
 //! output classification and "virtual" detection are heuristic.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Functional classification of a V4L2 device entry.
@@ -37,34 +38,82 @@ pub struct V4l2Device {
     pub kind: V4l2DeviceKind,
 }
 
+/// Outcome of an enumeration attempt — keeps the three "empty" cases
+/// distinct so the CLI can render a precise hint rather than the catch-all
+/// "check that the kernel exposes the V4L2 sysfs tree" message.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum EnumerationStatus {
+    /// `/sys/class/video4linux` does not exist — kernel does not expose
+    /// V4L2 (rare on a desktop kernel), or sysfs itself is not mounted
+    /// (containers without `/sys` propagation).
+    SysfsAbsent,
+    /// `/sys/class/video4linux` exists but `read_dir` failed (typically
+    /// EACCES from MAC/sandbox policies).  The `io::ErrorKind` is kept so
+    /// callers can branch on permission vs other failures.
+    SysfsUnreadable(io::ErrorKind),
+    /// `/sys/class/video4linux` is readable but contains no `video*`
+    /// entries.  This is the "no cameras attached and no v4l2loopback
+    /// loaded" case — qualitatively different from `SysfsAbsent`.
+    NoDevices,
+    /// One or more devices were enumerated.
+    Found(Vec<V4l2Device>),
+}
+
 /// Enumerate the V4L2 devices visible to the system.
 ///
 /// Reads `/sys/class/video4linux` and joins basenames against `/dev`.
-/// Errors during reads (e.g. permission denied on a single device) are
-/// logged via `tracing::debug` and the affected entry is skipped — the
-/// function returns whatever it could read successfully.
+/// Errors during per-device reads (e.g. permission denied on a single
+/// entry) are logged via `tracing::trace` and the affected entry is
+/// skipped — the function returns whatever it could read successfully.
 ///
-/// Returns an empty vector when `/sys/class/video4linux` is absent
-/// (e.g. inside some containers, on non-Linux platforms — though gst's
-/// `compile_error!` already prevents the latter).
+/// Returns an empty vector when `/sys/class/video4linux` is absent OR
+/// readable-but-empty.  Use [`enumerate_devices_status`] if you need to
+/// distinguish those two cases (the CLI does, to render different hints).
 #[must_use]
 pub fn enumerate_devices() -> Vec<V4l2Device> {
-    enumerate_devices_in(Path::new("/sys/class/video4linux"), Path::new("/dev"))
+    match enumerate_devices_status() {
+        EnumerationStatus::Found(v) => v,
+        _ => Vec::new(),
+    }
 }
 
 /// Same as [`enumerate_devices`] but reads from caller-supplied roots.
 ///
-/// `sys_root` is the directory whose subdirectories name video device
-/// entries (production: `/sys/class/video4linux`); `dev_root` is the
-/// directory that holds the matching character-device nodes (production:
-/// `/dev`).  Both are exposed so unit tests can drive a synthetic layout
-/// without having to mount or bind-mount anything — the test passes
-/// `dev_root = tmp_dev` and inspects `device.path == tmp_dev/video0`.
+/// See [`enumerate_devices_status_in`] for the rationale on having an
+/// `_in` variant.
 #[must_use]
 pub fn enumerate_devices_in(sys_root: &Path, dev_root: &Path) -> Vec<V4l2Device> {
-    let Ok(entries) = fs::read_dir(sys_root) else {
-        tracing::debug!(?sys_root, "sysfs root not present");
-        return Vec::new();
+    match enumerate_devices_status_in(sys_root, dev_root) {
+        EnumerationStatus::Found(v) => v,
+        _ => Vec::new(),
+    }
+}
+
+/// Like [`enumerate_devices`] but returns an [`EnumerationStatus`] so the
+/// caller can tell the three "empty" cases apart.
+#[must_use]
+pub fn enumerate_devices_status() -> EnumerationStatus {
+    enumerate_devices_status_in(Path::new("/sys/class/video4linux"), Path::new("/dev"))
+}
+
+/// Testable form of [`enumerate_devices_status`] — `sys_root` is the
+/// directory whose subdirectories name video device entries (production:
+/// `/sys/class/video4linux`); `dev_root` is the directory that holds the
+/// matching character-device nodes (production: `/dev`).  Both are exposed
+/// so unit tests can drive a synthetic layout without bind-mounting.
+#[must_use]
+pub fn enumerate_devices_status_in(sys_root: &Path, dev_root: &Path) -> EnumerationStatus {
+    let entries = match fs::read_dir(sys_root) {
+        Ok(it) => it,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            tracing::debug!(?sys_root, "sysfs root absent");
+            return EnumerationStatus::SysfsAbsent;
+        }
+        Err(e) => {
+            tracing::debug!(?sys_root, error = %e, "sysfs root unreadable");
+            return EnumerationStatus::SysfsUnreadable(e.kind());
+        }
     };
 
     let mut out: Vec<V4l2Device> = entries
@@ -76,8 +125,11 @@ pub fn enumerate_devices_in(sys_root: &Path, dev_root: &Path) -> Vec<V4l2Device>
         })
         .filter_map(|e| inspect_entry(&e.path(), dev_root))
         .collect();
+    if out.is_empty() {
+        return EnumerationStatus::NoDevices;
+    }
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
+    EnumerationStatus::Found(out)
 }
 
 fn inspect_entry(entry: &Path, dev_root: &Path) -> Option<V4l2Device> {
@@ -222,5 +274,38 @@ mod tests {
         let dev = TempDirGuard::new("dev-missing");
         let path = Path::new("/nonexistent/sysfs/path");
         assert!(enumerate_devices_in(path, dev.path()).is_empty());
+    }
+
+    #[test]
+    fn status_reports_sysfs_absent() {
+        let dev = TempDirGuard::new("dev-status-absent");
+        let path = Path::new("/nonexistent/sysfs/path");
+        assert!(matches!(
+            enumerate_devices_status_in(path, dev.path()),
+            EnumerationStatus::SysfsAbsent
+        ));
+    }
+
+    #[test]
+    fn status_reports_no_devices_for_empty_dir() {
+        let sys = TempDirGuard::new("sys-empty");
+        let dev = TempDirGuard::new("dev-empty");
+        // sys directory exists (TempDirGuard::new created it) but is empty.
+        assert!(matches!(
+            enumerate_devices_status_in(sys.path(), dev.path()),
+            EnumerationStatus::NoDevices
+        ));
+    }
+
+    #[test]
+    fn status_reports_found_for_populated_dir() {
+        let sys = TempDirGuard::new("sys-populated");
+        let dev = TempDirGuard::new("dev-populated");
+        make_fake_sys(sys.path());
+        let found = match enumerate_devices_status_in(sys.path(), dev.path()) {
+            EnumerationStatus::Found(v) => v,
+            other => panic!("expected Found, got {other:?}"),
+        };
+        assert_eq!(found.len(), 3);
     }
 }

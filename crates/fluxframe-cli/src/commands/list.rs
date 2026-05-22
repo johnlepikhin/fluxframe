@@ -5,7 +5,7 @@
 //! classification is heuristic — see [`fluxframe_gst::V4l2DeviceKind`].
 
 use fluxframe_core::FluxError;
-use fluxframe_gst::{V4l2Device, V4l2DeviceKind, enumerate_devices};
+use fluxframe_gst::{EnumerationStatus, V4l2Device, V4l2DeviceKind, enumerate_devices_status};
 use tracing::info;
 
 use crate::cli::ListArgs;
@@ -21,14 +21,38 @@ use crate::cli::ListArgs;
     reason = "signature mirrors other command handlers; Stage 5 may add real failures"
 )]
 pub fn run(_args: ListArgs) -> Result<(), FluxError> {
-    let devices = enumerate_devices();
-    if devices.is_empty() {
-        println!("No V4L2 devices found under /sys/class/video4linux.");
-        println!("If this is unexpected, check that:");
-        println!("  - the kernel exposes the V4L2 sysfs tree (`ls /sys/class/video4linux`)");
-        println!("  - your user can read those entries");
-        return Ok(());
-    }
+    let devices = match enumerate_devices_status() {
+        EnumerationStatus::SysfsAbsent => {
+            println!("No V4L2 devices: /sys/class/video4linux is not present.");
+            println!("If this is unexpected, check that:");
+            println!("  - the kernel exposes V4L2 (CONFIG_VIDEO_DEV)");
+            println!("  - sysfs is mounted (containers may need an explicit /sys mount)");
+            return Ok(());
+        }
+        EnumerationStatus::SysfsUnreadable(kind) => {
+            println!("No V4L2 devices: /sys/class/video4linux is not readable ({kind:?}).");
+            println!("If this is unexpected, check that:");
+            println!("  - your user can read /sys/class/video4linux entries");
+            println!("  - LSM/sandbox policy (AppArmor, SELinux, seccomp) is not blocking it");
+            return Ok(());
+        }
+        EnumerationStatus::NoDevices => {
+            println!("No V4L2 devices: /sys/class/video4linux is empty.");
+            println!("No cameras are attached and no v4l2loopback is loaded. To get devices:");
+            println!("  - plug in a USB camera");
+            println!(
+                "  - load v4l2loopback for a virtual sink: `sudo modprobe v4l2loopback devices=1 video_nr=10 card_label=\"FluxFrame Camera\" exclusive_caps=1`"
+            );
+            return Ok(());
+        }
+        EnumerationStatus::Found(v) => v,
+        // `EnumerationStatus` is `#[non_exhaustive]`; future variants
+        // surface here with a generic message until `list` learns them.
+        _ => {
+            println!("No V4L2 devices: enumeration returned an unsupported status.");
+            return Ok(());
+        }
+    };
 
     let (inputs, outputs) = partition(&devices);
 
