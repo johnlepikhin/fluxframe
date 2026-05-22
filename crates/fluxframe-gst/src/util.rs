@@ -118,11 +118,8 @@ impl Access {
 /// which is what we actually want to hand to the GStreamer element.
 fn validate_v4l2_device_path(device: &Path, access: Access) -> Result<PathBuf, PipelineError> {
     let canon = std::fs::canonicalize(device).map_err(|e| {
-        access.err(
-            device,
-            format!("cannot canonicalize path: {e}"),
-            "verify the device path",
-        )
+        let (reason, hint) = canonicalize_failure_hint(device, access, &e);
+        access.err(device, reason, hint)
     })?;
     if !canon.starts_with("/dev/") {
         tracing::warn!(
@@ -148,6 +145,38 @@ fn validate_v4l2_device_path(device: &Path, access: Access) -> Result<PathBuf, P
     }
     tracing::debug!(canonical = %canon.display(), original = %device.display(), "device path validated");
     Ok(canon)
+}
+
+/// Map a `canonicalize` failure on a V4L2 device path into a structured
+/// `(reason, hint)` pair.  The generic "verify the device path" hint is a
+/// poor diagnostic for the common `NotFound` case (missing loopback,
+/// camera unplugged) — operators repeatedly hit it without learning
+/// anything actionable.  This helper differentiates by `io::ErrorKind`
+/// and by access side so the hint actually points at the fix.
+fn canonicalize_failure_hint(
+    device: &Path,
+    access: Access,
+    err: &io::Error,
+) -> (String, &'static str) {
+    let device_disp = device.display().to_string();
+    match (err.kind(), access) {
+        (io::ErrorKind::NotFound, Access::Output) => (
+            format!("device {device_disp} does not exist"),
+            "load v4l2loopback for a virtual sink (`sudo modprobe v4l2loopback devices=1 video_nr=10 card_label=\"FluxFrame Camera\" exclusive_caps=1`) or run `fluxframe list` to see available outputs",
+        ),
+        (io::ErrorKind::NotFound, Access::Input) => (
+            format!("device {device_disp} does not exist"),
+            "plug in a camera and check `fluxframe list`; for synthetic input use `--input testsrc`",
+        ),
+        (io::ErrorKind::PermissionDenied, _) => (
+            format!("permission denied while resolving {device_disp}"),
+            "check that your user can stat the device (typically: add to the `video` group)",
+        ),
+        _ => (
+            format!("path resolution failed: {err}"),
+            "verify the device path",
+        ),
+    }
 }
 
 /// Map an `io::Error` from a v4l2 device open into a structured pipeline
@@ -304,6 +333,42 @@ mod tests {
             assert!(
                 hint.contains("device") || hint.contains("check"),
                 "hint should be actionable, got: {hint}"
+            );
+        } else {
+            panic!("expected InputDeviceUnavailable");
+        }
+    }
+
+    #[test]
+    fn output_not_found_hint_mentions_loopback() {
+        let path = Path::new("/dev/this-device-cannot-exist-fluxframe");
+        let err = check_v4l2_output_access(path).expect_err("missing");
+        if let PipelineError::OutputDeviceUnavailable { reason, hint, .. } = err {
+            assert!(
+                reason.contains("does not exist"),
+                "reason should call out non-existence, got: {reason}"
+            );
+            assert!(
+                hint.contains("v4l2loopback") && hint.contains("fluxframe list"),
+                "output hint should point at v4l2loopback + `fluxframe list`, got: {hint}"
+            );
+        } else {
+            panic!("expected OutputDeviceUnavailable");
+        }
+    }
+
+    #[test]
+    fn input_not_found_hint_mentions_testsrc() {
+        let path = Path::new("/dev/this-device-cannot-exist-fluxframe");
+        let err = check_v4l2_input_access(path).expect_err("missing");
+        if let PipelineError::InputDeviceUnavailable { reason, hint, .. } = err {
+            assert!(
+                reason.contains("does not exist"),
+                "reason should call out non-existence, got: {reason}"
+            );
+            assert!(
+                hint.contains("testsrc") && hint.contains("fluxframe list"),
+                "input hint should mention testsrc + `fluxframe list`, got: {hint}"
             );
         } else {
             panic!("expected InputDeviceUnavailable");
