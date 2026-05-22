@@ -494,9 +494,21 @@ impl BlurConfig {
 
 /// Build an [`EffectError::InvalidConfig`] with the effect name pre-filled.
 fn invalid_config(reason: impl Into<String>) -> EffectError {
+    let reason = reason.into();
+    // serde's `missing field` wording is stable enough to key the hint on,
+    // and it's the case operators hit most often when they forget `--model`.
+    let hint = if reason.contains("missing field `model`") {
+        Some(
+            "pass `--model <path/to/segmentation.onnx>` or set `[effects.background_blur].model` in the config TOML"
+                .into(),
+        )
+    } else {
+        None
+    };
     EffectError::InvalidConfig {
         name: BackgroundBlurEffect::NAME.to_string(),
-        reason: reason.into(),
+        reason,
+        hint,
     }
 }
 

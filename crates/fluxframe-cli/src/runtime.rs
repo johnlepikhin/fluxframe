@@ -262,6 +262,12 @@ where
     fluxframe_gst::init()?;
 
     let (input, output, processing_ctx, sink_label) = build_pipelines(cfg, input_builder)?;
+    // Configure must precede prepare: effects parse their per-effect TOML
+    // table here, surface `InvalidConfig` for missing fields (e.g.
+    // `background_blur` requires `model`) before resource acquisition.
+    chain
+        .configure_all(&cfg.effects.per_effect)
+        .map_err(FluxError::from)?;
     chain
         .prepare_all(&processing_ctx)
         .map_err(FluxError::from)?;

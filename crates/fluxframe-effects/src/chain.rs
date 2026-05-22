@@ -4,10 +4,12 @@
 //! — propagate the first error).  Stage 5 (realtime hardening) extends
 //! this with the full policy set from §26.
 
+use std::collections::BTreeMap;
+
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
 use fluxframe_core::frame::VideoFrame;
-use fluxframe_core::traits::VideoEffect;
+use fluxframe_core::traits::{RawEffectParams, VideoEffect};
 
 /// Ordered list of effects executed sequentially per frame.
 pub struct EffectChain {
@@ -38,6 +40,32 @@ impl EffectChain {
     #[must_use]
     pub fn names(&self) -> Vec<&'static str> {
         self.effects.iter().map(|e| e.name()).collect()
+    }
+
+    /// Run `configure` on every effect, passing the matching per-effect
+    /// TOML table from `per_effect_params` (or an empty table when the
+    /// effect has no entry).  Must be called before [`Self::prepare_all`];
+    /// effects that require configuration (e.g. `background_blur` needs a
+    /// `model`) surface a structured `EffectError::InvalidConfig` here
+    /// rather than the more cryptic "prepare called before configure" from
+    /// downstream lifecycle stages.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`EffectError`] produced by `configure`;
+    /// subsequent effects are not configured.
+    pub fn configure_all(
+        &mut self,
+        per_effect_params: &BTreeMap<String, toml::Value>,
+    ) -> Result<(), EffectError> {
+        for effect in &mut self.effects {
+            let params: RawEffectParams = per_effect_params
+                .get(effect.name())
+                .cloned()
+                .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+            effect.configure(params)?;
+        }
+        Ok(())
     }
 
     /// Run `prepare` on every effect in order.

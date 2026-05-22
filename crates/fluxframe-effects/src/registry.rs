@@ -93,18 +93,23 @@ impl EffectRegistry {
         &self,
         names: &[S],
     ) -> Result<crate::chain::EffectChain, EffectError> {
-        let effects: Vec<Box<dyn VideoEffect>> = names
-            .iter()
-            .map(|name| {
-                let n = name.as_ref();
-                self.get(n)
-                    .map(EffectFactory::build)
-                    .ok_or_else(|| EffectError::InvalidConfig {
+        let effects: Vec<Box<dyn VideoEffect>> =
+            names
+                .iter()
+                .map(|name| {
+                    let n = name.as_ref();
+                    self.get(n).map(EffectFactory::build).ok_or_else(|| {
+                        EffectError::InvalidConfig {
                         name: n.to_string(),
                         reason: "unknown effect: not registered".into(),
+                        hint: Some(
+                            "see `fluxframe check --effect <name>` for the list of built-in effects"
+                                .into(),
+                        ),
+                    }
                     })
-            })
-            .collect::<Result<_, _>>()?;
+                })
+                .collect::<Result<_, _>>()?;
         Ok(crate::chain::EffectChain::new(effects))
     }
 }

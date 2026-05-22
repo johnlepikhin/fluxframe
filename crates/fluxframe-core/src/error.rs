@@ -33,9 +33,14 @@ pub enum EffectError {
     /// The effect's configuration payload (TOML section) failed validation.
     ///
     /// Raised before any frame is processed, typically from
-    /// `VideoEffect::configure`.
+    /// `VideoEffect::configure`.  `hint` is rendered as the §27 "Hint:"
+    /// line when present (e.g. "supply --model").
     #[error("effect '{name}' configuration is invalid: {reason}")]
-    InvalidConfig { name: String, reason: String },
+    InvalidConfig {
+        name: String,
+        reason: String,
+        hint: Option<String>,
+    },
 
     /// The effect failed during its one-time preparation step.
     ///
@@ -313,7 +318,8 @@ impl Diagnostic for FluxError {
 
     fn hint(&self) -> Option<&str> {
         match self {
-            FluxError::Config { hint, .. } => hint.as_deref(),
+            FluxError::Config { hint, .. }
+            | FluxError::Effect(EffectError::InvalidConfig { hint, .. }) => hint.as_deref(),
             FluxError::Pipeline(
                 PipelineError::MissingElement { hint, .. }
                 | PipelineError::InputDeviceUnavailable { hint, .. }
