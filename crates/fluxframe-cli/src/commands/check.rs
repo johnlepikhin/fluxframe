@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use fluxframe_core::{FluxConfig, FluxError, normalise_effect_name};
+#[cfg(feature = "ml")]
 use fluxframe_effects::ml::OnnxEngine;
 use fluxframe_gst::{V4l2DeviceKind, enumerate_devices};
 use tracing::{info, warn};
@@ -30,6 +31,10 @@ pub fn run(args: CheckArgs) -> Result<(), FluxError> {
         width: None,
         height: None,
         fps: None,
+        // Clone because the same `args.common.model` is consulted again
+        // below for the dedicated `check_model_file` pass; moving the
+        // PathBuf here would invalidate that borrow.
+        model: args.common.model.clone(),
     };
     let cfg = load(args.common.config.as_deref())?;
     let cfg = apply(cfg, &overrides);
@@ -49,10 +54,22 @@ pub fn run(args: CheckArgs) -> Result<(), FluxError> {
     if let Err(e) = check_effect_chain(&cfg) {
         failures.push(e);
     }
+    #[cfg(feature = "ml")]
     if let Some(model) = args.common.model.as_deref() {
         if let Err(e) = check_model_file(model) {
             failures.push(e);
         }
+    }
+    // Without the `ml` feature the `--model` flag is still accepted (it
+    // is still merged into the per-effect config in case a downstream
+    // build re-enables `ml`), but the ONNX-loading pre-flight is a
+    // no-op because `fluxframe_effects::ml` is not compiled in.
+    #[cfg(not(feature = "ml"))]
+    if args.common.model.is_some() {
+        warn!(
+            "--model provided but this build was compiled without the \
+             `ml` feature; skipping ONNX pre-flight check",
+        );
     }
 
     if failures.is_empty() {
@@ -199,6 +216,7 @@ fn check_effect_chain(cfg: &FluxConfig) -> Result<(), FluxError> {
     Ok(())
 }
 
+#[cfg(feature = "ml")]
 fn check_model_file(path: &Path) -> Result<(), FluxError> {
     if !path.exists() {
         return Err(FluxError::Config {

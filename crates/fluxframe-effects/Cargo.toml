@@ -8,12 +8,36 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Effect registry, effect chain runtime and built-in effects for FluxFrame."
 
+[features]
+# `ml` gates the ONNX-runtime-backed effects (currently
+# `background_blur`) and the `ml::*` inference layer.  Enabled by default
+# so downstream binaries get the full effect catalogue without opt-in
+# friction; downstream crates that only need passthrough-style effects
+# can disable defaults to skip the `ort` dependency entirely.
+default = ["ml"]
+ml = ["dep:ort"]
+
 [dependencies]
 fluxframe-core = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
-ort = { workspace = true }
 tracing = { workspace = true }
+ort = { workspace = true, optional = true }
 
 [lints]
 workspace = true
+
+# Tests that pull in the ML inference layer must only be compiled when
+# the `ml` feature is active; otherwise the `ort`-backed types they
+# reference are not in scope.  `required-features` is the canonical
+# Cargo mechanism for this — it leaves the test file untouched and
+# simply skips compilation under `--no-default-features`.
+[[test]]
+name = "onnx_inference_e2e"
+path = "tests/onnx_inference_e2e.rs"
+required-features = ["ml"]
+
+[[test]]
+name = "background_blur_e2e"
+path = "tests/background_blur_e2e.rs"
+required-features = ["ml"]

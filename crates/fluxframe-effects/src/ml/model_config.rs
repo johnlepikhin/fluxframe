@@ -214,11 +214,7 @@ impl ModelConfig {
     /// `output_type` etc. should mutate the returned value before
     /// calling [`ModelConfig::validate`].
     #[must_use]
-    pub fn new(
-        name: impl Into<String>,
-        input_width: u32,
-        input_height: u32,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, input_width: u32, input_height: u32) -> Self {
         Self {
             name: name.into(),
             input_width,
@@ -398,7 +394,10 @@ input_layout = "HW"
         )
         .expect_err("HW input layout must fail to parse");
         let msg = format!("{err}");
-        assert!(msg.to_ascii_lowercase().contains("hw") || msg.contains("input_layout"), "got: {msg}");
+        assert!(
+            msg.to_ascii_lowercase().contains("hw") || msg.contains("input_layout"),
+            "got: {msg}"
+        );
     }
 
     #[test]

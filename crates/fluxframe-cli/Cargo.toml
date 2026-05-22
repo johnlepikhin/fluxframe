@@ -12,6 +12,14 @@ description = "fluxframe CLI binary: list, check, run, benchmark."
 name = "fluxframe"
 path = "src/main.rs"
 
+[features]
+# Forward the `ml` feature from `fluxframe-effects` so the CLI's own
+# `--no-default-features` build still has a way to opt back in without
+# editing this manifest.  Enabled by default so a stock
+# `cargo build -p fluxframe-cli` keeps the full effect catalogue.
+default = ["ml"]
+ml = ["fluxframe-effects/ml"]
+
 [dependencies]
 fluxframe-core = { workspace = true }
 fluxframe-gst = { workspace = true }

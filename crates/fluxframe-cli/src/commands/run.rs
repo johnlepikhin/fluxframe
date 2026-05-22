@@ -26,6 +26,7 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
         width: args.width,
         height: args.height,
         fps: args.fps,
+        model: args.common.model,
     };
 
     let cfg = load(args.common.config.as_deref())?;
