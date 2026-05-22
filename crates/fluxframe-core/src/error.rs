@@ -236,6 +236,22 @@ pub enum FluxError {
         #[source]
         source: std::io::Error,
     },
+
+    /// An aggregate of multiple failures, e.g. from `fluxframe check`.
+    ///
+    /// `primary` is the first failure (preserved so consumers can still
+    /// `matches!()` on the typed variant); `count` is the total number of
+    /// failures that the producer already rendered to the user.  Renderers
+    /// (e.g. `main.rs`) should detect this variant and **skip** their own
+    /// `Error:`/`Hint:` print to avoid duplicating output.
+    #[error("{count} failures (primary: {primary})")]
+    Aggregated {
+        /// First failure in the aggregate; preserved so `matches!()` on the
+        /// typed variant still works after aggregation.
+        primary: Box<FluxError>,
+        /// Total number of failures the producer already rendered.
+        count: usize,
+    },
 }
 
 impl FluxError {
@@ -250,6 +266,16 @@ impl FluxError {
     pub fn io(path: PathBuf, source: std::io::Error) -> Self {
         FluxError::Io { path, source }
     }
+
+    /// Return `true` if this is an [`FluxError::Aggregated`] variant.
+    ///
+    /// Convenience for renderers (e.g. `main.rs`) that need to skip their
+    /// own diagnostic print when the producer already rendered each
+    /// underlying failure.
+    #[must_use]
+    pub fn is_aggregated(&self) -> bool {
+        matches!(self, FluxError::Aggregated { .. })
+    }
 }
 
 /// User-facing diagnostic rendering surface for §27 "Error / Reason / Hint".
@@ -258,8 +284,9 @@ impl FluxError {
 /// format on stderr.  Errors that do not carry a separate hint return
 /// `None` from [`Diagnostic::hint`].
 pub trait Diagnostic {
-    /// Short, machine-readable cause.  Typically the `Display` of the
-    /// most-specific source.
+    /// User-facing reason string.  **Walks the `source()` chain** so
+    /// wrappers like `#[error(transparent)]` don't hide the underlying
+    /// cause; consecutive duplicates are deduplicated.
     fn reason(&self) -> String;
 
     /// Optional user-facing remediation hint.

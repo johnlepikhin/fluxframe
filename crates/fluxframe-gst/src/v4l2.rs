@@ -84,10 +84,12 @@ fn inspect_entry(entry: &Path, dev_root: &Path) -> Option<V4l2Device> {
     let basename = entry.file_name()?.to_str()?.to_string();
     let path = dev_root.join(&basename);
     let name_path = entry.join("name");
+    // Per-entry read failures are noise at debug level on systems with
+    // many V4L2 devices; surface only at `trace` for deep diagnostics.
     let name = match fs::read_to_string(&name_path) {
         Ok(s) => s.trim().to_string(),
         Err(e) => {
-            tracing::debug!(path = %name_path.display(), error = %e, "name read failed; falling back to basename");
+            tracing::trace!(path = %name_path.display(), error = %e, "name read failed; falling back to basename");
             basename.clone()
         }
     };
@@ -95,7 +97,7 @@ fn inspect_entry(entry: &Path, dev_root: &Path) -> Option<V4l2Device> {
     let modalias = match fs::read_to_string(&modalias_path) {
         Ok(s) => Some(s.trim().to_string()),
         Err(e) => {
-            tracing::debug!(path = %modalias_path.display(), error = %e, "modalias read failed; classification falls back to name");
+            tracing::trace!(path = %modalias_path.display(), error = %e, "modalias read failed; classification falls back to name");
             None
         }
     };
@@ -133,8 +135,8 @@ mod tests {
         fn new(label: &str) -> Self {
             let nano = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
             // Add thread id to avoid collisions when tests run in parallel.
             let tid = std::thread::current().id();
             let p = std::env::temp_dir().join(format!("ff-v4l2-test-{label}-{nano}-{tid:?}"));

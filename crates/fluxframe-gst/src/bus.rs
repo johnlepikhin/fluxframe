@@ -18,6 +18,19 @@ use tracing::{trace, warn};
 /// enough that idle pipelines don't spin.
 const BUS_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// Which pipeline the event originated from.  Typed source label so
+/// downstream EBUSY translation can dispatch into the right
+/// [`fluxframe_core::error::PipelineError`] variant without parsing
+/// magic strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BusSource {
+    /// Input/capture pipeline.
+    Input,
+    /// Output/sink pipeline.
+    Output,
+}
+
 /// Typed event extracted from a GStreamer bus.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -30,8 +43,8 @@ pub enum BusEvent {
         message: String,
         /// Optional debug payload.
         debug: Option<String>,
-        /// Label identifying which pipeline produced the event ("input"/"output"/etc).
-        source_label: &'static str,
+        /// Typed source identifying which pipeline produced the event.
+        source: BusSource,
     },
     /// A non-fatal element warning.
     Warning {
@@ -41,20 +54,20 @@ pub enum BusEvent {
         message: String,
         /// Optional debug payload.
         debug: Option<String>,
-        /// Label identifying which pipeline produced the event.
-        source_label: &'static str,
+        /// Typed source identifying which pipeline produced the event.
+        source: BusSource,
     },
     /// Pipeline reached end-of-stream.
     Eos {
-        /// Label identifying which pipeline produced the event.
-        source_label: &'static str,
+        /// Typed source identifying which pipeline produced the event.
+        source: BusSource,
     },
 }
 
 /// A registered pipeline whose bus the listener should drain.
 pub struct WatchedPipeline {
-    /// Stable label used in [`BusEvent`] `source_label` fields.
-    pub label: &'static str,
+    /// Typed source identifying which pipeline emitted the event.
+    pub source: BusSource,
     /// Bus to drain.
     pub bus: gstreamer::Bus,
 }
@@ -123,30 +136,91 @@ where
             ) else {
                 continue;
             };
-            on_event(translate(&msg, p.label));
+            on_event(translate(&msg, p.source));
         }
     }
     trace!("bus listener loop exited");
 }
 
-fn translate(msg: &gstreamer::Message, source_label: &'static str) -> BusEvent {
+fn translate(msg: &gstreamer::Message, source: BusSource) -> BusEvent {
     use gstreamer::MessageView;
     match msg.view() {
         MessageView::Error(e) => BusEvent::FatalError {
             element: e.src().map_or_else(|| "?".into(), |s| s.name().to_string()),
             message: e.error().to_string(),
             debug: e.debug().map(|d| d.to_string()),
-            source_label,
+            source,
         },
         MessageView::Warning(w) => BusEvent::Warning {
             element: w.src().map_or_else(|| "?".into(), |s| s.name().to_string()),
             message: w.error().to_string(),
             debug: w.debug().map(|d| d.to_string()),
-            source_label,
+            source,
         },
-        MessageView::Eos(_) => BusEvent::Eos { source_label },
+        MessageView::Eos(_) => BusEvent::Eos { source },
         _ => unreachable!("filter excludes other message types"),
     }
+}
+
+/// Promote a [`BusEvent::FatalError`] to a structured
+/// [`fluxframe_core::error::PipelineError`].
+///
+/// Recognises `EBUSY`-style messages and routes them to
+/// [`fluxframe_core::error::PipelineError::InputDeviceUnavailable`] /
+/// [`fluxframe_core::error::PipelineError::OutputDeviceUnavailable`]
+/// per `event.source`.  Everything else becomes
+/// [`fluxframe_core::error::PipelineError::BusError`] carrying the
+/// original message.
+///
+/// **Returns `None`** if the event is not a `FatalError`.
+#[must_use]
+pub fn translate_fatal(event: &BusEvent) -> Option<fluxframe_core::error::PipelineError> {
+    use fluxframe_core::error::PipelineError;
+    let BusEvent::FatalError {
+        element,
+        message,
+        debug,
+        source,
+    } = event
+    else {
+        return None;
+    };
+    if looks_busy(message) {
+        // `BusSource` is `#[non_exhaustive]`, but within this crate the
+        // compiler still sees every variant.  We list them explicitly so
+        // adding a new variant is a compile error here — forcing a
+        // conscious decision about EBUSY mapping for the new source.
+        return Some(match source {
+            BusSource::Input => PipelineError::InputDeviceUnavailable {
+                device: element.clone(),
+                reason: "device is busy".into(),
+                hint: "another application is holding the device; close it (e.g. browser tab, OBS)"
+                    .into(),
+            },
+            BusSource::Output => PipelineError::OutputDeviceUnavailable {
+                device: element.clone(),
+                reason: "device is busy".into(),
+                hint: "another application is using the loopback device".into(),
+            },
+        });
+    }
+    Some(PipelineError::BusError {
+        element: element.clone(),
+        message: message.clone(),
+        debug: debug.clone(),
+    })
+}
+
+/// Narrow `EBUSY`-style substring detector.
+///
+/// Only matches the kernel/GStreamer phrasings that genuinely mean
+/// "device or resource busy".  A bare `"busy"` substring would catch
+/// false positives like `"keep busy retrying..."`.
+fn looks_busy(message: &str) -> bool {
+    let lowered = message.to_lowercase();
+    lowered.contains("device or resource busy")
+        || lowered.contains("resource busy")
+        || lowered.contains("device busy")
 }
 
 #[cfg(test)]
@@ -157,7 +231,7 @@ mod tests {
     fn bus_event_debug_compiles() {
         // Sanity check that the enum derives `Debug` and `Clone`.
         let evt = BusEvent::Eos {
-            source_label: "test",
+            source: BusSource::Input,
         };
         let _cloned = evt.clone();
         let s = format!("{evt:?}");
@@ -167,7 +241,7 @@ mod tests {
             element: "decoder".into(),
             message: "boom".into(),
             debug: Some("trace".into()),
-            source_label: "input",
+            source: BusSource::Input,
         };
         let s = format!("{fatal:?}");
         assert!(s.contains("FatalError"));
@@ -177,7 +251,7 @@ mod tests {
             element: "encoder".into(),
             message: "minor".into(),
             debug: None,
-            source_label: "output",
+            source: BusSource::Output,
         };
         let s = format!("{warn_evt:?}");
         assert!(s.contains("Warning"));
@@ -201,5 +275,77 @@ mod tests {
         listener.stop();
         // Second stop after the handle has been taken should still be safe.
         listener.stop();
+    }
+
+    #[test]
+    fn translate_fatal_promotes_input_busy() {
+        let event = BusEvent::FatalError {
+            element: "v4l2src0".into(),
+            message: "Device or resource busy".into(),
+            debug: None,
+            source: BusSource::Input,
+        };
+        let err = translate_fatal(&event).expect("fatal");
+        assert!(matches!(
+            err,
+            fluxframe_core::error::PipelineError::InputDeviceUnavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn translate_fatal_promotes_output_busy() {
+        let event = BusEvent::FatalError {
+            element: "v4l2sink0".into(),
+            message: "Resource busy: cannot open".into(),
+            debug: None,
+            source: BusSource::Output,
+        };
+        let err = translate_fatal(&event).expect("fatal");
+        assert!(matches!(
+            err,
+            fluxframe_core::error::PipelineError::OutputDeviceUnavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn translate_fatal_falls_back_to_bus_error() {
+        let event = BusEvent::FatalError {
+            element: "videoconvert0".into(),
+            message: "Internal data stream error".into(),
+            debug: None,
+            source: BusSource::Input,
+        };
+        let err = translate_fatal(&event).expect("fatal");
+        assert!(matches!(
+            err,
+            fluxframe_core::error::PipelineError::BusError { .. }
+        ));
+    }
+
+    #[test]
+    fn translate_fatal_ignores_unrelated_busy_substring() {
+        let event = BusEvent::FatalError {
+            element: "filter".into(),
+            // generic "busy" — must NOT trigger EBUSY promote
+            message: "Keep busy retrying...".into(),
+            debug: None,
+            source: BusSource::Input,
+        };
+        let err = translate_fatal(&event).expect("fatal");
+        assert!(matches!(
+            err,
+            fluxframe_core::error::PipelineError::BusError { .. }
+        ));
+    }
+
+    #[test]
+    fn translate_fatal_returns_none_for_warning() {
+        let event = BusEvent::Warning {
+            element: "x".into(),
+            message: "y".into(),
+            debug: None,
+            source: BusSource::Input,
+        };
+        assert!(translate_fatal(&event).is_none());
     }
 }

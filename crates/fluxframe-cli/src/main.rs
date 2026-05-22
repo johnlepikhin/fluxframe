@@ -29,10 +29,16 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             use fluxframe_core::Diagnostic;
-            // Print §27 canonical format on stderr independent of RUST_LOG.
-            eprintln!("Error: {}", e.reason());
-            if let Some(hint) = e.hint() {
-                eprintln!("Hint: {hint}");
+            // Print §27 canonical format on stderr independent of RUST_LOG,
+            // unless the producer (e.g. `fluxframe check`) already rendered
+            // each underlying failure via `FluxError::Aggregated`.  Doing
+            // the §27 render twice would print the same lines for the
+            // primary failure and confuse the operator.
+            if !e.is_aggregated() {
+                eprintln!("Error: {}", e.reason());
+                if let Some(hint) = e.hint() {
+                    eprintln!("Hint: {hint}");
+                }
             }
             error!(error = %e, "command failed");
             ExitCode::FAILURE

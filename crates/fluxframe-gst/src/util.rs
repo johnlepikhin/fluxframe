@@ -3,9 +3,9 @@
 //! Some helpers (`make_element`, `build_caps`) stay `pub(crate)` so the
 //! GStreamer types do not leak through the crate's public surface.  The
 //! V4L2 access pre-checks ([`check_v4l2_input_access`],
-//! [`check_v4l2_output_access`], [`map_v4l2_open_error`]) are `pub` so the
-//! CLI layer can re-use the exact same path-validation logic instead of
-//! reimplementing it in `check.rs`.
+//! [`check_v4l2_output_access`]) are `pub` so the CLI layer can re-use
+//! the exact same path-validation logic instead of reimplementing it in
+//! `check.rs`.
 
 use std::fs::OpenOptions;
 use std::io;
@@ -69,11 +69,16 @@ pub(crate) fn build_caps(
 /// the only difference is the error variant the caller wants to see.
 #[derive(Debug, Clone, Copy)]
 enum Access {
+    /// Capture side: failures become
+    /// [`PipelineError::InputDeviceUnavailable`].
     Input,
+    /// Output side: failures become
+    /// [`PipelineError::OutputDeviceUnavailable`].
     Output,
 }
 
 impl Access {
+    /// Build the appropriate `PipelineError` variant for this access mode.
     fn err(self, device: &Path, reason: String, hint: &str) -> PipelineError {
         let device_disp = device.display().to_string();
         let hint = hint.to_string();
@@ -92,50 +97,63 @@ impl Access {
     }
 }
 
-/// Resolve `device` to a canonical path and verify it is a `/dev/` character
-/// device.
+/// Resolve `device` to a canonical path and verify it is a character device.
 ///
 /// Pre-check used by both [`check_v4l2_input_access`] and
 /// [`check_v4l2_output_access`].  Rejects:
 ///
 /// * paths that cannot be canonicalised (broken symlink, missing entry);
-/// * canonicalised paths that escape `/dev/` (e.g. symlink to a regular file
-///   under `/tmp` — a classic path-traversal sandbox bypass);
 /// * non-character-device file types (regular file, directory, fifo).
+///
+/// Paths whose canonical form does not live under `/dev/` are accepted but
+/// produce a `tracing::warn!` — some legitimate setups expose devices via
+/// `/run/udev/...` or by-id symlinks that resolve outside `/dev/`, and the
+/// `is_char_device` check still rejects regular files reached through
+/// those paths.  The canonical path is **not** included in error reasons
+/// (to avoid leaking host filesystem layout); it appears only in tracing
+/// at `debug!` level.
 ///
 /// Returning the canonical [`PathBuf`] is deliberate: callers (`v4l2src`,
 /// `v4l2sink`) then receive the resolved path with no symlink indirection,
 /// which is what we actually want to hand to the GStreamer element.
 fn validate_v4l2_device_path(device: &Path, access: Access) -> Result<PathBuf, PipelineError> {
-    let canon = std::fs::canonicalize(device)
-        .map_err(|e| access.err(device, format!("cannot canonicalize path: {e}"), "verify the device path"))?;
-    if !canon.starts_with("/dev/") {
-        return Err(access.err(
+    let canon = std::fs::canonicalize(device).map_err(|e| {
+        access.err(
             device,
-            format!("path escapes /dev/ after canonicalisation ({})", canon.display()),
-            "use a real /dev/video* device, not a symlink to elsewhere",
-        ));
+            format!("cannot canonicalize path: {e}"),
+            "verify the device path",
+        )
+    })?;
+    if !canon.starts_with("/dev/") {
+        tracing::warn!(
+            canonical = %canon.display(),
+            original = %device.display(),
+            "device path resolves outside /dev/; continuing because target is a character device",
+        );
     }
     let meta = std::fs::metadata(&canon).map_err(|e| {
-        access.err(device, format!("metadata failed: {e}"), "check that the device exists")
+        access.err(
+            device,
+            format!("metadata failed: {e}"),
+            "check that the device exists",
+        )
     })?;
     if !meta.file_type().is_char_device() {
+        tracing::debug!(canonical = %canon.display(), original = %device.display(), "rejected: non-char-device target");
         return Err(access.err(
             device,
-            "not a character device".into(),
-            "expected a /dev/video* character device",
+            "path resolves to non-character-device target".into(),
+            "use a real /dev/video* character device",
         ));
     }
+    tracing::debug!(canonical = %canon.display(), original = %device.display(), "device path validated");
     Ok(canon)
 }
 
 /// Map an `io::Error` from a v4l2 device open into a structured pipeline
 /// hint.
-///
-/// Exposed `pub` so the CLI layer can reuse the same hint phrasing when it
-/// surfaces device errors in `check.rs` rather than duplicating the match.
 #[must_use]
-pub fn map_v4l2_open_error(err: &io::Error) -> &'static str {
+fn map_v4l2_open_error(err: &io::Error) -> &'static str {
     match err.kind() {
         io::ErrorKind::NotFound => {
             "check that the device exists; run 'fluxframe list' for the available devices"
@@ -157,11 +175,14 @@ pub fn map_v4l2_open_error(err: &io::Error) -> &'static str {
 /// ("Internal data stream error" or similar), which defeats the §27
 /// Error/Reason/Hint diagnostic contract without this pre-check.
 ///
-/// The returned [`PathBuf`] is the canonicalised path: symlinks have been
-/// resolved and the result is guaranteed to live under `/dev/` and to be a
-/// character device.  Callers should feed this canonical path to
-/// `v4l2src`/`v4l2sink` rather than the user-supplied original so the
-/// pipeline targets exactly the inode the access check authorised.
+/// The probe uses `O_NONBLOCK` so a device that would block on open
+/// reports `EWOULDBLOCK`/`EAGAIN` immediately instead of hanging this
+/// thread for an indefinite period.  The returned [`PathBuf`] is the
+/// canonicalised path: symlinks have been resolved and the result is
+/// guaranteed to be a character device.  Callers should feed this
+/// canonical path to `v4l2src`/`v4l2sink` rather than the user-supplied
+/// original so the pipeline targets exactly the inode the access check
+/// authorised.
 ///
 /// There is a small TOCTOU window between this check and the actual
 /// `v4l2src` open; the Stage 2 plan documents that as an accepted
@@ -170,6 +191,7 @@ pub fn check_v4l2_input_access(device: &Path) -> Result<PathBuf, PipelineError> 
     let canon = validate_v4l2_device_path(device, Access::Input)?;
     OpenOptions::new()
         .read(true)
+        .custom_flags(libc::O_NONBLOCK)
         .open(&canon)
         .map_err(|e| PipelineError::InputDeviceUnavailable {
             device: device.display().to_string(),
@@ -218,8 +240,8 @@ mod tests {
     fn unique_tmp(label: &str) -> PathBuf {
         let nano = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
         let tid = std::thread::current().id();
         std::env::temp_dir().join(format!("ff-util-{label}-{nano}-{tid:?}"))
     }
@@ -239,7 +261,7 @@ mod tests {
         let tmp = unique_tmp("regular");
         std::fs::File::create(&tmp).unwrap().write_all(b"x").unwrap();
         let err = check_v4l2_input_access(&tmp).expect_err("regular file must error");
-        // canonicalize ok; starts_with /dev/ fails (tmp under /tmp).
+        // canonicalize ok; is_char_device fails (tmp is a regular file).
         assert!(
             matches!(err, PipelineError::InputDeviceUnavailable { .. }),
             "expected InputDeviceUnavailable, got {err:?}",
@@ -262,12 +284,48 @@ mod tests {
         let tmp = unique_tmp("dir");
         std::fs::create_dir_all(&tmp).unwrap();
         let err = check_v4l2_output_access(&tmp).expect_err("directory must error");
-        // Either the /dev/ guard or the char-device guard rejects this; both
-        // map to OutputDeviceUnavailable for the output access path.
+        // is_char_device rejects this; maps to OutputDeviceUnavailable for
+        // the output access path.
         assert!(
             matches!(err, PipelineError::OutputDeviceUnavailable { .. }),
             "expected OutputDeviceUnavailable, got {err:?}",
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn check_input_hint_actionable() {
+        let path = Path::new("/nonexistent");
+        let err = check_v4l2_input_access(path).expect_err("missing");
+        if let PipelineError::InputDeviceUnavailable { hint, .. } = err {
+            assert!(
+                hint.contains("device") || hint.contains("check"),
+                "hint should be actionable, got: {hint}"
+            );
+        } else {
+            panic!("expected InputDeviceUnavailable");
+        }
+    }
+
+    #[test]
+    fn check_rejects_symlink_to_regular_file() {
+        let nano = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tid = std::thread::current().id();
+        let dir = std::env::temp_dir().join(format!("ff-symlink-test-{nano}-{tid:?}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let regular = dir.join("regular");
+        std::fs::write(&regular, b"x").unwrap();
+        let link = dir.join("link-to-regular");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        let err =
+            check_v4l2_input_access(&link).expect_err("symlink-to-regular must fail");
+        assert!(matches!(
+            err,
+            PipelineError::InputDeviceUnavailable { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

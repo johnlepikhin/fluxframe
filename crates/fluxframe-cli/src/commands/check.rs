@@ -7,13 +7,13 @@
 
 use std::path::Path;
 
-use fluxframe_core::{Diagnostic, FluxConfig, FluxError, normalise_effect_name};
+use fluxframe_core::{FluxConfig, FluxError, normalise_effect_name};
 use fluxframe_gst::{V4l2DeviceKind, enumerate_devices};
 use tracing::{info, warn};
 
 use crate::cli::CheckArgs;
 use crate::config_merge::{CliOverrides, apply, load};
-use crate::runtime::default_registry;
+use crate::runtime::{InputSpec, OutputSpec, classify_input, classify_output, default_registry};
 
 /// Entry point for `fluxframe check`.
 ///
@@ -61,21 +61,21 @@ pub fn run(args: CheckArgs) -> Result<(), FluxError> {
         // Print every failure here, in §27 Error/Hint form, so the
         // operator sees the full picture (not just the first failure).
         for failure in &failures {
+            use fluxframe_core::Diagnostic;
             eprintln!("Error: {}", failure.reason());
             if let Some(hint) = failure.hint() {
                 eprintln!("Hint: {hint}");
             }
         }
-        // Return a *summary* error (without a Hint) so `main.rs` prints
-        // one extra line — "Error: N pre-flight check(s) failed; see
-        // messages above" — and not the first failure again.  Without
-        // this collapse, every failure would be printed three times
-        // (once here, once by `main.rs`, once by the `tracing::error!`
-        // there).
-        let n = failures.len();
-        Err(FluxError::Config {
-            reason: format!("{n} pre-flight check(s) failed; see messages above"),
-            hint: None,
+        // Surface an `Aggregated` error so `main.rs` recognises that we
+        // already rendered each underlying failure and skips its own
+        // §27 print.  Preserving `primary` keeps `matches!()` consumers
+        // (tests in particular) working unchanged.
+        let count = failures.len();
+        let primary = failures.into_iter().next().expect("non-empty");
+        Err(FluxError::Aggregated {
+            primary: Box::new(primary),
+            count,
         })
     }
 }
@@ -87,51 +87,89 @@ fn check_gstreamer_init() -> Result<(), FluxError> {
 }
 
 fn check_input_device(cfg: &FluxConfig) -> Result<(), FluxError> {
-    let device = &cfg.input.device;
-    if device == "testsrc" {
-        info!(device, "input: synthetic source (no device check needed)");
-        return Ok(());
-    }
-    if !device.starts_with("/dev/") {
-        return Err(FluxError::Config {
-            reason: format!("input '{device}' is neither 'testsrc' nor a /dev/* path"),
+    // Triage lives in [`classify_input`] (shared with `commands::run`)
+    // so both code paths cannot drift apart on which device strings are
+    // valid.  Delegate the actual canonicalisation + open-probe +
+    // hint-rendering to `fluxframe_gst::check_v4l2_input_access` so the
+    // §27 Error/Hint text is rendered in exactly one place.
+    match classify_input(cfg) {
+        InputSpec::Testsrc => {
+            info!(device = %cfg.input.device, "input: synthetic source (no device check needed)");
+            Ok(())
+        }
+        InputSpec::V4l2(path) => {
+            let canon = fluxframe_gst::check_v4l2_input_access(&path)?;
+            info!(
+                device = %path.display(),
+                canonical = %canon.display(),
+                "input device: readable",
+            );
+            Ok(())
+        }
+        InputSpec::Unsupported(d) => Err(FluxError::Config {
+            reason: format!("input '{d}' is not supported"),
             hint: Some("use --input testsrc or --input /dev/video<N>".into()),
-        });
+        }),
     }
-    // Delegate the actual canonicalisation + open-probe + hint-rendering
-    // to `fluxframe_gst::check_v4l2_input_access` so the §27 Error/Hint
-    // text is rendered in exactly one place across the workspace.
-    let canon = fluxframe_gst::check_v4l2_input_access(Path::new(device))?;
-    info!(device, canonical = %canon.display(), "input device: readable");
-    Ok(())
 }
 
 fn check_output_device(cfg: &FluxConfig) -> Result<(), FluxError> {
-    let device = &cfg.output.device;
-    if device == "auto" {
-        info!("output: autovideosink (no device check needed)");
-        return Ok(());
+    // Same rationale as `check_input_device`: route through
+    // [`classify_output`] so `commands::check` and `commands::run` agree
+    // on which output strings are valid.
+    match classify_output(cfg) {
+        OutputSpec::Auto => {
+            info!("output: autovideosink (no device check needed)");
+            Ok(())
+        }
+        OutputSpec::Fake => {
+            info!("output: fakesink (no device check needed)");
+            Ok(())
+        }
+        OutputSpec::V4l2(path) => {
+            let canon = fluxframe_gst::check_v4l2_output_access(&path)?;
+            warn_if_not_loopback(&canon);
+            info!(
+                device = %path.display(),
+                canonical = %canon.display(),
+                "output device: writable",
+            );
+            Ok(())
+        }
+        OutputSpec::Unsupported(d) => Err(FluxError::Config {
+            reason: format!("output '{d}' is not supported"),
+            hint: Some("supported outputs: auto, fakesink, /dev/video<N>".into()),
+        }),
     }
-    if !device.starts_with("/dev/") {
-        info!(device, "output: fakesink (no device check needed)");
-        return Ok(());
-    }
-    // Delegate to `fluxframe_gst::check_v4l2_output_access` for the same
-    // reason as on the input side — keep hint phrasing canonical.
-    let canon = fluxframe_gst::check_v4l2_output_access(Path::new(device))?;
-    warn_if_not_loopback(&canon);
-    info!(device, canonical = %canon.display(), "output device: writable");
-    Ok(())
 }
 
-fn warn_if_not_loopback(canon: &Path) {
+fn warn_if_not_loopback(canonical: &Path) {
     let devices = enumerate_devices();
-    if let Some(d) = devices.iter().find(|d| d.path == canon) {
-        if !matches!(d.kind, V4l2DeviceKind::Virtual) {
+    let Some(d) = devices.iter().find(|d| d.path == canonical) else {
+        // Device passed the open-probe but isn't in the sysfs enumeration
+        // (e.g. the user pointed at a path outside `/dev/video*`).  We
+        // intentionally do not warn the operator here — they already
+        // know they are writing to a non-standard path — but record a
+        // debug breadcrumb for support.
+        tracing::debug!(
+            device = %canonical.display(),
+            "loopback classification skipped (device not in enumeration)",
+        );
+        return;
+    };
+    match d.kind {
+        V4l2DeviceKind::Virtual => {} // expected
+        V4l2DeviceKind::Unknown => {
             warn!(
-                device = %canon.display(),
+                device = %canonical.display(),
+                "device kind unknown; could not verify loopback. If this is a real camera, output may be wasted.",
+            );
+        }
+        _ => {
+            warn!(
+                device = %canonical.display(),
                 kind = ?d.kind,
-                "output device does not look like a v4l2loopback; you may be writing to a real camera"
+                "output device does not look like a v4l2loopback; you may be writing to a real camera",
             );
         }
     }
@@ -207,10 +245,19 @@ mod tests {
 
     #[test]
     fn check_input_device_rejects_unknown_scheme() {
+        use fluxframe_core::Diagnostic;
         let mut cfg = FluxConfig::default();
         cfg.input.device = "http://example.com/stream".into();
         let err = check_input_device(&cfg).expect_err("unsupported scheme must fail");
-        let msg = format!("{err}");
-        assert!(msg.contains("testsrc") || msg.contains("/dev"), "got: {msg}");
+        let reason = err.reason();
+        assert!(
+            reason.contains("not supported") || reason.contains("http://"),
+            "got reason: {reason}",
+        );
+        let hint = err.hint().expect("Unsupported should carry a hint");
+        assert!(
+            hint.contains("testsrc") || hint.contains("/dev"),
+            "got hint: {hint}",
+        );
     }
 }

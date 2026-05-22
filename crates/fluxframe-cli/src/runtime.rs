@@ -21,7 +21,7 @@ use fluxframe_core::{FluxConfig, FluxError};
 use fluxframe_effects::{EffectChain, EffectRegistry, PassthroughEffect};
 use fluxframe_gst::input::{InputParams, InputPipeline};
 use fluxframe_gst::output::{OutputParams, OutputPipeline, OutputSink};
-use fluxframe_gst::{BusEvent, BusListener, LatestFrameSlot, WatchedPipeline};
+use fluxframe_gst::{BusEvent, BusListener, BusSource, LatestFrameSlot, WatchedPipeline};
 use tracing::{error, info, warn};
 
 /// How long the worker waits on an empty frame slot before re-checking the
@@ -146,10 +146,10 @@ pub(crate) fn default_registry() -> EffectRegistry {
 /// * everything else → [`Self::Unsupported`], so the caller surfaces a
 ///   structured §27 error instead of silently falling back to a default.
 ///
-/// `#[non_exhaustive]` reserves room for future input kinds (RTSP, file
-/// playback) without breaking match sites in the CLI layer.
+/// Adding a variant turns every CLI match site into a compile error,
+/// which is what we want at the `pub(crate)` boundary; `#[non_exhaustive]`
+/// would only matter cross-crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub(crate) enum InputSpec {
     /// Synthetic test source (`videotestsrc`).
     Testsrc,
@@ -179,10 +179,10 @@ pub(crate) fn classify_input(cfg: &FluxConfig) -> InputSpec {
 /// `device == "auto" | "fakesink" | /dev/...` triage into one match site
 /// so `commands::check` and `commands::run` cannot drift apart.
 ///
-/// `#[non_exhaustive]` reserves room for future sink kinds without
-/// breaking match sites in the CLI layer.
+/// Adding a variant turns every CLI match site into a compile error,
+/// which is what we want at the `pub(crate)` boundary; `#[non_exhaustive]`
+/// would only matter cross-crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub(crate) enum OutputSpec {
     /// `autovideosink` (manual glance verification).
     Auto,
@@ -190,6 +190,8 @@ pub(crate) enum OutputSpec {
     Fake,
     /// `v4l2sink` to a loopback (or other writable V4L2) device.
     V4l2(PathBuf),
+    /// Unrecognised — caller surfaces a structured error.
+    Unsupported(String),
 }
 
 /// Classify the output section of `cfg` into an [`OutputSpec`].
@@ -199,7 +201,7 @@ pub(crate) fn classify_output(cfg: &FluxConfig) -> OutputSpec {
         "auto" => OutputSpec::Auto,
         "fakesink" => OutputSpec::Fake,
         device if device.starts_with("/dev/") => OutputSpec::V4l2(PathBuf::from(device)),
-        _ => OutputSpec::Fake,
+        other => OutputSpec::Unsupported(other.to_string()),
     }
 }
 
@@ -325,7 +327,7 @@ where
         cfg.input.fps,
         cfg.input.format,
     );
-    let sink = resolve_output_sink(cfg);
+    let sink = resolve_output_sink(cfg)?;
     let sink_label = output_sink_label(&sink);
     let output_params = OutputParams::new(
         cfg.output.width,
@@ -359,11 +361,11 @@ fn build_bus_listener(
 ) -> BusListener {
     let pipelines = vec![
         WatchedPipeline {
-            label: "input",
+            source: BusSource::Input,
             bus: input.bus(),
         },
         WatchedPipeline {
-            label: "output",
+            source: BusSource::Output,
             bus: output.bus(),
         },
     ];
@@ -375,6 +377,10 @@ fn build_bus_listener(
 /// Translate a [`BusEvent`] into supervisor side-effects.  Extracted so
 /// the closure passed to [`BusListener::spawn`] stays a one-liner and so
 /// the handler is unit-testable.
+///
+/// Fatal-error promotion (busy device → typed [`PipelineError`]) lives in
+/// [`fluxframe_gst::translate_fatal`] so input-side and output-side bus
+/// traffic agree on phrasing.
 fn on_bus_event(
     event: &BusEvent,
     running: &AtomicBool,
@@ -386,39 +392,40 @@ fn on_bus_event(
             element,
             message,
             debug: debug_payload,
-            source_label,
+            source,
         } => {
             error!(
-                source = %source_label,
+                ?source,
                 %element,
                 %message,
                 debug = ?debug_payload,
                 "bus fatal error",
             );
-            let err = translate_bus_fatal(element, message, debug_payload.as_ref(), source_label);
-            let mut guard = bus_error.lock().expect("bus_error mutex poisoned");
-            if guard.is_none() {
-                *guard = Some(err);
+            if let Some(pipeline_err) = fluxframe_gst::translate_fatal(event) {
+                let mut guard = bus_error.lock().expect("bus_error mutex poisoned");
+                if guard.is_none() {
+                    *guard = Some(FluxError::from(pipeline_err));
+                }
             }
             running.store(false, Ordering::Release);
             slot.close();
         }
         BusEvent::Warning {
-            source_label,
+            source,
             element,
             message,
             debug: debug_payload,
         } => {
             warn!(
-                source = %source_label,
+                ?source,
                 %element,
                 %message,
                 debug = ?debug_payload,
                 "bus warning",
             );
         }
-        BusEvent::Eos { source_label } => {
-            info!(source = %source_label, "pipeline EOS");
+        BusEvent::Eos { source } => {
+            info!(?source, "pipeline EOS");
             running.store(false, Ordering::Release);
             slot.close();
         }
@@ -428,51 +435,6 @@ fn on_bus_event(
             warn!(?event, "unhandled bus event variant");
         }
     }
-}
-
-/// Translate a [`BusEvent::FatalError`] payload into a typed [`FluxError`].
-///
-/// GStreamer's bus reports `EBUSY` as a free-form message — there is no
-/// stable error code on the message path — so we recognise it via a
-/// substring heuristic.  When the message looks like a "device busy"
-/// failure we promote it to the matching
-/// [`PipelineError::InputDeviceUnavailable`]/[`PipelineError::OutputDeviceUnavailable`]
-/// variant with an actionable hint, so the §27 Error/Hint output points the
-/// user at the real cause ("close OBS / the browser tab") instead of the
-/// generic "internal data stream error" GStreamer normally prints.
-///
-/// Anything we cannot recognise falls back to [`PipelineError::BusError`]
-/// so the original message is still surfaced verbatim.
-fn translate_bus_fatal(
-    element: &str,
-    message: &str,
-    debug_payload: Option<&String>,
-    source_label: &str,
-) -> FluxError {
-    let lowered = message.to_lowercase();
-    let looks_busy = lowered.contains("device or resource busy") || lowered.contains("busy");
-    if looks_busy {
-        return if source_label == "input" {
-            FluxError::from(PipelineError::InputDeviceUnavailable {
-                device: element.to_string(),
-                reason: "device is busy".into(),
-                hint:
-                    "another application is holding the device; close it (e.g. browser tab, OBS)"
-                        .into(),
-            })
-        } else {
-            FluxError::from(PipelineError::OutputDeviceUnavailable {
-                device: element.to_string(),
-                reason: "device is busy".into(),
-                hint: "another application is using the device".into(),
-            })
-        };
-    }
-    FluxError::from(PipelineError::BusError {
-        element: element.to_string(),
-        message: message.to_string(),
-        debug: debug_payload.cloned(),
-    })
 }
 
 fn run_process_loop(
@@ -516,22 +478,23 @@ fn teardown(input: &InputPipeline, output: &OutputPipeline, chain: &mut EffectCh
     }
 }
 
-fn resolve_output_sink(cfg: &FluxConfig) -> OutputSink {
+fn resolve_output_sink(cfg: &FluxConfig) -> Result<OutputSink, FluxError> {
     // Routing rules (see Stage 2 plan, §"Output side"):
     //   * "auto"      -> autovideosink (manual glance verification).
     //   * "fakesink"  -> fakesink (CI / dev smoke without a loopback).
     //   * /dev/...    -> v4l2sink to a loopback device.
-    //   * everything else -> fakesink (CI / tests).
+    //   * everything else -> structured §27 Config error.
     //
     // Triage lives in [`classify_output`]; this function only maps the
     // typed `OutputSpec` onto the GStreamer-facing `OutputSink`.
-    // `OutputSpec` is `#[non_exhaustive]` for cross-crate consumers, but
-    // inside this crate the match is genuinely exhaustive — adding a
-    // variant prompts the developer to teach this match about it.
     match classify_output(cfg) {
-        OutputSpec::Auto => OutputSink::Auto,
-        OutputSpec::Fake => OutputSink::Fake,
-        OutputSpec::V4l2(device) => OutputSink::V4l2Loopback { device },
+        OutputSpec::Auto => Ok(OutputSink::Auto),
+        OutputSpec::Fake => Ok(OutputSink::Fake),
+        OutputSpec::V4l2(device) => Ok(OutputSink::V4l2Loopback { device }),
+        OutputSpec::Unsupported(d) => Err(FluxError::Config {
+            reason: format!("output '{d}' is not supported"),
+            hint: Some("supported outputs: auto, fakesink, /dev/video<N>".into()),
+        }),
     }
 }
 
@@ -589,7 +552,10 @@ mod tests {
     fn resolve_output_sink_maps_auto() {
         let mut cfg = base_cfg();
         cfg.output.device = "auto".into();
-        assert_eq!(resolve_output_sink(&cfg), OutputSink::Auto);
+        assert_eq!(
+            resolve_output_sink(&cfg).expect("auto resolves"),
+            OutputSink::Auto
+        );
     }
 
     #[test]
@@ -597,7 +563,7 @@ mod tests {
         let mut cfg = base_cfg();
         cfg.output.device = "/dev/video10".into();
         assert_eq!(
-            resolve_output_sink(&cfg),
+            resolve_output_sink(&cfg).expect("dev path resolves"),
             OutputSink::V4l2Loopback {
                 device: PathBuf::from("/dev/video10"),
             }
@@ -605,10 +571,32 @@ mod tests {
     }
 
     #[test]
-    fn resolve_output_sink_defaults_to_fake() {
+    fn resolve_output_sink_maps_fakesink() {
         let mut cfg = base_cfg();
         cfg.output.device = "fakesink".into();
-        assert_eq!(resolve_output_sink(&cfg), OutputSink::Fake);
+        assert_eq!(
+            resolve_output_sink(&cfg).expect("fakesink resolves"),
+            OutputSink::Fake
+        );
+    }
+
+    #[test]
+    fn resolve_output_sink_rejects_unsupported() {
+        let mut cfg = base_cfg();
+        cfg.output.device = "http://example.com/stream".into();
+        let err = resolve_output_sink(&cfg).expect_err("unsupported sink must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("not supported"), "got: {msg}");
+    }
+
+    #[test]
+    fn classify_output_marks_unsupported() {
+        let mut cfg = base_cfg();
+        cfg.output.device = "http://example.com/stream".into();
+        assert_eq!(
+            classify_output(&cfg),
+            OutputSpec::Unsupported("http://example.com/stream".to_string())
+        );
     }
 
     #[test]

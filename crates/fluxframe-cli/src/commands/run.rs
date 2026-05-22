@@ -61,16 +61,14 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
         .map_err(FluxError::from)?;
 
     // Dispatch via `classify_input` so the testsrc-vs-V4L2 triage lives in
-    // exactly one place (shared with `commands::check`).  `InputSpec` is
-    // `#[non_exhaustive]` for cross-crate consumers, but inside this crate
-    // the match is genuinely exhaustive: adding a variant will turn this
-    // into a compile error and prompt the developer to teach the
-    // dispatch about it.
+    // exactly one place (shared with `commands::check`).  Adding a variant
+    // to `InputSpec` turns this into a compile error and prompts the
+    // developer to teach the dispatch about it.
     match classify_input(&cfg) {
         InputSpec::Testsrc => run_testsrc_chain(&cfg, chain),
         InputSpec::V4l2(_) => run_v4l2_chain(&cfg, chain),
         InputSpec::Unsupported(d) => Err(FluxError::Config {
-            reason: format!("input '{d}' is not handled"),
+            reason: format!("input '{d}' is not supported"),
             hint: Some("supported inputs: testsrc, /dev/video* (V4L2)".into()),
         }),
     }
