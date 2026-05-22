@@ -133,17 +133,13 @@ fn translate(msg: &gstreamer::Message, source_label: &'static str) -> BusEvent {
     use gstreamer::MessageView;
     match msg.view() {
         MessageView::Error(e) => BusEvent::FatalError {
-            element: e
-                .src()
-                .map_or_else(|| "?".into(), |s| s.name().to_string()),
+            element: e.src().map_or_else(|| "?".into(), |s| s.name().to_string()),
             message: e.error().to_string(),
             debug: e.debug().map(|d| d.to_string()),
             source_label,
         },
         MessageView::Warning(w) => BusEvent::Warning {
-            element: w
-                .src()
-                .map_or_else(|| "?".into(), |s| s.name().to_string()),
+            element: w.src().map_or_else(|| "?".into(), |s| s.name().to_string()),
             message: w.error().to_string(),
             debug: w.debug().map(|d| d.to_string()),
             source_label,

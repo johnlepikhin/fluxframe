@@ -1,11 +1,12 @@
 //! GStreamer input pipeline construction.
 //!
-//! Stage 1 supports the synthetic `videotestsrc` backend only.  The V4L2
-//! backend lands in Stage 2.  All backends share the same downstream
+//! Stage 1 supported only the synthetic `videotestsrc` backend; Stage 2
+//! adds the V4L2 capture path.  All backends share the same downstream
 //! plumbing — `videoconvert → capsfilter → appsink` — so producing a
 //! [`VideoFrame`] from a captured `gst::Sample` happens in exactly one
 //! place ([`crate::frame_conv::sample_to_frame`]).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -17,7 +18,7 @@ use tracing::{debug, error, trace};
 
 use crate::frame_conv::sample_to_frame;
 use crate::slot::LatestFrameSlot;
-use crate::util::{build_caps, make_element};
+use crate::util::{build_caps, check_v4l2_input_access, make_element};
 
 /// Capture pipeline owning the GStreamer elements and the shared frame slot.
 pub struct InputPipeline {
@@ -76,6 +77,36 @@ impl InputPipeline {
         testsrc.set_property_from_str("pattern", "smpte");
 
         Self::build(&testsrc, params)
+    }
+
+    /// Build a `v4l2src`-based pipeline pointed at `device`.
+    ///
+    /// Pre-opens `device` for reading so a missing device, busy device or
+    /// permission failure surfaces as a structured
+    /// [`PipelineError::InputDeviceUnavailable`] *before* the GStreamer
+    /// pipeline is constructed.  Without this pre-check the user sees an
+    /// opaque GStreamer state-change error during `set_state(Playing)`.
+    ///
+    /// # Errors
+    ///
+    /// * [`PipelineError::InputDeviceUnavailable`] when the device cannot
+    ///   be opened (missing, busy, permission denied).
+    /// * [`PipelineError::MissingElement`] when the `v4l2src` plugin is
+    ///   not registered.
+    /// * Other [`PipelineError`] variants from element/link construction.
+    pub fn build_v4l2(device: PathBuf, params: InputParams) -> Result<Self, PipelineError> {
+        check_v4l2_input_access(&device)?;
+        let src = make_element("v4l2src", "input_src")?;
+        // Consume `device` here (rather than borrowing) so the public
+        // signature stays `PathBuf` per the Stage 2 contract while still
+        // satisfying clippy::needless_pass_by_value.
+        let device_str = device.into_os_string();
+        src.set_property_from_str("device", device_str.to_string_lossy().as_ref());
+        // `do-timestamp=true` so frames arriving from the camera carry a
+        // PTS based on the running clock — required for the downstream
+        // `appsink` to publish meaningful capture timestamps.
+        src.set_property("do-timestamp", true);
+        Self::build(&src, params)
     }
 
     fn build(source: &gstreamer::Element, params: InputParams) -> Result<Self, PipelineError> {
@@ -156,8 +187,7 @@ impl InputPipeline {
     /// relative to other observations.
     #[must_use]
     pub fn frames_captured(&self) -> u64 {
-        self.sequence
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.sequence.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Transition the pipeline to PLAYING.

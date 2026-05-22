@@ -21,6 +21,7 @@ pub mod v4l2;
 
 pub use bus::{BusEvent, BusListener, WatchedPipeline};
 pub use slot::LatestFrameSlot;
+pub use v4l2::{V4l2Device, V4l2DeviceKind, enumerate_devices};
 
 use fluxframe_core::error::PipelineError;
 

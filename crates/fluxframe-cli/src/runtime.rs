@@ -1,15 +1,16 @@
 //! End-to-end runtime supervisor.
 //!
 //! Owns the lifetime of input/output pipelines, the processing worker
-//! thread and the Ctrl-C signal handler.  Stage 1 wires `videotestsrc`
-//! → effect chain → fakesink/autovideosink only; V4L2 input lands in
-//! Stage 2.
+//! thread and the Ctrl-C signal handler.  Stage 1 wired `videotestsrc`
+//! → effect chain → fakesink/autovideosink only; Stage 2 adds the V4L2
+//! capture and v4l2loopback sink paths.
 //!
 //! GStreamer is intentionally absent from this module's surface: bus
 //! events arrive through the typed [`fluxframe_gst::BusEvent`] enum,
 //! draining is owned by [`fluxframe_gst::BusListener`], and the supervisor
 //! itself only juggles `std::sync` primitives.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
@@ -141,28 +142,70 @@ pub(crate) fn is_testsrc_input(cfg: &FluxConfig) -> bool {
     matches!(cfg.input.backend, BackendKind::Testsrc) || cfg.input.device == "testsrc"
 }
 
-/// Stage 1 entry point: run a passthrough-style chain on `videotestsrc`,
-/// emitting to a fakesink or autovideosink.
+/// Decide whether `cfg` describes a V4L2 capture device.
+///
+/// Both the explicit `BackendKind::V4l2` selection and a `/dev/...` device
+/// path under `BackendKind::Auto` route to the V4L2 capture pipeline.  The
+/// path-prefix heuristic is documented in the Stage 2 plan: with the
+/// `Auto` default, the only way the user can mean "real camera" is to
+/// point at a kernel device node.
+#[must_use]
+pub(crate) fn is_v4l2_input(cfg: &FluxConfig) -> bool {
+    use fluxframe_core::config::BackendKind;
+    matches!(cfg.input.backend, BackendKind::V4l2) || cfg.input.device.starts_with("/dev/")
+}
+
+/// Run a passthrough-style chain on `videotestsrc`, emitting to the sink
+/// resolved from the configuration.
 ///
 /// # Errors
 ///
 /// Propagates [`FluxError`] from pipeline construction, effect chain
 /// preparation, or runtime failures.
 #[tracing::instrument(skip_all, fields(sink = ?cfg.output.device))]
-pub(crate) fn run_testsrc_chain(
+pub(crate) fn run_testsrc_chain(cfg: &FluxConfig, chain: EffectChain) -> Result<(), FluxError> {
+    run_chain(cfg, chain, "testsrc", InputPipeline::build_testsrc)
+}
+
+/// Run the effect chain against a V4L2 capture device.
+///
+/// # Errors
+///
+/// Propagates [`FluxError`] from pipeline construction (including a
+/// structured [`PipelineError::InputDeviceUnavailable`] when the
+/// pre-open check fails), effect chain preparation, or runtime failures.
+#[tracing::instrument(skip_all, fields(device = %cfg.input.device, sink = ?cfg.output.device))]
+pub(crate) fn run_v4l2_chain(cfg: &FluxConfig, chain: EffectChain) -> Result<(), FluxError> {
+    let device = PathBuf::from(&cfg.input.device);
+    run_chain(cfg, chain, "v4l2src", move |params| {
+        InputPipeline::build_v4l2(device, params)
+    })
+}
+
+/// Shared driver for all input backends: takes a closure that builds the
+/// input pipeline so the bus-listener / processing-loop / teardown plumbing
+/// lives in exactly one place.
+fn run_chain<F>(
     cfg: &FluxConfig,
     mut chain: EffectChain,
-) -> Result<(), FluxError> {
+    source_label: &'static str,
+    input_builder: F,
+) -> Result<(), FluxError>
+where
+    F: FnOnce(InputParams) -> Result<InputPipeline, PipelineError>,
+{
     fluxframe_gst::init()?;
 
-    let (input, output, processing_ctx, sink_label) = build_pipelines(cfg)?;
-    chain.prepare_all(&processing_ctx).map_err(FluxError::from)?;
+    let (input, output, processing_ctx, sink_label) = build_pipelines(cfg, input_builder)?;
+    chain
+        .prepare_all(&processing_ctx)
+        .map_err(FluxError::from)?;
 
     info!(
         effects = ?chain.names(),
         input_format = ?cfg.input.format,
         output_format = ?cfg.output.format,
-        "starting Stage 1 pipeline (testsrc -> {sink_label})",
+        "starting pipeline ({source_label} -> {sink_label})",
     );
 
     output.start()?;
@@ -202,18 +245,16 @@ pub(crate) fn run_testsrc_chain(
 
     // Surface bus-reported errors when the processing loop itself was
     // clean, so the operator sees the real cause of shutdown.
-    let bus_err = bus_error
-        .lock()
-        .expect("bus_error mutex poisoned")
-        .take();
+    let bus_err = bus_error.lock().expect("bus_error mutex poisoned").take();
     match (process_result, bus_err) {
         (Ok(()), Some(e)) | (Err(e), _) => Err(e),
         (Ok(()), None) => Ok(()),
     }
 }
 
-fn build_pipelines(
+fn build_pipelines<F>(
     cfg: &FluxConfig,
+    input_builder: F,
 ) -> Result<
     (
         InputPipeline,
@@ -222,7 +263,10 @@ fn build_pipelines(
         &'static str,
     ),
     FluxError,
-> {
+>
+where
+    F: FnOnce(InputParams) -> Result<InputPipeline, PipelineError>,
+{
     let input_params = InputParams::new(
         cfg.input.width,
         cfg.input.height,
@@ -230,6 +274,7 @@ fn build_pipelines(
         cfg.input.format,
     );
     let sink = resolve_output_sink(cfg);
+    let sink_label = output_sink_label(&sink);
     let output_params = OutputParams::new(
         cfg.output.width,
         cfg.output.height,
@@ -238,7 +283,7 @@ fn build_pipelines(
         sink,
     );
 
-    let input = InputPipeline::build_testsrc(input_params)?;
+    let input = input_builder(input_params)?;
     let output = OutputPipeline::build(output_params)?;
 
     let processing_ctx = ProcessingContext {
@@ -248,7 +293,7 @@ fn build_pipelines(
         fps: cfg.input.fps,
     };
 
-    Ok((input, output, processing_ctx, output_sink_label(sink)))
+    Ok((input, output, processing_ctx, sink_label))
 }
 
 /// Build the [`BusListener`] watching both pipelines.  The listener is
@@ -379,23 +424,30 @@ fn teardown(input: &InputPipeline, output: &OutputPipeline, chain: &mut EffectCh
 }
 
 fn resolve_output_sink(cfg: &FluxConfig) -> OutputSink {
-    // Stage 1: route everything to fakesink unless the user explicitly
-    // asked for the auto sink via the device string.  Stage 2 will map
-    // a real `/dev/videoN` path onto `v4l2sink`.
-    if cfg.output.device == "auto" {
-        OutputSink::Auto
-    } else {
-        OutputSink::Fake
+    // Routing rules (see Stage 2 plan, §"Output side"):
+    //   * "auto"      -> autovideosink (manual glance verification).
+    //   * "fakesink"  -> fakesink (CI / dev smoke without a loopback).
+    //   * /dev/...    -> v4l2sink to a loopback device.
+    //   * everything else -> fakesink (CI / tests).
+    match cfg.output.device.as_str() {
+        "auto" => OutputSink::Auto,
+        "fakesink" => OutputSink::Fake,
+        device if device.starts_with("/dev/") => OutputSink::V4l2Loopback {
+            device: PathBuf::from(device),
+        },
+        _ => OutputSink::Fake,
     }
 }
 
-fn output_sink_label(sink: OutputSink) -> &'static str {
+fn output_sink_label(sink: &OutputSink) -> &'static str {
     // `OutputSink` is not `#[non_exhaustive]` inside the workspace, so
-    // this match is genuinely exhaustive: when Stage 2 adds `V4l2Loopback`
-    // the compiler will point us here.
+    // this match is genuinely exhaustive: adding a variant will produce
+    // a compile-time prompt here.  Borrowed because `V4l2Loopback` owns
+    // a `PathBuf` and is therefore no longer `Copy`.
     match sink {
         OutputSink::Fake => "fakesink",
         OutputSink::Auto => "autovideosink",
+        OutputSink::V4l2Loopback { .. } => "v4l2sink",
     }
 }
 
@@ -442,15 +494,57 @@ mod tests {
     }
 
     #[test]
-    fn resolve_output_sink_defaults_to_fake() {
+    fn resolve_output_sink_maps_dev_path_to_v4l2_loopback() {
         let mut cfg = base_cfg();
         cfg.output.device = "/dev/video10".into();
+        assert_eq!(
+            resolve_output_sink(&cfg),
+            OutputSink::V4l2Loopback {
+                device: PathBuf::from("/dev/video10"),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_output_sink_defaults_to_fake() {
+        let mut cfg = base_cfg();
+        cfg.output.device = "fakesink".into();
         assert_eq!(resolve_output_sink(&cfg), OutputSink::Fake);
     }
 
     #[test]
     fn output_sink_label_covers_each_variant() {
-        assert_eq!(output_sink_label(OutputSink::Fake), "fakesink");
-        assert_eq!(output_sink_label(OutputSink::Auto), "autovideosink");
+        assert_eq!(output_sink_label(&OutputSink::Fake), "fakesink");
+        assert_eq!(output_sink_label(&OutputSink::Auto), "autovideosink");
+        assert_eq!(
+            output_sink_label(&OutputSink::V4l2Loopback {
+                device: PathBuf::from("/dev/video10"),
+            }),
+            "v4l2sink"
+        );
+    }
+
+    #[test]
+    fn is_v4l2_input_recognises_backend() {
+        let mut cfg = base_cfg();
+        cfg.input.backend = BackendKind::V4l2;
+        cfg.input.device = "/dev/video0".into();
+        assert!(is_v4l2_input(&cfg));
+    }
+
+    #[test]
+    fn is_v4l2_input_recognises_dev_path() {
+        let mut cfg = base_cfg();
+        cfg.input.backend = BackendKind::Auto;
+        cfg.input.device = "/dev/video2".into();
+        assert!(is_v4l2_input(&cfg));
+    }
+
+    #[test]
+    fn is_v4l2_input_rejects_testsrc() {
+        let mut cfg = base_cfg();
+        cfg.input.backend = BackendKind::Auto;
+        cfg.input.device = "testsrc".into();
+        assert!(!is_v4l2_input(&cfg));
     }
 }

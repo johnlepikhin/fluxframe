@@ -1,12 +1,15 @@
-//! `fluxframe run` — Stage 1 wires synthetic source → effect chain → sink.
-//! V4L2 input lands in Stage 2.
+//! `fluxframe run` — dispatch the configured input backend onto the
+//! shared runtime supervisor (`testsrc` and V4L2 are both supported as
+//! of Stage 2).
 
 use fluxframe_core::{FluxError, normalise_effect_name};
 use tracing::info;
 
 use crate::cli::RunArgs;
 use crate::config_merge::{CliOverrides, apply, load};
-use crate::runtime::{default_registry, is_testsrc_input, run_testsrc_chain};
+use crate::runtime::{
+    default_registry, is_testsrc_input, is_v4l2_input, run_testsrc_chain, run_v4l2_chain,
+};
 
 /// Entry point for `fluxframe run`.
 ///
@@ -53,14 +56,22 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
     };
 
     let registry = default_registry();
-    let chain = registry.build_chain(&chain_names).map_err(FluxError::from)?;
+    let chain = registry
+        .build_chain(&chain_names)
+        .map_err(FluxError::from)?;
 
+    // Dispatch order: `testsrc` first so an explicit `--input testsrc` wins
+    // over the `/dev/` heuristic in `is_v4l2_input`.  Anything not matched
+    // by either rule (e.g. a future RTSP URL) is rejected with a hint
+    // listing the currently supported inputs.
     if is_testsrc_input(&cfg) {
         run_testsrc_chain(&cfg, chain)
+    } else if is_v4l2_input(&cfg) {
+        run_v4l2_chain(&cfg, chain)
     } else {
         Err(FluxError::Config {
-            reason: format!("input '{}' is not handled in Stage 1", cfg.input.device),
-            hint: Some("use --input testsrc for Stage 1; V4L2 capture lands in Stage 2".into()),
+            reason: format!("input '{}' is not handled", cfg.input.device),
+            hint: Some("supported inputs: testsrc, /dev/video* (V4L2)".into()),
         })
     }
 }

@@ -1,9 +1,10 @@
 //! GStreamer output pipeline construction.
 //!
-//! Stage 1 supports `fakesink` (CI/tests, no display) and `autovideosink`
-//! (manual glance verification).  `v4l2sink` for v4l2loopback lands in
-//! Stage 2.
+//! Stage 1 supported `fakesink` (CI/tests, no display) and `autovideosink`
+//! (manual glance verification).  Stage 2 adds the `v4l2sink` branch for
+//! `v4l2loopback` virtual cameras.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,28 +15,39 @@ use gstreamer_app::AppSrc;
 use tracing::trace;
 
 use crate::frame_conv::frame_to_buffer;
-use crate::util::{build_caps, make_element};
+use crate::util::{build_caps, check_v4l2_output_access, make_element};
 
-/// Output sink selection for Stage 1.  Stage 2 will add `V4l2Loopback`.
+/// Output sink selection.
 ///
 /// Intentionally *not* `#[non_exhaustive]`: this crate is workspace-internal
-/// with a single version, so adding a variant in Stage 2 should produce a
-/// compile-time prompt at every `match` site rather than a silent wildcard
-/// fall-through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// with a single version, so adding a variant should produce a compile-time
+/// prompt at every `match` site rather than a silent wildcard fall-through.
+///
+/// No longer `Copy` after Stage 2: `V4l2Loopback` carries an owned
+/// [`PathBuf`].  Use [`Clone`] explicitly where needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutputSink {
     /// Discards buffers immediately — for tests and CI.
     Fake,
     /// Picks a platform display sink (Wayland/X11) — for manual glance
     /// verification.
     Auto,
+    /// Writes to a `v4l2loopback` virtual camera device.
+    V4l2Loopback {
+        /// Loopback device path (e.g. `/dev/video10`).
+        device: PathBuf,
+    },
 }
 
 /// Negotiated output parameters.
 ///
 /// `#[non_exhaustive]` so adding optional fields (e.g. v4l2loopback device
-/// path) in Stage 2 is not a breaking change for downstream crates.
-#[derive(Debug, Clone, Copy)]
+/// path) is not a breaking change for downstream crates.
+///
+/// No longer `Copy` after Stage 2 because [`OutputSink`] now carries an
+/// owned [`PathBuf`] for the `V4l2Loopback` variant; only [`Clone`] is
+/// derived.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct OutputParams {
     /// Frame width in pixels.
@@ -86,6 +98,18 @@ impl OutputPipeline {
     /// Returns [`PipelineError`] if any element cannot be instantiated
     /// or linking fails.
     pub fn build(params: OutputParams) -> Result<Self, PipelineError> {
+        // Destructure up-front so the `sink` variant (which owns a PathBuf
+        // for V4l2Loopback) can move into the match arm without forcing
+        // clippy's `needless_pass_by_value` lint on the public signature.
+        let OutputParams {
+            width,
+            height,
+            fps,
+            format,
+            sink,
+            ..
+        } = params;
+
         let pipeline = gstreamer::Pipeline::with_name("fluxframe-output");
 
         let appsrc_elem = make_element("appsrc", "output_src")?;
@@ -103,9 +127,17 @@ impl OutputPipeline {
         let videoconvert = make_element("videoconvert", "output_videoconvert")?;
         let videoscale = make_element("videoscale", "output_videoscale")?;
 
-        let sink_elem = match params.sink {
+        let sink_elem = match sink {
             OutputSink::Fake => make_element("fakesink", "output_sink")?,
             OutputSink::Auto => make_element("autovideosink", "output_sink")?,
+            OutputSink::V4l2Loopback { device } => {
+                // Pre-open write check so EACCES/EBUSY/ENOENT surface with a
+                // hint *before* `v4l2sink` returns an opaque GStreamer error.
+                check_v4l2_output_access(&device)?;
+                let elem = make_element("v4l2sink", "output_sink")?;
+                elem.set_property_from_str("device", device.to_string_lossy().as_ref());
+                elem
+            }
         };
         sink_elem.set_property("sync", false);
 
@@ -133,7 +165,7 @@ impl OutputPipeline {
             })?;
 
         // Negotiate caps on the appsrc so downstream knows what to expect.
-        let caps = build_caps(params.width, params.height, params.fps, params.format)?;
+        let caps = build_caps(width, height, fps, format)?;
         appsrc.set_caps(Some(&caps));
         appsrc.set_format(gstreamer::Format::Time);
 
@@ -216,5 +248,41 @@ impl OutputPipeline {
     #[must_use]
     pub fn bus(&self) -> gstreamer::Bus {
         self.pipeline.bus().expect("pipelines always have a bus")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_sink_v4l2loopback_is_clone() {
+        let sink = OutputSink::V4l2Loopback {
+            device: PathBuf::from("/dev/video10"),
+        };
+        let cloned = sink.clone();
+        assert!(matches!(cloned, OutputSink::V4l2Loopback { .. }));
+    }
+
+    #[test]
+    fn output_params_carry_v4l2_device() {
+        let params = OutputParams::new(
+            640,
+            480,
+            30,
+            PixelFormat::Yuy2,
+            OutputSink::V4l2Loopback {
+                device: PathBuf::from("/dev/video10"),
+            },
+        );
+        match &params.sink {
+            OutputSink::V4l2Loopback { device } => {
+                assert_eq!(device, &PathBuf::from("/dev/video10"));
+            }
+            other => panic!("expected V4l2Loopback, got {other:?}"),
+        }
+        // `OutputParams` no longer implements `Copy`; ensure it is still
+        // `Clone` for the runtime layer that may dup-and-pass it.
+        let _cloned = params.clone();
     }
 }
