@@ -13,7 +13,8 @@ use gstreamer::prelude::*;
 use gstreamer_app::AppSrc;
 use tracing::trace;
 
-use crate::frame_conv::{frame_to_buffer, pixel_format_to_gst};
+use crate::frame_conv::frame_to_buffer;
+use crate::util::{build_caps, make_element};
 
 /// Output sink selection for Stage 1.  Stage 2 will add `V4l2Loopback`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +28,11 @@ pub enum OutputSink {
 }
 
 /// Negotiated output parameters.
+///
+/// `#[non_exhaustive]` so adding optional fields (e.g. v4l2loopback device
+/// path) in Stage 2 is not a breaking change for downstream crates.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct OutputParams {
     /// Frame width in pixels.
     pub width: u32,
@@ -39,6 +44,24 @@ pub struct OutputParams {
     pub format: PixelFormat,
     /// Choice of terminal sink element.
     pub sink: OutputSink,
+}
+
+impl OutputParams {
+    /// Construct a fully-specified [`OutputParams`].
+    ///
+    /// Provided because the struct is `#[non_exhaustive]`, so cross-crate
+    /// callers cannot use the record literal syntax.  Inside this crate
+    /// the literal still works.
+    #[must_use]
+    pub fn new(width: u32, height: u32, fps: u32, format: PixelFormat, sink: OutputSink) -> Self {
+        Self {
+            width,
+            height,
+            fps,
+            format,
+            sink,
+        }
+    }
 }
 
 /// Output pipeline owning the GStreamer elements.
@@ -106,7 +129,8 @@ impl OutputPipeline {
             })?;
 
         // Negotiate caps on the appsrc so downstream knows what to expect.
-        appsrc.set_caps(Some(&build_caps(params)));
+        let caps = build_caps(params.width, params.height, params.fps, params.format)?;
+        appsrc.set_caps(Some(&caps));
         appsrc.set_format(gstreamer::Format::Time);
 
         Ok(Self {
@@ -135,18 +159,24 @@ impl OutputPipeline {
 
     /// Push one processed frame into the pipeline.
     ///
+    /// Takes the frame by value as a forward-compatibility hook for the
+    /// Stage 5 zero-copy path: the frame's backing memory will need to
+    /// transfer into the `gst::Buffer` so the mapping outlives this call.
+    /// Today the body still copies the pixel data regardless.
+    ///
     /// # Errors
     ///
     /// Returns [`PipelineError`] if buffer construction fails or the
     /// `appsrc` rejects the push (e.g. pipeline closed).
-    pub fn push_frame(&self, frame: &VideoFrame) -> Result<(), PipelineError> {
+    pub fn push_frame(&self, frame: VideoFrame) -> Result<(), PipelineError> {
         if !self.started.load(Ordering::Acquire) {
             return Err(PipelineError::Runtime {
                 reason: "output pipeline not started".into(),
             });
         }
+        let seq = frame.meta.sequence;
         let buffer = frame_to_buffer(frame)?;
-        trace!(seq = frame.meta.sequence, "pushing frame to appsrc");
+        trace!(seq, "pushing frame to appsrc");
         self.appsrc
             .push_buffer(buffer)
             .map(|_| ())
@@ -173,32 +203,15 @@ impl OutputPipeline {
             })
     }
 
-    /// Borrow the underlying pipeline (bus listening, state queries).
+    /// Borrow the underlying pipeline so the runtime supervisor can attach
+    /// a bus listener.
+    ///
+    /// Leaks the GStreamer type by design — the bus is the only sanctioned
+    /// integration point between this crate and the runtime layer.  Do not
+    /// use this handle for state changes; route those through [`Self::start`]
+    /// and [`Self::stop`].
     #[must_use]
-    pub fn pipeline(&self) -> &gstreamer::Pipeline {
+    pub fn pipeline_for_bus(&self) -> &gstreamer::Pipeline {
         &self.pipeline
     }
-}
-
-fn make_element(factory: &str, name: &str) -> Result<gstreamer::Element, PipelineError> {
-    gstreamer::ElementFactory::make(factory)
-        .name(name)
-        .build()
-        .map_err(|_| PipelineError::MissingElement {
-            element: factory.into(),
-            hint: format!("GStreamer plugin providing `{factory}` is not installed"),
-        })
-}
-
-fn build_caps(params: OutputParams) -> gstreamer::Caps {
-    let gst_fmt = pixel_format_to_gst(params.format);
-    gstreamer::Caps::builder("video/x-raw")
-        .field("format", gst_fmt.to_str())
-        .field("width", i32::try_from(params.width).unwrap_or(i32::MAX))
-        .field("height", i32::try_from(params.height).unwrap_or(i32::MAX))
-        .field(
-            "framerate",
-            gstreamer::Fraction::new(i32::try_from(params.fps).unwrap_or(i32::MAX), 1),
-        )
-        .build()
 }

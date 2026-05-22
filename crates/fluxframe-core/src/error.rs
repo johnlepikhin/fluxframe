@@ -139,6 +139,19 @@ pub enum PipelineError {
     #[error("pixel format '{format:?}' is not supported by this stage")]
     UnsupportedPixelFormat { format: PixelFormat },
 
+    /// A GStreamer pixel format was received that does not map to any
+    /// FluxFrame [`PixelFormat`].
+    ///
+    /// The previous behaviour was to wrap such a format in
+    /// `UnsupportedPixelFormat { format: PixelFormat::Rgb }`, which lied to
+    /// the caller about what was actually received.  Carrying the raw
+    /// GStreamer label preserves the diagnostic for the §27 renderer.
+    #[error("unsupported GStreamer pixel format: {gst_label}")]
+    UnsupportedGstFormat {
+        /// The GStreamer format label that could not be mapped (e.g. `I420`).
+        gst_label: String,
+    },
+
     /// Upstream and downstream caps could not be reconciled.
     #[error("caps negotiation failed: {reason}")]
     CapsNegotiationFailed { reason: String },

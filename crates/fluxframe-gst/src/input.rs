@@ -6,23 +6,34 @@
 //! [`VideoFrame`] from a captured `gst::Sample` happens in exactly one
 //! place ([`crate::frame_conv::sample_to_frame`]).
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+
 use fluxframe_core::error::PipelineError;
 use fluxframe_core::frame::PixelFormat;
 use gstreamer::prelude::*;
 use gstreamer_app::AppSink;
 use tracing::{debug, error, trace};
 
-use crate::frame_conv::{pixel_format_to_gst, sample_to_frame};
+use crate::frame_conv::sample_to_frame;
 use crate::slot::LatestFrameSlot;
+use crate::util::{build_caps, make_element};
 
 /// Capture pipeline owning the GStreamer elements and the shared frame slot.
 pub struct InputPipeline {
     pipeline: gstreamer::Pipeline,
     slot: LatestFrameSlot,
+    /// Per-pipeline monotonic frame counter.  Lives in an [`Arc`] so the
+    /// `appsink` callback can borrow it for the lifetime of the pipeline.
+    sequence: Arc<AtomicU64>,
 }
 
 /// Negotiated capture parameters.
+///
+/// `#[non_exhaustive]` so adding optional fields (e.g. device path, colour
+/// range hint) in Stage 2 is not a breaking change for downstream crates.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct InputParams {
     /// Frame width in pixels.
     pub width: u32,
@@ -32,6 +43,23 @@ pub struct InputParams {
     pub fps: u32,
     /// Pixel format expected downstream.
     pub format: PixelFormat,
+}
+
+impl InputParams {
+    /// Construct a fully-specified [`InputParams`].
+    ///
+    /// Provided because the struct is `#[non_exhaustive]`, so cross-crate
+    /// callers cannot use the record literal syntax.  Inside this crate
+    /// the literal still works.
+    #[must_use]
+    pub fn new(width: u32, height: u32, fps: u32, format: PixelFormat) -> Self {
+        Self {
+            width,
+            height,
+            fps,
+            format,
+        }
+    }
 }
 
 impl InputPipeline {
@@ -63,7 +91,7 @@ impl InputPipeline {
         let videoscale = make_element("videoscale", "input_videoscale")?;
         let capsfilter = make_element("capsfilter", "input_capsfilter")?;
 
-        let caps = build_caps(params);
+        let caps = build_caps(params.width, params.height, params.fps, params.format)?;
         capsfilter.set_property("caps", &caps);
 
         let appsink_elem = make_element("appsink", "input_sink")?;
@@ -104,15 +132,32 @@ impl InputPipeline {
                 })?;
 
         let slot = LatestFrameSlot::new();
-        attach_appsink_callbacks(&appsink, slot.clone());
+        let sequence = Arc::new(AtomicU64::new(0));
+        attach_appsink_callbacks(&appsink, slot.clone(), Arc::clone(&sequence));
 
-        Ok(Self { pipeline, slot })
+        Ok(Self {
+            pipeline,
+            slot,
+            sequence,
+        })
     }
 
     /// Shared frame slot — published frames land here.  Clones cheaply.
     #[must_use]
     pub fn slot(&self) -> LatestFrameSlot {
         self.slot.clone()
+    }
+
+    /// Snapshot of the per-pipeline frame counter — equals the sequence
+    /// number that will be assigned to the *next* captured frame.
+    ///
+    /// Exposed primarily for tests and metrics; the value is read with
+    /// `Relaxed` ordering and therefore carries no synchronisation guarantee
+    /// relative to other observations.
+    #[must_use]
+    pub fn frames_captured(&self) -> u64 {
+        self.sequence
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Transition the pipeline to PLAYING.
@@ -145,20 +190,25 @@ impl InputPipeline {
             })
     }
 
-    /// Borrow the underlying pipeline for advanced operations (bus
-    /// listening, querying state).  Intended for the runtime supervisor.
+    /// Borrow the underlying pipeline so the runtime supervisor can attach
+    /// a bus listener.
+    ///
+    /// Leaks the GStreamer type by design — the bus is the only sanctioned
+    /// integration point between this crate and the runtime layer.  Do not
+    /// use this handle for state changes; route those through [`Self::start`]
+    /// and [`Self::stop`].
     #[must_use]
-    pub fn pipeline(&self) -> &gstreamer::Pipeline {
+    pub fn pipeline_for_bus(&self) -> &gstreamer::Pipeline {
         &self.pipeline
     }
 }
 
-fn attach_appsink_callbacks(appsink: &AppSink, slot: LatestFrameSlot) {
+fn attach_appsink_callbacks(appsink: &AppSink, slot: LatestFrameSlot, sequence: Arc<AtomicU64>) {
     appsink.set_callbacks(
         gstreamer_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
                 let sample = sink.pull_sample().map_err(|_| gstreamer::FlowError::Eos)?;
-                match sample_to_frame(&sample) {
+                match sample_to_frame(&sample, &sequence) {
                     Ok(frame) => {
                         trace!(seq = frame.meta.sequence, "captured frame");
                         slot.push(frame);
@@ -176,27 +226,4 @@ fn attach_appsink_callbacks(appsink: &AppSink, slot: LatestFrameSlot) {
             .build(),
     );
     debug!("input appsink callbacks installed");
-}
-
-fn make_element(factory: &str, name: &str) -> Result<gstreamer::Element, PipelineError> {
-    gstreamer::ElementFactory::make(factory)
-        .name(name)
-        .build()
-        .map_err(|_| PipelineError::MissingElement {
-            element: factory.into(),
-            hint: format!("GStreamer plugin providing `{factory}` is not installed"),
-        })
-}
-
-fn build_caps(params: InputParams) -> gstreamer::Caps {
-    let gst_fmt = pixel_format_to_gst(params.format);
-    gstreamer::Caps::builder("video/x-raw")
-        .field("format", gst_fmt.to_str())
-        .field("width", i32::try_from(params.width).unwrap_or(i32::MAX))
-        .field("height", i32::try_from(params.height).unwrap_or(i32::MAX))
-        .field(
-            "framerate",
-            gstreamer::Fraction::new(i32::try_from(params.fps).unwrap_or(i32::MAX), 1),
-        )
-        .build()
 }

@@ -1,7 +1,6 @@
 //! `fluxframe run` — Stage 1 wires synthetic source → effect chain → sink.
 //! V4L2 input lands in Stage 2.
 
-use fluxframe_core::error::EffectError;
 use fluxframe_core::{FluxError, normalise_effect_name};
 use tracing::info;
 
@@ -54,7 +53,7 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
     };
 
     let registry = default_registry();
-    let chain = registry.build_chain(&chain_names).map_err(map_effect_err)?;
+    let chain = registry.build_chain(&chain_names).map_err(FluxError::from)?;
 
     if is_testsrc_input(&cfg) {
         run_testsrc_chain(&cfg, chain)
@@ -64,8 +63,4 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
             hint: Some("use --input testsrc for Stage 1; V4L2 capture lands in Stage 2".into()),
         })
     }
-}
-
-fn map_effect_err(e: EffectError) -> FluxError {
-    FluxError::from(e)
 }

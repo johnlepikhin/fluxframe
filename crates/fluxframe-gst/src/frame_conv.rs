@@ -13,11 +13,13 @@ use std::time::Duration;
 use fluxframe_core::error::PipelineError;
 use fluxframe_core::frame::{FrameBuffer, FrameMeta, PixelFormat, Stride, Timestamp, VideoFrame};
 use gstreamer_video::VideoInfo;
+use tracing::warn;
 
 /// Translate a GStreamer pixel format into FluxFrame's enum.
 ///
-/// Returns [`PipelineError::UnsupportedPixelFormat`] for variants the
-/// MVP processing chain does not handle.
+/// Returns [`PipelineError::UnsupportedGstFormat`] for variants the MVP
+/// processing chain does not handle, carrying the raw GStreamer label so
+/// diagnostics do not have to invent a placeholder [`PixelFormat`].
 pub fn pixel_format_from_gst(
     fmt: gstreamer_video::VideoFormat,
 ) -> Result<PixelFormat, PipelineError> {
@@ -30,8 +32,8 @@ pub fn pixel_format_from_gst(
         G::Nv12 => PixelFormat::Nv12,
         G::Gray8 => PixelFormat::Gray8,
         other => {
-            return Err(PipelineError::UnsupportedPixelFormat {
-                format: gst_format_label_to_pixel_format(other).unwrap_or(PixelFormat::Rgb),
+            return Err(PipelineError::UnsupportedGstFormat {
+                gst_label: other.to_str().to_string(),
             });
         }
     })
@@ -51,37 +53,26 @@ pub fn pixel_format_to_gst(fmt: PixelFormat) -> gstreamer_video::VideoFormat {
     }
 }
 
-/// Pseudo-mapping used only inside [`PipelineError::UnsupportedPixelFormat`]
-/// so the error variant carries *some* `PixelFormat` even when the GStreamer
-/// format is outside our enum.  Returns `None` for truly unknown formats.
-fn gst_format_label_to_pixel_format(fmt: gstreamer_video::VideoFormat) -> Option<PixelFormat> {
-    use gstreamer_video::VideoFormat as G;
-    match fmt {
-        G::Rgb => Some(PixelFormat::Rgb),
-        G::Rgba => Some(PixelFormat::Rgba),
-        G::Bgr => Some(PixelFormat::Bgr),
-        G::Yuy2 => Some(PixelFormat::Yuy2),
-        G::Nv12 => Some(PixelFormat::Nv12),
-        G::Gray8 => Some(PixelFormat::Gray8),
-        _ => None,
-    }
-}
-
-/// Atomically increasing sequence number assigned to each captured frame.
-static FRAME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 /// Convert a `gst::Sample` (one frame's worth of buffer + caps) into a
 /// [`VideoFrame`].
 ///
 /// Performs an owned copy of the buffer's bytes — Stage 1's hot path is
 /// not yet zero-copy.
 ///
+/// `sequence` is the per-pipeline monotonic counter.  Lives outside this
+/// function so each [`crate::input::InputPipeline`] instance owns its own
+/// numbering instead of sharing a process-global atomic (which entangled
+/// concurrent test pipelines and any future multi-input deployment).
+///
 /// # Errors
 ///
 /// Returns [`PipelineError`] if caps are missing/unparseable, the buffer
 /// cannot be mapped, the pixel format is not supported, or the buffer
 /// does not match the negotiated dimensions.
-pub fn sample_to_frame(sample: &gstreamer::Sample) -> Result<VideoFrame, PipelineError> {
+pub fn sample_to_frame(
+    sample: &gstreamer::Sample,
+    sequence: &AtomicU64,
+) -> Result<VideoFrame, PipelineError> {
     let caps = sample.caps().ok_or_else(|| PipelineError::Runtime {
         reason: "sample has no caps".into(),
     })?;
@@ -121,7 +112,7 @@ pub fn sample_to_frame(sample: &gstreamer::Sample) -> Result<VideoFrame, Pipelin
     let data = FrameBuffer::Owned(map.as_slice()[..expected].to_vec());
     let stride = Stride::Packed(width as usize * bytes_per_pixel);
 
-    let sequence = FRAME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let seq = sequence.fetch_add(1, Ordering::Relaxed);
     let source_timestamp = buffer.pts().map(|ts| Timestamp::from_nanos(ts.nseconds()));
     let duration = buffer
         .duration()
@@ -134,7 +125,7 @@ pub fn sample_to_frame(sample: &gstreamer::Sample) -> Result<VideoFrame, Pipelin
         format,
         stride,
         meta: FrameMeta {
-            sequence,
+            sequence: seq,
             timestamp: source_timestamp.unwrap_or_default(),
             source_timestamp,
             duration,
@@ -145,19 +136,33 @@ pub fn sample_to_frame(sample: &gstreamer::Sample) -> Result<VideoFrame, Pipelin
 /// Wrap a [`VideoFrame`] into a fresh `gst::Buffer` that can be pushed
 /// into an `appsrc`.  Copies the pixel data.
 ///
+/// Takes the frame by value as a forward-compatibility hook: when Stage 5
+/// switches to zero-copy via `FrameBuffer::Mapped`, ownership of the frame
+/// will need to transfer into the buffer so the `gst::Memory` mapping can
+/// outlive the call.  Today the body still copies regardless.
+///
 /// # Errors
 ///
 /// Returns [`PipelineError::Runtime`] if buffer allocation fails.
-pub fn frame_to_buffer(frame: &VideoFrame) -> Result<gstreamer::Buffer, PipelineError> {
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Stage 5 will move ownership of the frame's backing memory into the gst::Buffer; \
+              keeping the by-value signature now avoids a churning API break later."
+)]
+pub fn frame_to_buffer(frame: VideoFrame) -> Result<gstreamer::Buffer, PipelineError> {
     let bytes = frame.data.as_slice();
     let mut buffer =
         gstreamer::Buffer::with_size(bytes.len()).map_err(|e| PipelineError::Runtime {
             reason: format!("Buffer::with_size failed: {e}"),
         })?;
     {
-        let buffer_ref = buffer.get_mut().ok_or_else(|| PipelineError::Runtime {
-            reason: "buffer is not writable immediately after allocation".into(),
-        })?;
+        // `Buffer::with_size` returns a freshly allocated buffer whose
+        // refcount is exactly one, so `get_mut` is guaranteed to succeed
+        // by the GStreamer contract.  We treat a failure here as a
+        // programming error rather than a runtime condition.
+        let buffer_ref = buffer
+            .get_mut()
+            .expect("buffer is uniquely owned immediately after with_size allocation");
         let mut map = buffer_ref
             .map_writable()
             .map_err(|_| PipelineError::Runtime {
@@ -166,13 +171,23 @@ pub fn frame_to_buffer(frame: &VideoFrame) -> Result<gstreamer::Buffer, Pipeline
         map.as_mut_slice().copy_from_slice(bytes);
     }
     {
-        let buffer_ref = buffer.get_mut().expect("just allocated");
+        let buffer_ref = buffer
+            .get_mut()
+            .expect("buffer is uniquely owned immediately after with_size allocation");
         buffer_ref.set_pts(gstreamer::ClockTime::from_nseconds(
             frame.meta.timestamp.as_nanos(),
         ));
         if let Some(d) = frame.meta.duration {
-            if let Ok(nanos) = u64::try_from(d.as_nanos()) {
-                buffer_ref.set_duration(gstreamer::ClockTime::from_nseconds(nanos));
+            match u64::try_from(d.as_nanos()) {
+                Ok(nanos) => {
+                    buffer_ref.set_duration(gstreamer::ClockTime::from_nseconds(nanos));
+                }
+                Err(_) => {
+                    warn!(
+                        duration_ns = ?d.as_nanos(),
+                        "frame duration overflows u64 nanoseconds; skipping set_duration"
+                    );
+                }
             }
         }
     }

@@ -15,6 +15,7 @@ pub mod frame_conv;
 pub mod input;
 pub mod output;
 pub mod slot;
+mod util;
 pub mod v4l2;
 
 pub use slot::LatestFrameSlot;

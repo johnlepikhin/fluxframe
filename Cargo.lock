@@ -218,6 +218,8 @@ dependencies = [
  "fluxframe-core",
  "fluxframe-effects",
  "fluxframe-gst",
+ "gstreamer",
+ "parking_lot",
  "serde",
  "toml 0.8.23",
  "tracing",
