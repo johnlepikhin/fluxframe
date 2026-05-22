@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use fluxframe_core::{FluxConfig, FluxError, normalise_effect_name};
-use fluxframe_effects::ml::{ModelConfig, OnnxEngine};
+use fluxframe_effects::ml::OnnxEngine;
 use fluxframe_gst::{V4l2DeviceKind, enumerate_devices};
 use tracing::{info, warn};
 
@@ -206,29 +206,7 @@ fn check_model_file(path: &Path) -> Result<(), FluxError> {
             hint: Some("pass --model <path> pointing at a valid ONNX model".into()),
         });
     }
-
-    // TODO(stage-4): consolidate with `benchmark::load_or_default_config`.
-    // Sidecar TOML: `<model>.toml` next to the `.onnx` file.
-    let sidecar = path.with_extension("toml");
-    let config = if sidecar.exists() {
-        info!(sidecar = %sidecar.display(), "loading model config sidecar");
-        ModelConfig::load(&sidecar)?
-    } else {
-        warn!(
-            sidecar = %sidecar.display(),
-            "no model config sidecar found; using minimal defaults \
-             — Stage 4 effects will likely refuse this model",
-        );
-        ModelConfig::from_toml_str(
-            r#"
-name = "<unknown>"
-input_width = 1
-input_height = 1
-"#,
-        )?
-    };
-
-    info!(model = %path.display(), name = %config.name, "loading ONNX session");
+    let config = fluxframe_effects::ml::load_sidecar_or_placeholder(path)?;
     let engine = OnnxEngine::load(path, config)?;
     info!(
         inputs = engine.input_count(),

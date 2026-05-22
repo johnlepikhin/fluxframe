@@ -18,25 +18,21 @@ use std::sync::OnceLock;
 use fluxframe_core::error::InferenceError;
 use fluxframe_core::traits::{InferenceEngine, InferenceInput, InferenceOutput, ModelInfo};
 use ort::session::Session;
-use ort::value::Tensor;
+use ort::value::{DynValue, Tensor};
 use tracing::{debug, info};
 
 use super::model_config::ModelConfig;
 
 /// Ensure the ONNX Runtime library is initialised exactly once per process.
 ///
-/// Subsequent calls return the cached outcome — including the cached
-/// failure when the dynamic library could not be loaded — so the second
-/// engine load is cheap and deterministic.
+/// Marks `ort::init` as attempted; the actual dlopen happens lazily in
+/// `Session::builder`, so each subsequent `load` reports a fresh dylib
+/// error (no cached failure).
 fn ensure_runtime_initialised() {
-    // `ort::init().commit()` returns `bool` in 2.0-rc.x: `true` when the
-    // environment was registered, `false` when something earlier in the
-    // process already registered one (also fine for us).  The dynamic
-    // load failure surfaces later, from `Session::builder()`, so we
-    // remap it to `BackendUnavailable` inside `OnnxEngine::load`.
-    // Wrapping the call in `OnceLock` keeps it idempotent.
-    static INIT: OnceLock<bool> = OnceLock::new();
-    INIT.get_or_init(|| ort::init().commit());
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = ort::init().commit();
+    });
 }
 
 /// Decide whether an `ort::Error` from `Session::builder()` looks like a
@@ -65,13 +61,19 @@ fn map_backend_or_load_error(message: &str) -> InferenceError {
 /// ONNX Runtime-backed inference engine.
 ///
 /// One instance owns one [`ort::session::Session`] plus the
-/// [`ModelConfig`] that describes its tensor IO.  The engine is `Send`
-/// (via `InferenceEngine`) but, like the underlying `ort::Session`, not
-/// `Sync` — the runtime pins it to a single worker thread.
+/// [`ModelConfig`] that describes its tensor IO.
+///
+/// Send-only by API contract through `InferenceEngine: Send`.  The
+/// underlying `ort::Session` is `Sync` upstream, but our
+/// `infer(&mut self)` enforces exclusive access — wrap in
+/// `Arc<Mutex<dyn InferenceEngine>>` for sharing.
 pub struct OnnxEngine {
     config: ModelConfig,
     session: Session,
     info: ModelInfo,
+    // Cached at load to avoid per-frame metadata reads.
+    input_name: String,
+    output_name: String,
 }
 
 impl OnnxEngine {
@@ -80,7 +82,8 @@ impl OnnxEngine {
     /// Initialises the ONNX Runtime on first call (idempotent across the
     /// process via a [`OnceLock`]), opens the model file as a session
     /// and snapshots the static [`ModelInfo`] so the hot path does not
-    /// touch `ort` types again.
+    /// touch `ort` types again.  The model path is canonicalised so log
+    /// messages and error reports show a stable absolute path.
     ///
     /// # Errors
     ///
@@ -89,27 +92,56 @@ impl OnnxEngine {
     /// * [`InferenceError::ModelNotFound`] — the path does not exist.
     /// * [`InferenceError::ModelLoadFailed`] — the path exists but the
     ///   session builder rejected it (corrupt model, unsupported opset,
-    ///   etc.).
+    ///   etc.), or the model exposes no inputs.
+    /// * [`InferenceError::InvalidModelConfig`] — `config.output_index`
+    ///   refers to an output the model does not expose.
     pub fn load(model_path: &Path, config: ModelConfig) -> Result<Self, InferenceError> {
         ensure_runtime_initialised();
-        if !model_path.exists() {
-            return Err(InferenceError::ModelNotFound {
+        let canonical = std::fs::canonicalize(model_path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => InferenceError::ModelNotFound {
                 path: model_path.display().to_string(),
-            });
-        }
-        info!(model = %model_path.display(), name = %config.name, "loading ONNX session");
+            },
+            _ => InferenceError::ModelLoadFailed {
+                reason: format!("cannot canonicalize {}: {e}", model_path.display()),
+            },
+        })?;
+        info!(model = %canonical.display(), name = %config.name, "loading ONNX session");
         // `Session::builder()` is where `load-dynamic` actually tries to
         // dlopen libonnxruntime.  Failures there are remapped to
         // `BackendUnavailable` (with the ORT_DYLIB_PATH hint) so the
         // CLI can render the §27 "install/configure ORT" guidance.
-        let mut builder =
-            Session::builder().map_err(|e| map_backend_or_load_error(&e.to_string()))?;
-        let session =
-            builder
-                .commit_from_file(model_path)
-                .map_err(|e| InferenceError::ModelLoadFailed {
-                    reason: format!("commit_from_file({}): {e}", model_path.display()),
-                })?;
+        let session = Session::builder()
+            .map_err(|e| map_backend_or_load_error(&e.to_string()))?
+            .commit_from_file(&canonical)
+            .map_err(|e| InferenceError::ModelLoadFailed {
+                reason: format!("commit_from_file({}): {e}", canonical.display()),
+            })?;
+
+        // Resolve and cache input/output names up-front; per-frame
+        // metadata reads were a measurable overhead in the Stage 3
+        // benchmark.  We also validate `output_index` here so misconfigs
+        // surface at load instead of on the first `infer` call.
+        let input_name = session
+            .inputs()
+            .first()
+            .ok_or_else(|| InferenceError::ModelLoadFailed {
+                reason: "model has no inputs".into(),
+            })?
+            .name()
+            .to_string();
+
+        let outputs = session.outputs();
+        let output_name = outputs
+            .get(config.output_index)
+            .ok_or_else(|| InferenceError::InvalidModelConfig {
+                reason: format!(
+                    "output_index {} out of range; model has {} outputs",
+                    config.output_index,
+                    outputs.len()
+                ),
+            })?
+            .name()
+            .to_string();
 
         let info = ModelInfo {
             name: Arc::<str>::from(config.name.as_str()),
@@ -118,24 +150,23 @@ impl OnnxEngine {
             input_format: config.input_color,
         };
 
-        debug!(
-            inputs = ?session
-                .inputs()
-                .iter()
-                .map(|i| i.name().to_string())
-                .collect::<Vec<_>>(),
-            outputs = ?session
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let input_names: Vec<&str> =
+                session.inputs().iter().map(ort::value::Outlet::name).collect();
+            let output_names: Vec<&str> = session
                 .outputs()
                 .iter()
-                .map(|o| o.name().to_string())
-                .collect::<Vec<_>>(),
-            "ONNX session ready"
-        );
+                .map(ort::value::Outlet::name)
+                .collect();
+            debug!(inputs = ?input_names, outputs = ?output_names, "ONNX session ready");
+        }
 
         Ok(Self {
             config,
             session,
             info,
+            input_name,
+            output_name,
         })
     }
 
@@ -156,15 +187,11 @@ impl OnnxEngine {
     pub fn config(&self) -> &ModelConfig {
         &self.config
     }
-}
 
-impl InferenceEngine for OnnxEngine {
-    fn model_info(&self) -> ModelInfo {
-        self.info.clone()
-    }
-
-    fn infer(&mut self, input: InferenceInput<'_>) -> Result<InferenceOutput, InferenceError> {
-        // 1. Validate that the flat data length matches the declared shape.
+    /// Validate the caller's shape against `data` and build the input
+    /// tensor.  Pulled out of [`Self::infer`] for readability.
+    fn build_tensor(&self, input: &InferenceInput<'_>) -> Result<Tensor<f32>, InferenceError> {
+        let _ = self; // currently unused — reserved for shape-vs-config checks (Stage 4).
         let expected_elems: usize = input.shape.iter().copied().product();
         if input.data.len() != expected_elems {
             return Err(InferenceError::InferenceFailed {
@@ -176,56 +203,15 @@ impl InferenceEngine for OnnxEngine {
                 ),
             });
         }
+        Tensor::from_array((input.shape.to_vec(), input.data.to_vec())).map_err(|e| {
+            InferenceError::InferenceFailed {
+                reason: format!("tensor build: {e}"),
+            }
+        })
+    }
 
-        // 2. Build an ndarray-backed tensor.  `ort::value::Tensor::from_array`
-        //    accepts `(shape, Vec<T>)` directly in 2.0-rc.x.
-        let tensor =
-            Tensor::from_array((input.shape.to_vec(), input.data.to_vec())).map_err(|e| {
-                InferenceError::InferenceFailed {
-                    reason: format!("tensor build: {e}"),
-                }
-            })?;
-
-        // 3. Snapshot the input/output names from session metadata
-        //    *before* taking the mutable borrow `session.run` needs.
-        let input_name = self
-            .session
-            .inputs()
-            .first()
-            .ok_or_else(|| InferenceError::InferenceFailed {
-                reason: "model has no inputs".into(),
-            })?
-            .name()
-            .to_string();
-
-        let output_count = self.session.outputs().len();
-        if self.config.output_index >= output_count {
-            return Err(InferenceError::InferenceFailed {
-                reason: format!(
-                    "output_index {} out of range (model has {} outputs)",
-                    self.config.output_index, output_count
-                ),
-            });
-        }
-        let output_name = self.session.outputs()[self.config.output_index]
-            .name()
-            .to_string();
-
-        // 4. Run.  `ort::inputs![name => tensor]` builds the input map.
-        let outputs = self
-            .session
-            .run(ort::inputs![input_name => tensor])
-            .map_err(|e| InferenceError::InferenceFailed {
-                reason: format!("session.run: {e}"),
-            })?;
-
-        // 5. Pick the configured output by name.
-        let value =
-            outputs
-                .get(output_name.as_str())
-                .ok_or_else(|| InferenceError::InferenceFailed {
-                    reason: format!("output '{output_name}' missing from session.run result"),
-                })?;
+    /// Extract a flat `f32` tensor + shape from an `ort` output value.
+    fn extract_f32_output(value: &DynValue) -> Result<InferenceOutput, InferenceError> {
         let (shape, data) =
             value
                 .try_extract_tensor::<f32>()
@@ -237,6 +223,28 @@ impl InferenceEngine for OnnxEngine {
             data: data.to_vec(),
             shape: shape_usize,
         })
+    }
+}
+
+impl InferenceEngine for OnnxEngine {
+    fn model_info(&self) -> ModelInfo {
+        self.info.clone()
+    }
+
+    fn infer(&mut self, input: InferenceInput<'_>) -> Result<InferenceOutput, InferenceError> {
+        let tensor = self.build_tensor(&input)?;
+        let outputs = self
+            .session
+            .run(ort::inputs![self.input_name.as_str() => tensor])
+            .map_err(|e| InferenceError::InferenceFailed {
+                reason: format!("session.run: {e}"),
+            })?;
+        let value = outputs.get(self.output_name.as_str()).ok_or_else(|| {
+            InferenceError::InferenceFailed {
+                reason: format!("output '{}' not found in session run", self.output_name),
+            }
+        })?;
+        Self::extract_f32_output(value)
     }
 }
 

@@ -3,13 +3,12 @@
 //! Full end-to-end pipeline benchmarking (capture + chain + sink)
 //! lands in Stage 5.
 
-use std::path::Path;
 use std::time::Instant;
 
 use fluxframe_core::FluxError;
 use fluxframe_core::traits::{InferenceEngine, InferenceInput};
-use fluxframe_effects::ml::{ModelConfig, OnnxEngine, TensorDType, TensorLayout};
-use tracing::{info, warn};
+use fluxframe_effects::ml::{Layout, ModelConfig, OnnxEngine, TensorDType};
+use tracing::info;
 
 use crate::cli::BenchmarkArgs;
 
@@ -34,7 +33,7 @@ pub fn run(args: BenchmarkArgs) -> Result<(), FluxError> {
         });
     }
 
-    let config = load_or_default_config(&model_path)?;
+    let config = fluxframe_effects::ml::load_sidecar_or_placeholder(&model_path)?;
 
     // Snapshot fields that we still need after `config` is moved into
     // `OnnxEngine::load`.  This avoids relying on `ModelConfig: Clone`
@@ -56,14 +55,13 @@ pub fn run(args: BenchmarkArgs) -> Result<(), FluxError> {
     );
 
     let data: Vec<f32> = vec![0.0; elements];
-    // Stage 3: `--duration` doubles as iteration count.  Stage 5 will
-    // switch to a wall-clock budget when the full pipeline benchmark
-    // lands.
-    let runs = u32::max(args.duration, 1);
-    let mut timings: Vec<u128> = Vec::with_capacity(runs as usize);
-    for _ in 0..runs {
+
+    let duration = std::time::Duration::from_secs(args.duration.into());
+    let start = Instant::now();
+    let mut timings: Vec<u128> = Vec::with_capacity(1024);
+    while start.elapsed() < duration {
         let t = Instant::now();
-        let _ = engine.infer(InferenceInput {
+        engine.infer(InferenceInput {
             data: &data,
             shape: &shape,
         })?;
@@ -71,9 +69,16 @@ pub fn run(args: BenchmarkArgs) -> Result<(), FluxError> {
     }
     timings.sort_unstable();
 
+    let total = timings.len();
+    if total == 0 {
+        return Err(FluxError::Config {
+            reason: "duration too short — no inferences completed".into(),
+            hint: Some("increase --duration to at least 1 second".into()),
+        });
+    }
     let p50 = percentile(&timings, 50);
     let p95 = percentile(&timings, 95);
-    let max = *timings.last().unwrap_or(&0);
+    let max = *timings.last().expect("non-empty by check above");
 
     println!("model: {}", info.name);
     println!(
@@ -83,47 +88,35 @@ pub fn run(args: BenchmarkArgs) -> Result<(), FluxError> {
         dtype_label(dtype),
         layout,
     );
-    println!("runs:  {runs}");
+    println!("runs:  {} (in {:?})", total, start.elapsed());
     println!("p50: {p50} us   p95: {p95} us   max: {max} us");
     Ok(())
 }
 
-/// Load a `<model>.toml` sidecar next to `model_path`, falling back to
-/// a 1x1 placeholder config when the sidecar is missing.
-///
-/// TODO(stage-4): consolidate with `commands::check::check_model_file`.
-fn load_or_default_config(model_path: &Path) -> Result<ModelConfig, FluxError> {
-    let sidecar = model_path.with_extension("toml");
-    if sidecar.exists() {
-        Ok(ModelConfig::load(&sidecar)?)
-    } else {
-        warn!(
-            sidecar = %sidecar.display(),
-            "no model config sidecar found; falling back to 1x1 placeholder",
-        );
-        Ok(ModelConfig::from_toml_str(
-            r#"
-name = "<unknown>"
-input_width = 1
-input_height = 1
-"#,
-        )?)
-    }
-}
-
 /// Build the synthetic input shape `(shape, total_elements)` for the
-/// given model config.  Channel count is hard-coded to 3 (RGB-typical);
-/// Stage 5 will derive it from `config.input_color`.
+/// given model config.  Channel count is derived from `input_color`;
+/// Stage 5 will refine the planar (YUY2/NV12) formats.
 fn synthetic_input_shape(cfg: &ModelConfig) -> (Vec<usize>, usize) {
+    let channels = match cfg.input_color {
+        fluxframe_core::frame::PixelFormat::Gray8 => 1usize,
+        fluxframe_core::frame::PixelFormat::Rgba => 4,
+        // Rgb/Bgr/Yuy2/Nv12 — Stage 5 will refine planar formats.
+        _ => 3,
+    };
     let (n, c, h, w) = (
         1_usize,
-        3_usize,
+        channels,
         cfg.input_height as usize,
         cfg.input_width as usize,
     );
     let shape = match cfg.input_layout {
-        TensorLayout::Nhwc => vec![n, h, w, c],
-        TensorLayout::Nchw => vec![n, c, h, w],
+        Layout::Nchw => vec![n, c, h, w],
+        // `Hw` is invalid for inputs (validated by `ModelConfig`), but
+        // synthesise something sensible anyway as a Stage 5 edge case.
+        Layout::Hw => vec![h, w],
+        // `Layout::Nhwc` plus any future `#[non_exhaustive]` variants
+        // default to NHWC, the most common layout.
+        Layout::Nhwc | _ => vec![n, h, w, c],
     };
     let elements = shape.iter().product();
     (shape, elements)
@@ -142,5 +135,61 @@ fn dtype_label(dtype: TensorDType) -> &'static str {
         TensorDType::F32 => "f32",
         TensorDType::U8 => "u8",
         TensorDType::I8 => "i8",
+        // `TensorDType` is `#[non_exhaustive]`.
+        _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluxframe_core::frame::PixelFormat;
+    use fluxframe_effects::ml::{Layout, ModelConfig};
+
+    fn cfg_for(layout: Layout, color: PixelFormat, w: u32, h: u32) -> ModelConfig {
+        let mut c = ModelConfig::new("test".into(), w, h);
+        c.input_layout = layout;
+        c.input_color = color;
+        c
+    }
+
+    #[test]
+    fn nhwc_rgb_shape_matches_dimensions() {
+        let cfg = cfg_for(Layout::Nhwc, PixelFormat::Rgb, 4, 3);
+        let (shape, elements) = synthetic_input_shape(&cfg);
+        assert_eq!(shape, vec![1, 3, 4, 3]);
+        assert_eq!(elements, 36);
+    }
+
+    #[test]
+    fn nchw_gray8_shape_one_channel() {
+        let cfg = cfg_for(Layout::Nchw, PixelFormat::Gray8, 4, 3);
+        let (shape, elements) = synthetic_input_shape(&cfg);
+        assert_eq!(shape, vec![1, 1, 3, 4]);
+        assert_eq!(elements, 12);
+    }
+
+    #[test]
+    fn rgba_yields_four_channels() {
+        let cfg = cfg_for(Layout::Nhwc, PixelFormat::Rgba, 2, 2);
+        let (shape, _) = synthetic_input_shape(&cfg);
+        assert_eq!(shape, vec![1, 2, 2, 4]);
+    }
+
+    #[test]
+    fn percentile_returns_zero_on_empty_slice() {
+        assert_eq!(percentile(&[], 50), 0);
+    }
+
+    #[test]
+    fn percentile_picks_correct_indices() {
+        // `percentile` uses `(len * p / 100).min(len - 1)`, so for a
+        // length-100 sorted slice the index is `p` (capped at 99).  With
+        // `sorted[i] = i + 1` this means the 50th-percentile value is
+        // 51, the 95th is 96, and the 100th saturates to 100.
+        let sorted: Vec<u128> = (1..=100).collect();
+        assert_eq!(percentile(&sorted, 50), 51);
+        assert_eq!(percentile(&sorted, 95), 96);
+        assert_eq!(percentile(&sorted, 100), 100);
     }
 }

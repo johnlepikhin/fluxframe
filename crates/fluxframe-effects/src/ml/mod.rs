@@ -5,13 +5,17 @@
 //!   shape, dtype and post-processing parameters (spec §24.2).
 //! * `OnnxEngine` — concrete [`fluxframe_core::traits::InferenceEngine`]
 //!   implementation backed by ONNX Runtime via the `ort` crate.
+//! * [`load_sidecar_or_placeholder`] — shared helper for loading the
+//!   `<model>.toml` sidecar with a conservative 1x1 fallback.
 //!
 //! Stage 4 (`background_blur`) is the first consumer.  The trait is
 //! intentionally GStreamer-free; effects depend on
 //! [`fluxframe_core::traits::InferenceEngine`] only, not on this module.
 
+pub mod loader;
 pub mod model_config;
 pub mod onnx;
 
-pub use model_config::{ModelConfig, OutputLayout, OutputType, TensorDType, TensorLayout};
+pub use loader::load_sidecar_or_placeholder;
+pub use model_config::{Layout, ModelConfig, OutputType, TensorDType};
 pub use onnx::OnnxEngine;

@@ -12,7 +12,6 @@ description = "Effect registry, effect chain runtime and built-in effects for Fl
 fluxframe-core = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
-ndarray = { workspace = true }
 ort = { workspace = true }
 tracing = { workspace = true }
 

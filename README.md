@@ -6,10 +6,13 @@ The first production effect is `background_blur`. The architecture is deliberate
 
 ## Status
 
-**Stage 1 — testsrc end-to-end runs.** The synthetic videotestsrc input
-flows through the effect chain (`passthrough`) and reaches a fakesink
-or autovideosink. Ctrl-C, drop-old latency policy and §27 error
-rendering are in place. Real V4L2 capture lands in Stage 2.
+**Stage 3 — ONNX inference layer in place.** Pipeline runs synthetic
+video (testsrc) or V4L2 capture → effect chain (passthrough) → fakesink,
+v4l2loopback or autovideosink. `fluxframe list` / `fluxframe check`
+verify devices and the effect chain. ONNX Runtime is wired through
+`fluxframe-effects::ml::OnnxEngine`; `fluxframe check --model <path>`
+and `fluxframe benchmark --model <path>` exercise the inference layer.
+The first production effect (`background_blur`) lands in Stage 4.
 
 ## Build
 
@@ -56,6 +59,28 @@ Verify:
 v4l2-ctl --list-devices
 ```
 
+## ONNX Runtime setup (Stage 3+)
+
+`fluxframe-effects::ml::OnnxEngine` loads ONNX Runtime dynamically via
+`ort`'s `load-dynamic` feature, so the path to `libonnxruntime.so` is
+read from the `ORT_DYLIB_PATH` environment variable at startup.
+
+If you installed `onnxruntime` through Guix (see "Build" above), point
+the variable at the store path:
+
+```bash
+export ORT_DYLIB_PATH=$(find ~/.guix-profile/lib /run/current-system/profile/lib \
+    -maxdepth 1 -name 'libonnxruntime.so*' 2>/dev/null | head -1)
+```
+
+For other distributions, install `libonnxruntime` (apt: `libonnxruntime-dev`,
+homebrew: `onnxruntime`) and point the variable at the resulting
+`libonnxruntime.so` (or `.dylib` on macOS).
+
+Once set, `fluxframe check --model ./models/<name>.onnx` reports model
+load status, and `fluxframe benchmark --model <path> --duration 5`
+runs an inference-only latency benchmark.
+
 ## Pre-commit
 
 Install once:
@@ -73,8 +98,8 @@ Hooks run `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test`. They
 |---|---|
 | 0. Core scaffolding | done |
 | 1. Passthrough on testsrc | done |
-| 2. Real V4L2 I/O (`list`, `check`, v4l2loopback) | planned |
-| 3. Inference layer (`InferenceEngine`, ONNX) | planned |
+| 2. Real V4L2 I/O (`list`, `check`, v4l2loopback) | done |
+| 3. Inference layer (`InferenceEngine`, ONNX) | done |
 | 4. `background_blur` effect | planned |
 | 5. Realtime hardening (latency, drop, fallback) | planned |
 | 6. Documentation + release candidate | planned |

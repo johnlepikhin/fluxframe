@@ -59,33 +59,14 @@ mod pixel_format_serde {
 // Tensor layout / dtype enums
 // ---------------------------------------------------------------------------
 
-/// Tensor memory layout.
+/// Tensor memory layout, used for both input and output.
+///
+/// `Hw` is valid only for outputs (e.g. squeezed segmentation masks);
+/// inputs always have at least N+H+W+C or N+C+H+W.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TensorLayout {
-    /// `[batch, height, width, channels]`
-    #[serde(rename = "NHWC")]
-    Nhwc,
-    /// `[batch, channels, height, width]`
-    #[serde(rename = "NCHW")]
-    Nchw,
-}
-
-/// Tensor element type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TensorDType {
-    /// 32-bit IEEE 754 float.
-    F32,
-    /// Unsigned 8-bit integer.
-    U8,
-    /// Signed 8-bit integer.
-    I8,
-}
-
-/// Layout of the inference output tensor that the effect cares about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OutputLayout {
-    /// `[height, width]` — pre-squeezed segmentation mask.
+#[non_exhaustive]
+pub enum Layout {
+    /// `[height, width]` — flat 2D, only for outputs.
     #[serde(rename = "HW")]
     Hw,
     /// `[batch, height, width, channels]`.
@@ -96,9 +77,23 @@ pub enum OutputLayout {
     Nchw,
 }
 
+/// Tensor element type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum TensorDType {
+    /// 32-bit IEEE 754 float.
+    F32,
+    /// Unsigned 8-bit integer.
+    U8,
+    /// Signed 8-bit integer.
+    I8,
+}
+
 /// Semantic interpretation of the output tensor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum OutputType {
     /// Single-channel confidence mask (0..1).
     Mask,
@@ -117,6 +112,7 @@ pub enum OutputType {
 /// TOML-deserialised model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ModelConfig {
     /// Human-readable model identifier.
     pub name: String,
@@ -127,7 +123,7 @@ pub struct ModelConfig {
     pub input_height: u32,
     /// Memory layout the model expects for its input tensor.
     #[serde(default = "default_input_layout")]
-    pub input_layout: TensorLayout,
+    pub input_layout: Layout,
     /// Element type.  Stage 3 normalises to `f32` on the host side;
     /// future stages may add `u8`/`i8` quantised paths.
     #[serde(default = "default_input_dtype")]
@@ -152,7 +148,7 @@ pub struct ModelConfig {
     pub output_index: usize,
     /// Layout of the selected output.
     #[serde(default = "default_output_layout")]
-    pub output_layout: OutputLayout,
+    pub output_layout: Layout,
     /// Semantic kind of the output tensor.
     #[serde(default = "default_output_type")]
     pub output_type: OutputType,
@@ -167,8 +163,8 @@ pub struct ModelConfig {
     pub threshold: Option<f32>,
 }
 
-fn default_input_layout() -> TensorLayout {
-    TensorLayout::Nhwc
+fn default_input_layout() -> Layout {
+    Layout::Nhwc
 }
 fn default_input_dtype() -> TensorDType {
     TensorDType::F32
@@ -179,14 +175,40 @@ fn default_input_color() -> PixelFormat {
 fn default_input_scale() -> f32 {
     1.0 / 255.0
 }
-fn default_output_layout() -> OutputLayout {
-    OutputLayout::Hw
+fn default_output_layout() -> Layout {
+    Layout::Hw
 }
 fn default_output_type() -> OutputType {
     OutputType::Mask
 }
 
 impl ModelConfig {
+    /// Construct a minimal [`ModelConfig`] with defaults for every
+    /// optional field.
+    ///
+    /// Useful in tests and as a building block for synthetic
+    /// placeholders.  Callers that need a non-default `input_scale`,
+    /// `output_type` etc. should mutate the returned value before
+    /// calling [`ModelConfig::validate`].
+    #[must_use]
+    pub fn new(name: String, input_width: u32, input_height: u32) -> Self {
+        Self {
+            name,
+            input_width,
+            input_height,
+            input_layout: default_input_layout(),
+            input_dtype: default_input_dtype(),
+            input_color: default_input_color(),
+            input_scale: default_input_scale(),
+            input_zero_point: 0.0,
+            output_index: 0,
+            output_layout: default_output_layout(),
+            output_type: default_output_type(),
+            person_class_index: None,
+            threshold: None,
+        }
+    }
+
     /// Parse a TOML document into a [`ModelConfig`] and validate.
     ///
     /// # Errors
@@ -205,13 +227,20 @@ impl ModelConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`InferenceError::InvalidModelConfig`] if the file cannot
-    /// be read or its content fails validation.
+    /// * [`InferenceError::ModelNotFound`] — the file does not exist.
+    ///   The variant name covers both ONNX models and their sidecar
+    ///   configs: "model OR config file not found".
+    /// * [`InferenceError::InvalidModelConfig`] — the file exists but
+    ///   cannot be read, parsed or fails validation.
     pub fn load(path: &Path) -> Result<Self, InferenceError> {
-        let text =
-            std::fs::read_to_string(path).map_err(|e| InferenceError::InvalidModelConfig {
+        let text = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => InferenceError::ModelNotFound {
+                path: path.display().to_string(),
+            },
+            _ => InferenceError::InvalidModelConfig {
                 reason: format!("cannot read model config {}: {e}", path.display()),
-            })?;
+            },
+        })?;
         Self::from_toml_str(&text)
     }
 
@@ -225,6 +254,11 @@ impl ModelConfig {
         if self.input_width == 0 || self.input_height == 0 {
             return Err(InferenceError::InvalidModelConfig {
                 reason: "input_width and input_height must be > 0".into(),
+            });
+        }
+        if matches!(self.input_layout, Layout::Hw) {
+            return Err(InferenceError::InvalidModelConfig {
+                reason: "input_layout = HW is not valid for inputs; use NHWC or NCHW".into(),
             });
         }
         if self.input_scale == 0.0 || !self.input_scale.is_finite() {
@@ -278,7 +312,7 @@ threshold = 0.5
         .expect("parse ok");
         assert_eq!(cfg.name, "person-seg");
         assert_eq!(cfg.input_width, 256);
-        assert_eq!(cfg.input_layout, TensorLayout::Nhwc);
+        assert_eq!(cfg.input_layout, Layout::Nhwc);
         assert_eq!(cfg.output_type, OutputType::Mask);
         assert_eq!(cfg.threshold, Some(0.5));
     }
@@ -293,12 +327,12 @@ input_height = 48
 "#,
         )
         .expect("defaults ok");
-        assert_eq!(cfg.input_layout, TensorLayout::Nhwc);
+        assert_eq!(cfg.input_layout, Layout::Nhwc);
         assert_eq!(cfg.input_dtype, TensorDType::F32);
         assert_eq!(cfg.input_color, PixelFormat::Rgb);
         assert!((cfg.input_scale - 1.0 / 255.0).abs() < 1e-6);
         assert!(cfg.input_zero_point.abs() < f32::EPSILON);
-        assert_eq!(cfg.output_layout, OutputLayout::Hw);
+        assert_eq!(cfg.output_layout, Layout::Hw);
         assert_eq!(cfg.output_type, OutputType::Mask);
         assert!(cfg.threshold.is_none());
     }
@@ -319,24 +353,20 @@ input_height = 1
 
     #[test]
     fn rejects_nonfinite_scale() {
-        let mut cfg = ModelConfig {
-            name: "x".into(),
-            input_width: 1,
-            input_height: 1,
-            input_layout: TensorLayout::Nhwc,
-            input_dtype: TensorDType::F32,
-            input_color: PixelFormat::Rgb,
-            input_scale: f32::NAN,
-            input_zero_point: 0.0,
-            output_index: 0,
-            output_layout: OutputLayout::Hw,
-            output_type: OutputType::Mask,
-            person_class_index: None,
-            threshold: None,
-        };
+        let mut cfg = ModelConfig::new("x".into(), 1, 1);
+        cfg.input_scale = f32::NAN;
         assert!(cfg.validate().is_err());
         cfg.input_scale = 0.0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_hw_for_input_layout() {
+        let mut cfg = ModelConfig::new("x".into(), 1, 1);
+        cfg.input_layout = Layout::Hw;
+        let err = cfg.validate().expect_err("HW input layout must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("input_layout"), "got: {msg}");
     }
 
     #[test]
