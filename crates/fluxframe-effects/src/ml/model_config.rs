@@ -59,13 +59,36 @@ mod pixel_format_serde {
 // Tensor layout / dtype enums
 // ---------------------------------------------------------------------------
 
-/// Tensor memory layout, used for both input and output.
+/// Tensor layout for inference inputs.
 ///
-/// `Hw` is valid only for outputs (e.g. squeezed segmentation masks);
-/// inputs always have at least N+H+W+C or N+C+H+W.
+/// # Invariants
+///
+/// `InputLayout` does not include the `Hw` variant — input tensors
+/// always carry batch and channel dimensions.  Use [`OutputLayout::Hw`]
+/// for pre-squeezed segmentation masks.  Splitting `InputLayout` and
+/// [`OutputLayout`] makes the "no flat 2D input" rule a compile-time
+/// guarantee instead of a runtime check in [`ModelConfig::validate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
-pub enum Layout {
+pub enum InputLayout {
+    /// `[batch, height, width, channels]`.
+    #[serde(rename = "NHWC")]
+    Nhwc,
+    /// `[batch, channels, height, width]`.
+    #[serde(rename = "NCHW")]
+    Nchw,
+}
+
+/// Tensor layout for inference outputs.
+///
+/// # Invariants
+///
+/// `OutputLayout::Hw` is valid for pre-squeezed segmentation masks; the
+/// other variants mirror [`InputLayout`].  See the doc on [`InputLayout`]
+/// for why these are distinct types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum OutputLayout {
     /// `[height, width]` — flat 2D, only for outputs.
     #[serde(rename = "HW")]
     Hw,
@@ -123,7 +146,7 @@ pub struct ModelConfig {
     pub input_height: u32,
     /// Memory layout the model expects for its input tensor.
     #[serde(default = "default_input_layout")]
-    pub input_layout: Layout,
+    pub input_layout: InputLayout,
     /// Element type.  Stage 3 normalises to `f32` on the host side;
     /// future stages may add `u8`/`i8` quantised paths.
     #[serde(default = "default_input_dtype")]
@@ -148,7 +171,7 @@ pub struct ModelConfig {
     pub output_index: usize,
     /// Layout of the selected output.
     #[serde(default = "default_output_layout")]
-    pub output_layout: Layout,
+    pub output_layout: OutputLayout,
     /// Semantic kind of the output tensor.
     #[serde(default = "default_output_type")]
     pub output_type: OutputType,
@@ -163,8 +186,8 @@ pub struct ModelConfig {
     pub threshold: Option<f32>,
 }
 
-fn default_input_layout() -> Layout {
-    Layout::Nhwc
+fn default_input_layout() -> InputLayout {
+    InputLayout::Nhwc
 }
 fn default_input_dtype() -> TensorDType {
     TensorDType::F32
@@ -175,8 +198,8 @@ fn default_input_color() -> PixelFormat {
 fn default_input_scale() -> f32 {
     1.0 / 255.0
 }
-fn default_output_layout() -> Layout {
-    Layout::Hw
+fn default_output_layout() -> OutputLayout {
+    OutputLayout::Hw
 }
 fn default_output_type() -> OutputType {
     OutputType::Mask
@@ -191,9 +214,13 @@ impl ModelConfig {
     /// `output_type` etc. should mutate the returned value before
     /// calling [`ModelConfig::validate`].
     #[must_use]
-    pub fn new(name: String, input_width: u32, input_height: u32) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        input_width: u32,
+        input_height: u32,
+    ) -> Self {
         Self {
-            name,
+            name: name.into(),
             input_width,
             input_height,
             input_layout: default_input_layout(),
@@ -256,11 +283,8 @@ impl ModelConfig {
                 reason: "input_width and input_height must be > 0".into(),
             });
         }
-        if matches!(self.input_layout, Layout::Hw) {
-            return Err(InferenceError::InvalidModelConfig {
-                reason: "input_layout = HW is not valid for inputs; use NHWC or NCHW".into(),
-            });
-        }
+        // Note: `input_layout = HW` is intentionally impossible by types
+        // — see [`InputLayout`]'s invariants doc.
         if self.input_scale == 0.0 || !self.input_scale.is_finite() {
             return Err(InferenceError::InvalidModelConfig {
                 reason: format!(
@@ -312,7 +336,7 @@ threshold = 0.5
         .expect("parse ok");
         assert_eq!(cfg.name, "person-seg");
         assert_eq!(cfg.input_width, 256);
-        assert_eq!(cfg.input_layout, Layout::Nhwc);
+        assert_eq!(cfg.input_layout, InputLayout::Nhwc);
         assert_eq!(cfg.output_type, OutputType::Mask);
         assert_eq!(cfg.threshold, Some(0.5));
     }
@@ -327,12 +351,12 @@ input_height = 48
 "#,
         )
         .expect("defaults ok");
-        assert_eq!(cfg.input_layout, Layout::Nhwc);
+        assert_eq!(cfg.input_layout, InputLayout::Nhwc);
         assert_eq!(cfg.input_dtype, TensorDType::F32);
         assert_eq!(cfg.input_color, PixelFormat::Rgb);
         assert!((cfg.input_scale - 1.0 / 255.0).abs() < 1e-6);
         assert!(cfg.input_zero_point.abs() < f32::EPSILON);
-        assert_eq!(cfg.output_layout, Layout::Hw);
+        assert_eq!(cfg.output_layout, OutputLayout::Hw);
         assert_eq!(cfg.output_type, OutputType::Mask);
         assert!(cfg.threshold.is_none());
     }
@@ -353,7 +377,7 @@ input_height = 1
 
     #[test]
     fn rejects_nonfinite_scale() {
-        let mut cfg = ModelConfig::new("x".into(), 1, 1);
+        let mut cfg = ModelConfig::new("x", 1, 1);
         cfg.input_scale = f32::NAN;
         assert!(cfg.validate().is_err());
         cfg.input_scale = 0.0;
@@ -361,12 +385,20 @@ input_height = 1
     }
 
     #[test]
-    fn rejects_hw_for_input_layout() {
-        let mut cfg = ModelConfig::new("x".into(), 1, 1);
-        cfg.input_layout = Layout::Hw;
-        let err = cfg.validate().expect_err("HW input layout must fail");
+    fn rejects_hw_for_input_layout_in_toml() {
+        // `HW` is not a valid serde tag for `InputLayout` — the parse
+        // must fail at deserialisation time, before `validate` runs.
+        let err = ModelConfig::from_toml_str(
+            r#"
+name = "x"
+input_width = 1
+input_height = 1
+input_layout = "HW"
+"#,
+        )
+        .expect_err("HW input layout must fail to parse");
         let msg = format!("{err}");
-        assert!(msg.contains("input_layout"), "got: {msg}");
+        assert!(msg.to_ascii_lowercase().contains("hw") || msg.contains("input_layout"), "got: {msg}");
     }
 
     #[test]

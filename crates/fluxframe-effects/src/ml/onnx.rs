@@ -31,7 +31,12 @@ use super::model_config::ModelConfig;
 fn ensure_runtime_initialised() {
     static INIT: OnceLock<()> = OnceLock::new();
     INIT.get_or_init(|| {
-        let _ = ort::init().commit();
+        // `ort::init().commit()` returns `bool`: `true` if this call
+        // installed the env config, `false` if another caller did so
+        // first.  Either outcome means "ORT is configured"; we surface
+        // the bit at trace level to aid debugging double-init races.
+        let committed = ort::init().commit();
+        tracing::trace!(committed, "ort runtime initialisation attempted");
     });
 }
 
@@ -74,6 +79,9 @@ pub struct OnnxEngine {
     // Cached at load to avoid per-frame metadata reads.
     input_name: String,
     output_name: String,
+    output_index: usize,
+    input_count: usize,
+    output_count: usize,
 }
 
 impl OnnxEngine {
@@ -117,12 +125,14 @@ impl OnnxEngine {
                 reason: format!("commit_from_file({}): {e}", canonical.display()),
             })?;
 
-        // Resolve and cache input/output names up-front; per-frame
-        // metadata reads were a measurable overhead in the Stage 3
-        // benchmark.  We also validate `output_index` here so misconfigs
-        // surface at load instead of on the first `infer` call.
-        let input_name = session
-            .inputs()
+        // Resolve and cache input/output names + counts up-front;
+        // per-frame metadata reads were a measurable overhead in the
+        // Stage 3 benchmark.  We also validate `output_index` here so
+        // misconfigs surface at load instead of on the first `infer`
+        // call.
+        let inputs = session.inputs();
+        let input_count = inputs.len();
+        let input_name = inputs
             .first()
             .ok_or_else(|| InferenceError::ModelLoadFailed {
                 reason: "model has no inputs".into(),
@@ -131,13 +141,13 @@ impl OnnxEngine {
             .to_string();
 
         let outputs = session.outputs();
+        let output_count = outputs.len();
+        let output_index = config.output_index;
         let output_name = outputs
-            .get(config.output_index)
+            .get(output_index)
             .ok_or_else(|| InferenceError::InvalidModelConfig {
                 reason: format!(
-                    "output_index {} out of range; model has {} outputs",
-                    config.output_index,
-                    outputs.len()
+                    "output_index {output_index} out of range; model has {output_count} outputs",
                 ),
             })?
             .name()
@@ -151,14 +161,27 @@ impl OnnxEngine {
         };
 
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let input_names: Vec<&str> =
-                session.inputs().iter().map(ort::value::Outlet::name).collect();
-            let output_names: Vec<&str> = session
-                .outputs()
-                .iter()
-                .map(ort::value::Outlet::name)
-                .collect();
-            debug!(inputs = ?input_names, outputs = ?output_names, "ONNX session ready");
+            // Closures over `i.name()` keep us robust against minor `ort`
+            // bumps that might reshuffle the `Outlet` path — we just
+            // need *something* that exposes `name()`.
+            #[allow(
+                clippy::redundant_closure_for_method_calls,
+                reason = "closure form survives ort minor version bumps that may move the Outlet path"
+            )]
+            let input_names: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();
+            #[allow(
+                clippy::redundant_closure_for_method_calls,
+                reason = "closure form survives ort minor version bumps that may move the Outlet path"
+            )]
+            let output_names: Vec<&str> = session.outputs().iter().map(|o| o.name()).collect();
+            debug!(
+                model = %canonical.display(),
+                inputs = ?input_names,
+                outputs = ?output_names,
+                input_count,
+                output_count,
+                "ONNX session ready"
+            );
         }
 
         Ok(Self {
@@ -167,19 +190,22 @@ impl OnnxEngine {
             info,
             input_name,
             output_name,
+            output_index,
+            input_count,
+            output_count,
         })
     }
 
     /// Number of inputs the underlying model exposes.
     #[must_use]
     pub fn input_count(&self) -> usize {
-        self.session.inputs().len()
+        self.input_count
     }
 
     /// Number of outputs the underlying model exposes.
     #[must_use]
     pub fn output_count(&self) -> usize {
-        self.session.outputs().len()
+        self.output_count
     }
 
     /// Borrow the configuration this engine was loaded with.
@@ -190,8 +216,11 @@ impl OnnxEngine {
 
     /// Validate the caller's shape against `data` and build the input
     /// tensor.  Pulled out of [`Self::infer`] for readability.
-    fn build_tensor(&self, input: &InferenceInput<'_>) -> Result<Tensor<f32>, InferenceError> {
-        let _ = self; // currently unused — reserved for shape-vs-config checks (Stage 4).
+    ///
+    /// This is intentionally an associated function — it does not yet
+    /// need any state from `self`.  If a future stage adds shape-vs-config
+    /// checks (Stage 4 candidate), re-introduce a `&self` parameter then.
+    fn build_tensor(input: &InferenceInput<'_>) -> Result<Tensor<f32>, InferenceError> {
         let expected_elems: usize = input.shape.iter().copied().product();
         if input.data.len() != expected_elems {
             return Err(InferenceError::InferenceFailed {
@@ -232,18 +261,29 @@ impl InferenceEngine for OnnxEngine {
     }
 
     fn infer(&mut self, input: InferenceInput<'_>) -> Result<InferenceOutput, InferenceError> {
-        let tensor = self.build_tensor(&input)?;
+        let tensor = Self::build_tensor(&input)?;
         let outputs = self
             .session
             .run(ort::inputs![self.input_name.as_str() => tensor])
             .map_err(|e| InferenceError::InferenceFailed {
                 reason: format!("session.run: {e}"),
             })?;
-        let value = outputs.get(self.output_name.as_str()).ok_or_else(|| {
-            InferenceError::InferenceFailed {
-                reason: format!("output '{}' not found in session run", self.output_name),
-            }
-        })?;
+        // `SessionOutputs` implements `Index<usize>` — selecting by
+        // `output_index` skips the linear scan in `get(&str)` and keeps
+        // the engine in sync with `config.output_index` even if a future
+        // ort release reshuffles output ordering.  We bound-check
+        // manually because `Index<usize>` panics on overflow.
+        if self.output_index >= outputs.len() {
+            return Err(InferenceError::InferenceFailed {
+                reason: format!(
+                    "output_index {} out of range at infer time; session returned {} outputs",
+                    self.output_index,
+                    outputs.len()
+                ),
+            });
+        }
+        let value: &DynValue = &outputs[self.output_index];
+        let _ = &self.output_name; // retained for diagnostics / future name-based lookups.
         Self::extract_f32_output(value)
     }
 }

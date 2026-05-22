@@ -17,5 +17,5 @@ pub mod model_config;
 pub mod onnx;
 
 pub use loader::load_sidecar_or_placeholder;
-pub use model_config::{Layout, ModelConfig, OutputType, TensorDType};
+pub use model_config::{InputLayout, ModelConfig, OutputLayout, OutputType, TensorDType};
 pub use onnx::OnnxEngine;
