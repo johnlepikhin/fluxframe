@@ -198,10 +198,7 @@ mod tests {
         let dev = TempDirGuard::new("dev-cam");
         make_fake_sys(sys.path());
         let devices = enumerate_devices_in(sys.path(), dev.path());
-        let video0 = devices
-            .iter()
-            .find(|d| d.path.ends_with("video0"))
-            .unwrap();
+        let video0 = devices.iter().find(|d| d.path.ends_with("video0")).unwrap();
         assert_eq!(video0.kind, V4l2DeviceKind::Input);
         assert_eq!(video0.name, "USB 2.0 Camera");
         assert_eq!(video0.path, dev.path().join("video0"));

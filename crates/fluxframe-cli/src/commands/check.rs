@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use fluxframe_core::{FluxConfig, FluxError, normalise_effect_name};
+use fluxframe_effects::ml::{ModelConfig, OnnxEngine};
 use fluxframe_gst::{V4l2DeviceKind, enumerate_devices};
 use tracing::{info, warn};
 
@@ -188,7 +189,9 @@ fn check_effect_chain(cfg: &FluxConfig) -> Result<(), FluxError> {
         if !registry.contains(&normalised) {
             return Err(FluxError::Config {
                 reason: format!("effect '{name}' is not registered (normalised to '{normalised}')"),
-                hint: Some("available effects: passthrough (Stage 1) — more land in Stage 4".into()),
+                hint: Some(
+                    "available effects: passthrough (Stage 1) — more land in Stage 4".into(),
+                ),
             });
         }
     }
@@ -203,7 +206,35 @@ fn check_model_file(path: &Path) -> Result<(), FluxError> {
             hint: Some("pass --model <path> pointing at a valid ONNX model".into()),
         });
     }
-    info!(model = %path.display(), "model file: exists");
+
+    // TODO(stage-4): consolidate with `benchmark::load_or_default_config`.
+    // Sidecar TOML: `<model>.toml` next to the `.onnx` file.
+    let sidecar = path.with_extension("toml");
+    let config = if sidecar.exists() {
+        info!(sidecar = %sidecar.display(), "loading model config sidecar");
+        ModelConfig::load(&sidecar)?
+    } else {
+        warn!(
+            sidecar = %sidecar.display(),
+            "no model config sidecar found; using minimal defaults \
+             — Stage 4 effects will likely refuse this model",
+        );
+        ModelConfig::from_toml_str(
+            r#"
+name = "<unknown>"
+input_width = 1
+input_height = 1
+"#,
+        )?
+    };
+
+    info!(model = %path.display(), name = %config.name, "loading ONNX session");
+    let engine = OnnxEngine::load(path, config)?;
+    info!(
+        inputs = engine.input_count(),
+        outputs = engine.output_count(),
+        "model file: loads OK",
+    );
     Ok(())
 }
 

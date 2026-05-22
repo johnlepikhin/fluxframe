@@ -259,7 +259,10 @@ mod tests {
     #[test]
     fn check_input_access_rejects_regular_file() {
         let tmp = unique_tmp("regular");
-        std::fs::File::create(&tmp).unwrap().write_all(b"x").unwrap();
+        std::fs::File::create(&tmp)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
         let err = check_v4l2_input_access(&tmp).expect_err("regular file must error");
         // canonicalize ok; is_char_device fails (tmp is a regular file).
         assert!(
@@ -320,12 +323,8 @@ mod tests {
         std::fs::write(&regular, b"x").unwrap();
         let link = dir.join("link-to-regular");
         std::os::unix::fs::symlink(&regular, &link).unwrap();
-        let err =
-            check_v4l2_input_access(&link).expect_err("symlink-to-regular must fail");
-        assert!(matches!(
-            err,
-            PipelineError::InputDeviceUnavailable { .. }
-        ));
+        let err = check_v4l2_input_access(&link).expect_err("symlink-to-regular must fail");
+        assert!(matches!(err, PipelineError::InputDeviceUnavailable { .. }));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
