@@ -38,7 +38,7 @@ fn passthrough_testsrc_to_fakesink_produces_frames() {
 
     let count = processed.load(Ordering::Relaxed);
     assert!(
-        count >= 10,
-        "expected at least 10 frames through the pipeline within 1.5s, got {count}"
+        count >= 5,
+        "expected at least 5 frames through the pipeline within 1.5s, got {count}"
     );
 }

@@ -17,8 +17,12 @@ use crate::frame_conv::frame_to_buffer;
 use crate::util::{build_caps, make_element};
 
 /// Output sink selection for Stage 1.  Stage 2 will add `V4l2Loopback`.
+///
+/// Intentionally *not* `#[non_exhaustive]`: this crate is workspace-internal
+/// with a single version, so adding a variant in Stage 2 should produce a
+/// compile-time prompt at every `match` site rather than a silent wildcard
+/// fall-through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum OutputSink {
     /// Discards buffers immediately — for tests and CI.
     Fake,
@@ -203,15 +207,14 @@ impl OutputPipeline {
             })
     }
 
-    /// Borrow the underlying pipeline so the runtime supervisor can attach
-    /// a bus listener.
+    /// Borrow the pipeline's bus for use with [`crate::bus::BusListener`].
     ///
-    /// Leaks the GStreamer type by design — the bus is the only sanctioned
-    /// integration point between this crate and the runtime layer.  Do not
-    /// use this handle for state changes; route those through [`Self::start`]
-    /// and [`Self::stop`].
+    /// The bus is the only piece of the underlying GStreamer pipeline that
+    /// the supervisor needs visibility into; exposing it instead of the
+    /// whole `gstreamer::Pipeline` keeps the GStreamer surface area at this
+    /// crate's boundary as small as possible.
     #[must_use]
-    pub fn pipeline_for_bus(&self) -> &gstreamer::Pipeline {
-        &self.pipeline
+    pub fn bus(&self) -> gstreamer::Bus {
+        self.pipeline.bus().expect("pipelines always have a bus")
     }
 }

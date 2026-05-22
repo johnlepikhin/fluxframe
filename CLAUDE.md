@@ -4,14 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-Stage 0 (core scaffolding) complete: Cargo workspace, core types and traits, CLI skeleton with stubbed subcommands. Pipeline does not yet process frames — that lands in Stage 1+. Implementation plan: `doc/plan/000-overview.md` (overview) and `doc/plan/stage-*-*.md` (per-stage detail). Original spec: `doc/ideas/001-mvp.md`.
+Stage 1 complete: end-to-end pipeline runs synthetic video through the
+effect chain (passthrough only) and emits to fakesink/autovideosink.
+GStreamer integration lives in `fluxframe-gst` (capture, output, bus
+events, frame slot). Ctrl-C, basic logging and the latest-frame
+drop-old policy are wired.
+
+Coming up: Stage 2 wires V4L2 capture and the `v4l2loopback` sink,
+plus `list` and `check` device probing. Implementation plan:
+`doc/plan/000-overview.md` and per-stage detail in `doc/plan/stage-*.md`.
+Original spec: `doc/ideas/001-mvp.md`.
 
 ## Workspace layout
 
 Cargo workspace with four crates under `crates/`:
 
 - `fluxframe-core` — `VideoFrame`, traits (`VideoEffect`, `InferenceEngine`, `VideoSource`, `VideoSink`), error model, `FluxConfig`. Zero GStreamer/ONNX deps; `#![forbid(unsafe_code)]`.
-- `fluxframe-gst` — GStreamer init + (Stage 1+) pipeline construction, V4L2 enumeration.
+- `fluxframe-gst` — GStreamer init plus `bus`/`input`/`output`/`slot`/`frame_conv`/`util` modules wiring the Stage 1 pipeline; v4l2 enumeration remains a stub until Stage 2. Bus events arrive as a typed `BusEvent` enum via `BusListener::spawn`.
 - `fluxframe-effects` — effect registry, chain, built-in effects. ML and image-processing helpers live as modules here (no separate crates until a second consumer appears).
 - `fluxframe-cli` — `fluxframe` binary: clap subcommands, tracing init, config loader, CLI/file merge.
 

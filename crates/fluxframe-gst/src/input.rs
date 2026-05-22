@@ -190,16 +190,15 @@ impl InputPipeline {
             })
     }
 
-    /// Borrow the underlying pipeline so the runtime supervisor can attach
-    /// a bus listener.
+    /// Borrow the pipeline's bus for use with [`crate::bus::BusListener`].
     ///
-    /// Leaks the GStreamer type by design — the bus is the only sanctioned
-    /// integration point between this crate and the runtime layer.  Do not
-    /// use this handle for state changes; route those through [`Self::start`]
-    /// and [`Self::stop`].
+    /// The bus is the only piece of the underlying GStreamer pipeline that
+    /// the supervisor needs visibility into; exposing it instead of the
+    /// whole `gstreamer::Pipeline` keeps the GStreamer surface area at this
+    /// crate's boundary as small as possible.
     #[must_use]
-    pub fn pipeline_for_bus(&self) -> &gstreamer::Pipeline {
-        &self.pipeline
+    pub fn bus(&self) -> gstreamer::Bus {
+        self.pipeline.bus().expect("pipelines always have a bus")
     }
 }
 

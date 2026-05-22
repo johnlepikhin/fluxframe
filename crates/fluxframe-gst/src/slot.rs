@@ -115,6 +115,9 @@ impl LatestFrameSlot {
     pub fn close(&self) {
         let mut state = self.inner.state.lock();
         state.closed = true;
+        // Drop the last buffered frame so it doesn't sit in the slot
+        // holding onto its pixel buffer until the slot itself is dropped.
+        state.frame = None;
         self.inner.cond.notify_all();
     }
 }

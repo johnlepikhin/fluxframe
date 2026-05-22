@@ -11,6 +11,7 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("fluxframe-gst is Linux-only (see §2 of doc/ideas/001-mvp.md)");
 
+pub mod bus;
 pub mod frame_conv;
 pub mod input;
 pub mod output;
@@ -18,6 +19,7 @@ pub mod slot;
 mod util;
 pub mod v4l2;
 
+pub use bus::{BusEvent, BusListener, WatchedPipeline};
 pub use slot::LatestFrameSlot;
 
 use fluxframe_core::error::PipelineError;

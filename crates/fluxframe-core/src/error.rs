@@ -16,8 +16,6 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::frame::PixelFormat;
-
 /// Errors raised from a `VideoEffect` implementation.
 ///
 /// These cover the full lifecycle of an effect: configuration validation,
@@ -136,20 +134,17 @@ pub enum PipelineError {
     },
 
     /// A stage in the pipeline received a pixel format it cannot handle.
-    #[error("pixel format '{format:?}' is not supported by this stage")]
-    UnsupportedPixelFormat { format: PixelFormat },
-
-    /// A GStreamer pixel format was received that does not map to any
-    /// FluxFrame [`PixelFormat`].
     ///
-    /// The previous behaviour was to wrap such a format in
-    /// `UnsupportedPixelFormat { format: PixelFormat::Rgb }`, which lied to
-    /// the caller about what was actually received.  Carrying the raw
-    /// GStreamer label preserves the diagnostic for the §27 renderer.
-    #[error("unsupported GStreamer pixel format: {gst_label}")]
-    UnsupportedGstFormat {
-        /// The GStreamer format label that could not be mapped (e.g. `I420`).
-        gst_label: String,
+    /// At least one of `format`/`raw_label` is `Some`.  Use `format` when
+    /// the source backend produced a recognised FluxFrame variant; use
+    /// `raw_label` for backend-specific identifiers that don't map to
+    /// `PixelFormat` (e.g. raw GStreamer caps strings).
+    #[error("pixel format not supported (format={format:?}, raw_label={raw_label:?})")]
+    UnsupportedPixelFormat {
+        /// Recognised FluxFrame variant when the backend produced one.
+        format: Option<crate::frame::PixelFormat>,
+        /// Backend-specific identifier when the variant could not be mapped.
+        raw_label: Option<String>,
     },
 
     /// Upstream and downstream caps could not be reconciled.
@@ -159,6 +154,22 @@ pub enum PipelineError {
     /// A GStreamer state change (NULL → READY → PAUSED → PLAYING) failed.
     #[error("pipeline state change failed: {reason}")]
     StateChangeFailed { reason: String },
+
+    /// A GStreamer bus reported a fatal error from a pipeline element.
+    ///
+    /// Carries the GStreamer-level message string and optional debug string
+    /// instead of the raw `glib::Error`, so `fluxframe-core` stays free of
+    /// the `glib` dependency.  The string content is whatever GStreamer
+    /// produced — sufficient for §27 diagnostics and logs.
+    #[error("pipeline bus error from {element}: {message}")]
+    BusError {
+        /// Pipeline element name that originated the error (best-effort).
+        element: String,
+        /// `glib::Error` `Display` representation.
+        message: String,
+        /// Optional GStreamer debug payload.
+        debug: Option<String>,
+    },
 
     /// A runtime error reported by the pipeline bus (EOS, fatal warning, etc.).
     #[error("pipeline runtime error: {reason}")]

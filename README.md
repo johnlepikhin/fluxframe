@@ -6,7 +6,10 @@ The first production effect is `background_blur`. The architecture is deliberate
 
 ## Status
 
-**Stage 0 — scaffolding only.** The workspace, type/trait surface and CLI structure are in place; the pipeline itself does not yet capture or process frames. Subcommands print a `not implemented yet (Stage N)` notice. See `doc/plan/000-overview.md` for the full roadmap.
+**Stage 1 — testsrc end-to-end runs.** The synthetic videotestsrc input
+flows through the effect chain (`passthrough`) and reaches a fakesink
+or autovideosink. Ctrl-C, drop-old latency policy and §27 error
+rendering are in place. Real V4L2 capture lands in Stage 2.
 
 ## Build
 
@@ -69,7 +72,7 @@ Hooks run `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test`. They
 | Stage | Status |
 |---|---|
 | 0. Core scaffolding | done |
-| 1. Passthrough on testsrc | planned |
+| 1. Passthrough on testsrc | done |
 | 2. Real V4L2 I/O (`list`, `check`, v4l2loopback) | planned |
 | 3. Inference layer (`InferenceEngine`, ONNX) | planned |
 | 4. `background_blur` effect | planned |

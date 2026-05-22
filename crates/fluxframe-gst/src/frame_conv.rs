@@ -17,9 +17,10 @@ use tracing::warn;
 
 /// Translate a GStreamer pixel format into FluxFrame's enum.
 ///
-/// Returns [`PipelineError::UnsupportedGstFormat`] for variants the MVP
-/// processing chain does not handle, carrying the raw GStreamer label so
-/// diagnostics do not have to invent a placeholder [`PixelFormat`].
+/// Returns [`PipelineError::UnsupportedPixelFormat`] (with `raw_label`
+/// populated) for variants the MVP processing chain does not handle, so
+/// diagnostics carry the actual GStreamer label rather than a placeholder
+/// [`PixelFormat`].
 pub fn pixel_format_from_gst(
     fmt: gstreamer_video::VideoFormat,
 ) -> Result<PixelFormat, PipelineError> {
@@ -32,8 +33,9 @@ pub fn pixel_format_from_gst(
         G::Nv12 => PixelFormat::Nv12,
         G::Gray8 => PixelFormat::Gray8,
         other => {
-            return Err(PipelineError::UnsupportedGstFormat {
-                gst_label: other.to_str().to_string(),
+            return Err(PipelineError::UnsupportedPixelFormat {
+                format: None,
+                raw_label: Some(format!("{other:?}")),
             });
         }
     })
@@ -90,9 +92,13 @@ pub fn sample_to_frame(
     let width = info.width();
     let height = info.height();
 
-    let bytes_per_pixel = format
-        .bytes_per_pixel()
-        .ok_or(PipelineError::UnsupportedPixelFormat { format })?;
+    let bytes_per_pixel =
+        format
+            .bytes_per_pixel()
+            .ok_or(PipelineError::UnsupportedPixelFormat {
+                format: Some(format),
+                raw_label: None,
+            })?;
     let expected = (width as usize)
         .checked_mul(height as usize)
         .and_then(|p| p.checked_mul(bytes_per_pixel))
@@ -150,19 +156,20 @@ pub fn sample_to_frame(
               keeping the by-value signature now avoids a churning API break later."
 )]
 pub fn frame_to_buffer(frame: VideoFrame) -> Result<gstreamer::Buffer, PipelineError> {
+    // `Buffer::with_size` returns a freshly allocated buffer whose refcount
+    // is exactly one, so `get_mut` is guaranteed to succeed by the GStreamer
+    // contract.  We treat a failure here as a programming error rather than
+    // a runtime condition.
+    const UNIQUE_BUFFER_MSG: &str =
+        "buffer is uniquely owned immediately after with_size allocation";
+
     let bytes = frame.data.as_slice();
     let mut buffer =
         gstreamer::Buffer::with_size(bytes.len()).map_err(|e| PipelineError::Runtime {
             reason: format!("Buffer::with_size failed: {e}"),
         })?;
     {
-        // `Buffer::with_size` returns a freshly allocated buffer whose
-        // refcount is exactly one, so `get_mut` is guaranteed to succeed
-        // by the GStreamer contract.  We treat a failure here as a
-        // programming error rather than a runtime condition.
-        let buffer_ref = buffer
-            .get_mut()
-            .expect("buffer is uniquely owned immediately after with_size allocation");
+        let buffer_ref = buffer.get_mut().expect(UNIQUE_BUFFER_MSG);
         let mut map = buffer_ref
             .map_writable()
             .map_err(|_| PipelineError::Runtime {
@@ -171,9 +178,7 @@ pub fn frame_to_buffer(frame: VideoFrame) -> Result<gstreamer::Buffer, PipelineE
         map.as_mut_slice().copy_from_slice(bytes);
     }
     {
-        let buffer_ref = buffer
-            .get_mut()
-            .expect("buffer is uniquely owned immediately after with_size allocation");
+        let buffer_ref = buffer.get_mut().expect(UNIQUE_BUFFER_MSG);
         buffer_ref.set_pts(gstreamer::ClockTime::from_nseconds(
             frame.meta.timestamp.as_nanos(),
         ));
