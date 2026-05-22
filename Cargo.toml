@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/fluxframe-core",
+    "crates/fluxframe-gst",
+    "crates/fluxframe-effects",
+    "crates/fluxframe-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["FluxFrame contributors"]
+repository = "https://github.com/johnlepikhin/fluxframe"
+rust-version = "1.85"
+
+[workspace.dependencies]
+fluxframe-core = { path = "crates/fluxframe-core", version = "0.1.0" }
+fluxframe-gst = { path = "crates/fluxframe-gst", version = "0.1.0" }
+fluxframe-effects = { path = "crates/fluxframe-effects", version = "0.1.0" }
+
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,33 @@
+# Local pre-commit configuration for FluxFrame.
+#
+# Install once:
+#   pip install --user pre-commit
+#   pre-commit install
+#
+# All Cargo hooks assume a Guix dev shell:
+#   guix shell -m manifest.scm
+# is already entered (so that pkg-config can find GStreamer).
+
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt --all -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy -D warnings
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --workspace
+        language: system
+        types: [rust]
+        pass_filenames: false

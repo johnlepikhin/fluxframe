@@ -1,0 +1,20 @@
+[package]
+name = "fluxframe-gst"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "GStreamer + V4L2 capture/output integration for FluxFrame."
+
+[dependencies]
+fluxframe-core = { workspace = true }
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-video = "0.23"
+glib = "0.20"
+tracing = { workspace = true }
+
+[lints]
+workspace = true

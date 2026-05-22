@@ -1,0 +1,15 @@
+[package]
+name = "fluxframe-effects"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Effect registry, effect chain runtime and built-in effects for FluxFrame."
+
+[dependencies]
+fluxframe-core = { workspace = true }
+
+[lints]
+workspace = true
