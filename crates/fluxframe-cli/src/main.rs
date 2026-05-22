@@ -15,6 +15,7 @@ mod cli;
 mod commands;
 mod config_merge;
 mod logging;
+mod runtime;
 
 fn main() -> ExitCode {
     let args = cli::Cli::parse();

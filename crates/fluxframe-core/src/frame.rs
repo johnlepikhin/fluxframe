@@ -319,27 +319,18 @@ mod tests {
     #[test]
     fn new_packed_rejects_planar_format() {
         let buf = FrameBuffer::Owned(vec![0; 100]);
-        let frame = VideoFrame::new_packed(
-            buf,
-            10,
-            10,
-            PixelFormat::Nv12,
-            FrameMeta::default(),
+        let frame = VideoFrame::new_packed(buf, 10, 10, PixelFormat::Nv12, FrameMeta::default());
+        assert!(
+            frame.is_none(),
+            "Nv12 is planar; new_packed must return None"
         );
-        assert!(frame.is_none(), "Nv12 is planar; new_packed must return None");
     }
 
     #[test]
     fn validate_catches_dimension_mismatch() {
         let buf = FrameBuffer::Owned(vec![0; 5]);
-        let frame = VideoFrame::new_packed(
-            buf,
-            100,
-            100,
-            PixelFormat::Rgb,
-            FrameMeta::default(),
-        )
-        .expect("constructor ok");
+        let frame = VideoFrame::new_packed(buf, 100, 100, PixelFormat::Rgb, FrameMeta::default())
+            .expect("constructor ok");
         assert!(frame.validate().is_err(), "data too small for w*h*bpp");
     }
 }

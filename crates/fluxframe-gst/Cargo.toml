@@ -15,6 +15,7 @@ gstreamer-app = "0.23"
 gstreamer-video = "0.23"
 glib = "0.20"
 tracing = { workspace = true }
+parking_lot = { workspace = true }
 
 [lints]
 workspace = true
