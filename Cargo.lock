@@ -249,6 +249,7 @@ dependencies = [
  "gstreamer",
  "gstreamer-app",
  "gstreamer-video",
+ "libc",
  "parking_lot",
  "tracing",
 ]

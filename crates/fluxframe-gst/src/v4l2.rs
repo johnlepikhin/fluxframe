@@ -8,12 +8,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Functional classification of a V4L2 device entry.
+///
+/// `#[non_exhaustive]` so a future variant (e.g. dedicated `Output` once a
+/// kernel-level signal becomes reliable) is not a breaking change.  The
+/// previous `Output` variant was removed in Stage 2 because [`classify`]
+/// never returned it — the heuristic only ever produces `Input`/`Virtual`/
+/// `Unknown`, so the dead variant only invited mis-handling in `match`
+/// sites elsewhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum V4l2DeviceKind {
     /// Capture-only (e.g. UVC webcam).
     Input,
-    /// Output-only sink (e.g. v4l2loopback configured as output-only).
-    Output,
     /// Bidirectional or loopback (v4l2loopback default).
     Virtual,
     /// Heuristic could not determine — caller should treat as unknown.
@@ -33,25 +39,31 @@ pub struct V4l2Device {
 
 /// Enumerate the V4L2 devices visible to the system.
 ///
-/// Reads `/sys/class/video4linux`.  Errors during reads (e.g. permission
-/// denied on a single device) are logged via `tracing::debug` and the
-/// affected entry is skipped — the function returns whatever it could
-/// read successfully.
+/// Reads `/sys/class/video4linux` and joins basenames against `/dev`.
+/// Errors during reads (e.g. permission denied on a single device) are
+/// logged via `tracing::debug` and the affected entry is skipped — the
+/// function returns whatever it could read successfully.
 ///
 /// Returns an empty vector when `/sys/class/video4linux` is absent
 /// (e.g. inside some containers, on non-Linux platforms — though gst's
 /// `compile_error!` already prevents the latter).
 #[must_use]
 pub fn enumerate_devices() -> Vec<V4l2Device> {
-    enumerate_devices_in(Path::new("/sys/class/video4linux"))
+    enumerate_devices_in(Path::new("/sys/class/video4linux"), Path::new("/dev"))
 }
 
-/// Same as [`enumerate_devices`] but reads from a caller-supplied root.
-/// Useful for unit tests with a synthetic /sys layout.
+/// Same as [`enumerate_devices`] but reads from caller-supplied roots.
+///
+/// `sys_root` is the directory whose subdirectories name video device
+/// entries (production: `/sys/class/video4linux`); `dev_root` is the
+/// directory that holds the matching character-device nodes (production:
+/// `/dev`).  Both are exposed so unit tests can drive a synthetic layout
+/// without having to mount or bind-mount anything — the test passes
+/// `dev_root = tmp_dev` and inspects `device.path == tmp_dev/video0`.
 #[must_use]
-pub fn enumerate_devices_in(root: &Path) -> Vec<V4l2Device> {
-    let Ok(entries) = fs::read_dir(root) else {
-        tracing::debug!(?root, "/sys/class/video4linux not present");
+pub fn enumerate_devices_in(sys_root: &Path, dev_root: &Path) -> Vec<V4l2Device> {
+    let Ok(entries) = fs::read_dir(sys_root) else {
+        tracing::debug!(?sys_root, "sysfs root not present");
         return Vec::new();
     };
 
@@ -62,21 +74,31 @@ pub fn enumerate_devices_in(root: &Path) -> Vec<V4l2Device> {
                 .to_str()
                 .is_some_and(|n| n.starts_with("video"))
         })
-        .filter_map(|e| inspect_entry(&e.path()))
+        .filter_map(|e| inspect_entry(&e.path(), dev_root))
         .collect();
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
-fn inspect_entry(entry: &Path) -> Option<V4l2Device> {
+fn inspect_entry(entry: &Path, dev_root: &Path) -> Option<V4l2Device> {
     let basename = entry.file_name()?.to_str()?.to_string();
-    let path = PathBuf::from(format!("/dev/{basename}"));
-    let name = fs::read_to_string(entry.join("name"))
-        .ok()
-        .map_or_else(|| basename.clone(), |s| s.trim().to_string());
-    let modalias = fs::read_to_string(entry.join("device/modalias"))
-        .ok()
-        .map(|s| s.trim().to_string());
+    let path = dev_root.join(&basename);
+    let name_path = entry.join("name");
+    let name = match fs::read_to_string(&name_path) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => {
+            tracing::debug!(path = %name_path.display(), error = %e, "name read failed; falling back to basename");
+            basename.clone()
+        }
+    };
+    let modalias_path = entry.join("device/modalias");
+    let modalias = match fs::read_to_string(&modalias_path) {
+        Ok(s) => Some(s.trim().to_string()),
+        Err(e) => {
+            tracing::debug!(path = %modalias_path.display(), error = %e, "modalias read failed; classification falls back to name");
+            None
+        }
+    };
 
     let kind = classify(&name, modalias.as_deref());
     Some(V4l2Device { path, name, kind })
@@ -108,14 +130,14 @@ mod tests {
     struct TempDirGuard(PathBuf);
 
     impl TempDirGuard {
-        fn new() -> Self {
+        fn new(label: &str) -> Self {
             let nano = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             // Add thread id to avoid collisions when tests run in parallel.
             let tid = std::thread::current().id();
-            let p = std::env::temp_dir().join(format!("ff-v4l2-test-{nano}-{tid:?}"));
+            let p = std::env::temp_dir().join(format!("ff-v4l2-test-{label}-{nano}-{tid:?}"));
             let _ = fs::remove_dir_all(&p);
             fs::create_dir_all(&p).unwrap();
             Self(p)
@@ -153,35 +175,42 @@ mod tests {
 
     #[test]
     fn enumerate_returns_sorted_entries() {
-        let guard = TempDirGuard::new();
-        make_fake_sys(guard.path());
-        let devices = enumerate_devices_in(guard.path());
+        let sys = TempDirGuard::new("sys-sorted");
+        let dev = TempDirGuard::new("dev-sorted");
+        make_fake_sys(sys.path());
+        let devices = enumerate_devices_in(sys.path(), dev.path());
         let paths: Vec<_> = devices.iter().map(|d| d.path.clone()).collect();
         assert_eq!(
             paths,
             vec![
-                PathBuf::from("/dev/video0"),
-                PathBuf::from("/dev/video1"),
-                PathBuf::from("/dev/video10"),
+                dev.path().join("video0"),
+                dev.path().join("video1"),
+                dev.path().join("video10"),
             ]
         );
     }
 
     #[test]
     fn classify_camera_by_name() {
-        let guard = TempDirGuard::new();
-        make_fake_sys(guard.path());
-        let devices = enumerate_devices_in(guard.path());
-        let video0 = devices.iter().find(|d| d.path.ends_with("video0")).unwrap();
+        let sys = TempDirGuard::new("sys-cam");
+        let dev = TempDirGuard::new("dev-cam");
+        make_fake_sys(sys.path());
+        let devices = enumerate_devices_in(sys.path(), dev.path());
+        let video0 = devices
+            .iter()
+            .find(|d| d.path.ends_with("video0"))
+            .unwrap();
         assert_eq!(video0.kind, V4l2DeviceKind::Input);
         assert_eq!(video0.name, "USB 2.0 Camera");
+        assert_eq!(video0.path, dev.path().join("video0"));
     }
 
     #[test]
     fn classify_loopback_by_modalias() {
-        let guard = TempDirGuard::new();
-        make_fake_sys(guard.path());
-        let devices = enumerate_devices_in(guard.path());
+        let sys = TempDirGuard::new("sys-loop");
+        let dev = TempDirGuard::new("dev-loop");
+        make_fake_sys(sys.path());
+        let devices = enumerate_devices_in(sys.path(), dev.path());
         let video10 = devices
             .iter()
             .find(|d| d.path.ends_with("video10"))
@@ -191,7 +220,8 @@ mod tests {
 
     #[test]
     fn missing_root_returns_empty() {
+        let dev = TempDirGuard::new("dev-missing");
         let path = Path::new("/nonexistent/sysfs/path");
-        assert!(enumerate_devices_in(path).is_empty());
+        assert!(enumerate_devices_in(path, dev.path()).is_empty());
     }
 }

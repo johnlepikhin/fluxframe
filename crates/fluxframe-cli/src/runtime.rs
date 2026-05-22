@@ -135,24 +135,72 @@ pub(crate) fn default_registry() -> EffectRegistry {
     registry
 }
 
-/// Decide whether `cfg` describes a synthetic source.
-#[must_use]
-pub(crate) fn is_testsrc_input(cfg: &FluxConfig) -> bool {
-    use fluxframe_core::config::BackendKind;
-    matches!(cfg.input.backend, BackendKind::Testsrc) || cfg.input.device == "testsrc"
+/// Parsed input source resolved from a [`FluxConfig`].
+///
+/// Routing rules (see Stage 2 plan, §"Input side"):
+///
+/// * `BackendKind::Testsrc` or `device == "testsrc"` → [`Self::Testsrc`].
+/// * `BackendKind::V4l2`, or `BackendKind::Auto` + `/dev/...` path →
+///   [`Self::V4l2`].  The `Auto` path-prefix heuristic is the only way a
+///   user can mean "real camera" without overriding the backend.
+/// * everything else → [`Self::Unsupported`], so the caller surfaces a
+///   structured §27 error instead of silently falling back to a default.
+///
+/// `#[non_exhaustive]` reserves room for future input kinds (RTSP, file
+/// playback) without breaking match sites in the CLI layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) enum InputSpec {
+    /// Synthetic test source (`videotestsrc`).
+    Testsrc,
+    /// V4L2 capture device (path is *not* canonicalised here — that
+    /// happens inside [`fluxframe_gst::input::InputPipeline::build_v4l2`]).
+    V4l2(PathBuf),
+    /// Unrecognised — caller surfaces a structured error.
+    Unsupported(String),
 }
 
-/// Decide whether `cfg` describes a V4L2 capture device.
-///
-/// Both the explicit `BackendKind::V4l2` selection and a `/dev/...` device
-/// path under `BackendKind::Auto` route to the V4L2 capture pipeline.  The
-/// path-prefix heuristic is documented in the Stage 2 plan: with the
-/// `Auto` default, the only way the user can mean "real camera" is to
-/// point at a kernel device node.
+/// Classify the input section of `cfg` into an [`InputSpec`].
 #[must_use]
-pub(crate) fn is_v4l2_input(cfg: &FluxConfig) -> bool {
+pub(crate) fn classify_input(cfg: &FluxConfig) -> InputSpec {
     use fluxframe_core::config::BackendKind;
-    matches!(cfg.input.backend, BackendKind::V4l2) || cfg.input.device.starts_with("/dev/")
+    let device = &cfg.input.device;
+    match (cfg.input.backend, device.as_str()) {
+        (BackendKind::Testsrc, _) | (_, "testsrc") => InputSpec::Testsrc,
+        (BackendKind::V4l2, _) => InputSpec::V4l2(PathBuf::from(device)),
+        (BackendKind::Auto, d) if d.starts_with("/dev/") => InputSpec::V4l2(PathBuf::from(d)),
+        (_, other) => InputSpec::Unsupported(other.to_string()),
+    }
+}
+
+/// Parsed output sink resolved from a [`FluxConfig`].
+///
+/// Mirrors [`InputSpec`] on the output side: a typed enum collapses the
+/// `device == "auto" | "fakesink" | /dev/...` triage into one match site
+/// so `commands::check` and `commands::run` cannot drift apart.
+///
+/// `#[non_exhaustive]` reserves room for future sink kinds without
+/// breaking match sites in the CLI layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) enum OutputSpec {
+    /// `autovideosink` (manual glance verification).
+    Auto,
+    /// `fakesink` (CI / dev smoke without a loopback).
+    Fake,
+    /// `v4l2sink` to a loopback (or other writable V4L2) device.
+    V4l2(PathBuf),
+}
+
+/// Classify the output section of `cfg` into an [`OutputSpec`].
+#[must_use]
+pub(crate) fn classify_output(cfg: &FluxConfig) -> OutputSpec {
+    match cfg.output.device.as_str() {
+        "auto" => OutputSpec::Auto,
+        "fakesink" => OutputSpec::Fake,
+        device if device.starts_with("/dev/") => OutputSpec::V4l2(PathBuf::from(device)),
+        _ => OutputSpec::Fake,
+    }
 }
 
 /// Run a passthrough-style chain on `videotestsrc`, emitting to the sink
@@ -176,9 +224,13 @@ pub(crate) fn run_testsrc_chain(cfg: &FluxConfig, chain: EffectChain) -> Result<
 /// pre-open check fails), effect chain preparation, or runtime failures.
 #[tracing::instrument(skip_all, fields(device = %cfg.input.device, sink = ?cfg.output.device))]
 pub(crate) fn run_v4l2_chain(cfg: &FluxConfig, chain: EffectChain) -> Result<(), FluxError> {
-    let device = PathBuf::from(&cfg.input.device);
+    // `build_v4l2` takes `&Path` (Stage 2 API change), but the builder
+    // closure must own its captured state because `run_chain` may invoke
+    // it on a different thread / after `cfg` has gone out of scope.  Move
+    // the owned `PathBuf` into the closure and re-borrow on each call.
+    let device_path = PathBuf::from(&cfg.input.device);
     run_chain(cfg, chain, "v4l2src", move |params| {
-        InputPipeline::build_v4l2(device, params)
+        InputPipeline::build_v4l2(&device_path, params)
     })
 }
 
@@ -343,11 +395,7 @@ fn on_bus_event(
                 debug = ?debug_payload,
                 "bus fatal error",
             );
-            let err = FluxError::from(PipelineError::BusError {
-                element: element.clone(),
-                message: message.clone(),
-                debug: debug_payload.clone(),
-            });
+            let err = translate_bus_fatal(element, message, debug_payload.as_ref(), source_label);
             let mut guard = bus_error.lock().expect("bus_error mutex poisoned");
             if guard.is_none() {
                 *guard = Some(err);
@@ -380,6 +428,51 @@ fn on_bus_event(
             warn!(?event, "unhandled bus event variant");
         }
     }
+}
+
+/// Translate a [`BusEvent::FatalError`] payload into a typed [`FluxError`].
+///
+/// GStreamer's bus reports `EBUSY` as a free-form message — there is no
+/// stable error code on the message path — so we recognise it via a
+/// substring heuristic.  When the message looks like a "device busy"
+/// failure we promote it to the matching
+/// [`PipelineError::InputDeviceUnavailable`]/[`PipelineError::OutputDeviceUnavailable`]
+/// variant with an actionable hint, so the §27 Error/Hint output points the
+/// user at the real cause ("close OBS / the browser tab") instead of the
+/// generic "internal data stream error" GStreamer normally prints.
+///
+/// Anything we cannot recognise falls back to [`PipelineError::BusError`]
+/// so the original message is still surfaced verbatim.
+fn translate_bus_fatal(
+    element: &str,
+    message: &str,
+    debug_payload: Option<&String>,
+    source_label: &str,
+) -> FluxError {
+    let lowered = message.to_lowercase();
+    let looks_busy = lowered.contains("device or resource busy") || lowered.contains("busy");
+    if looks_busy {
+        return if source_label == "input" {
+            FluxError::from(PipelineError::InputDeviceUnavailable {
+                device: element.to_string(),
+                reason: "device is busy".into(),
+                hint:
+                    "another application is holding the device; close it (e.g. browser tab, OBS)"
+                        .into(),
+            })
+        } else {
+            FluxError::from(PipelineError::OutputDeviceUnavailable {
+                device: element.to_string(),
+                reason: "device is busy".into(),
+                hint: "another application is using the device".into(),
+            })
+        };
+    }
+    FluxError::from(PipelineError::BusError {
+        element: element.to_string(),
+        message: message.to_string(),
+        debug: debug_payload.cloned(),
+    })
 }
 
 fn run_process_loop(
@@ -429,13 +522,16 @@ fn resolve_output_sink(cfg: &FluxConfig) -> OutputSink {
     //   * "fakesink"  -> fakesink (CI / dev smoke without a loopback).
     //   * /dev/...    -> v4l2sink to a loopback device.
     //   * everything else -> fakesink (CI / tests).
-    match cfg.output.device.as_str() {
-        "auto" => OutputSink::Auto,
-        "fakesink" => OutputSink::Fake,
-        device if device.starts_with("/dev/") => OutputSink::V4l2Loopback {
-            device: PathBuf::from(device),
-        },
-        _ => OutputSink::Fake,
+    //
+    // Triage lives in [`classify_output`]; this function only maps the
+    // typed `OutputSpec` onto the GStreamer-facing `OutputSink`.
+    // `OutputSpec` is `#[non_exhaustive]` for cross-crate consumers, but
+    // inside this crate the match is genuinely exhaustive — adding a
+    // variant prompts the developer to teach this match about it.
+    match classify_output(cfg) {
+        OutputSpec::Auto => OutputSink::Auto,
+        OutputSpec::Fake => OutputSink::Fake,
+        OutputSpec::V4l2(device) => OutputSink::V4l2Loopback { device },
     }
 }
 
@@ -463,27 +559,30 @@ mod tests {
     }
 
     #[test]
-    fn is_testsrc_input_recognises_backend_enum() {
+    fn classify_input_recognises_backend_enum_for_testsrc() {
         let mut cfg = base_cfg();
         cfg.input.backend = BackendKind::Testsrc;
         cfg.input.device = "anything".into();
-        assert!(is_testsrc_input(&cfg));
+        assert_eq!(classify_input(&cfg), InputSpec::Testsrc);
     }
 
     #[test]
-    fn is_testsrc_input_recognises_device_string() {
+    fn classify_input_recognises_device_string_for_testsrc() {
         let mut cfg = base_cfg();
         cfg.input.backend = BackendKind::V4l2;
         cfg.input.device = "testsrc".into();
-        assert!(is_testsrc_input(&cfg));
+        assert_eq!(classify_input(&cfg), InputSpec::Testsrc);
     }
 
     #[test]
-    fn is_testsrc_input_rejects_real_device() {
+    fn classify_input_classifies_real_device_as_v4l2() {
         let mut cfg = base_cfg();
         cfg.input.backend = BackendKind::V4l2;
         cfg.input.device = "/dev/video0".into();
-        assert!(!is_testsrc_input(&cfg));
+        assert_eq!(
+            classify_input(&cfg),
+            InputSpec::V4l2(PathBuf::from("/dev/video0"))
+        );
     }
 
     #[test]
@@ -525,26 +624,67 @@ mod tests {
     }
 
     #[test]
-    fn is_v4l2_input_recognises_backend() {
+    fn classify_input_recognises_v4l2_backend() {
         let mut cfg = base_cfg();
         cfg.input.backend = BackendKind::V4l2;
         cfg.input.device = "/dev/video0".into();
-        assert!(is_v4l2_input(&cfg));
+        assert_eq!(
+            classify_input(&cfg),
+            InputSpec::V4l2(PathBuf::from("/dev/video0"))
+        );
     }
 
     #[test]
-    fn is_v4l2_input_recognises_dev_path() {
+    fn classify_input_recognises_dev_path_under_auto() {
         let mut cfg = base_cfg();
         cfg.input.backend = BackendKind::Auto;
         cfg.input.device = "/dev/video2".into();
-        assert!(is_v4l2_input(&cfg));
+        assert_eq!(
+            classify_input(&cfg),
+            InputSpec::V4l2(PathBuf::from("/dev/video2"))
+        );
     }
 
     #[test]
-    fn is_v4l2_input_rejects_testsrc() {
+    fn classify_input_routes_testsrc_under_auto() {
         let mut cfg = base_cfg();
         cfg.input.backend = BackendKind::Auto;
         cfg.input.device = "testsrc".into();
-        assert!(!is_v4l2_input(&cfg));
+        assert_eq!(classify_input(&cfg), InputSpec::Testsrc);
+    }
+
+    #[test]
+    fn classify_input_marks_unsupported_under_auto() {
+        let mut cfg = base_cfg();
+        cfg.input.backend = BackendKind::Auto;
+        cfg.input.device = "http://example.com/stream".into();
+        assert_eq!(
+            classify_input(&cfg),
+            InputSpec::Unsupported("http://example.com/stream".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_output_maps_auto() {
+        let mut cfg = base_cfg();
+        cfg.output.device = "auto".into();
+        assert_eq!(classify_output(&cfg), OutputSpec::Auto);
+    }
+
+    #[test]
+    fn classify_output_maps_fakesink() {
+        let mut cfg = base_cfg();
+        cfg.output.device = "fakesink".into();
+        assert_eq!(classify_output(&cfg), OutputSpec::Fake);
+    }
+
+    #[test]
+    fn classify_output_maps_dev_path() {
+        let mut cfg = base_cfg();
+        cfg.output.device = "/dev/video10".into();
+        assert_eq!(
+            classify_output(&cfg),
+            OutputSpec::V4l2(PathBuf::from("/dev/video10"))
+        );
     }
 }

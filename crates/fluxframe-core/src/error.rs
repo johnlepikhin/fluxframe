@@ -90,7 +90,7 @@ pub enum InferenceError {
     /// The chosen backend (e.g. CUDA, CoreML, ONNX Runtime) is not available.
     ///
     /// Carries a user-facing hint suggesting how to install or enable it.
-    #[error("inference backend unavailable: {reason}. Hint: {hint}")]
+    #[error("inference backend unavailable: {reason}")]
     BackendUnavailable { reason: String, hint: String },
 
     /// The model loaded successfully but a specific `infer` call failed.
@@ -114,11 +114,11 @@ pub enum PipelineError {
     ///
     /// `hint` names the package that typically ships it
     /// (e.g. `gstreamer1.0-plugins-good`).
-    #[error("required GStreamer element '{element}' is missing. Hint: install {hint}")]
+    #[error("required GStreamer element '{element}' is missing")]
     MissingElement { element: String, hint: String },
 
     /// The input device (camera, file, virtual source) could not be opened.
-    #[error("input device '{device}' could not be opened: {reason}. Hint: {hint}")]
+    #[error("input device '{device}' could not be opened: {reason}")]
     InputDeviceUnavailable {
         device: String,
         reason: String,
@@ -126,7 +126,7 @@ pub enum PipelineError {
     },
 
     /// The output device (v4l2loopback, file, network sink) is not usable.
-    #[error("output device '{device}' is not usable: {reason}. Hint: {hint}")]
+    #[error("output device '{device}' is not usable: {reason}")]
     OutputDeviceUnavailable {
         device: String,
         reason: String,

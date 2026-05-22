@@ -16,12 +16,13 @@ pub mod frame_conv;
 pub mod input;
 pub mod output;
 pub mod slot;
-mod util;
+pub mod util;
 pub mod v4l2;
 
 pub use bus::{BusEvent, BusListener, WatchedPipeline};
 pub use slot::LatestFrameSlot;
-pub use v4l2::{V4l2Device, V4l2DeviceKind, enumerate_devices};
+pub use util::{check_v4l2_input_access, check_v4l2_output_access, map_v4l2_open_error};
+pub use v4l2::{V4l2Device, V4l2DeviceKind, enumerate_devices, enumerate_devices_in};
 
 use fluxframe_core::error::PipelineError;
 

@@ -8,7 +8,7 @@ use tracing::info;
 use crate::cli::RunArgs;
 use crate::config_merge::{CliOverrides, apply, load};
 use crate::runtime::{
-    default_registry, is_testsrc_input, is_v4l2_input, run_testsrc_chain, run_v4l2_chain,
+    InputSpec, classify_input, default_registry, run_testsrc_chain, run_v4l2_chain,
 };
 
 /// Entry point for `fluxframe run`.
@@ -60,18 +60,18 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
         .build_chain(&chain_names)
         .map_err(FluxError::from)?;
 
-    // Dispatch order: `testsrc` first so an explicit `--input testsrc` wins
-    // over the `/dev/` heuristic in `is_v4l2_input`.  Anything not matched
-    // by either rule (e.g. a future RTSP URL) is rejected with a hint
-    // listing the currently supported inputs.
-    if is_testsrc_input(&cfg) {
-        run_testsrc_chain(&cfg, chain)
-    } else if is_v4l2_input(&cfg) {
-        run_v4l2_chain(&cfg, chain)
-    } else {
-        Err(FluxError::Config {
-            reason: format!("input '{}' is not handled", cfg.input.device),
+    // Dispatch via `classify_input` so the testsrc-vs-V4L2 triage lives in
+    // exactly one place (shared with `commands::check`).  `InputSpec` is
+    // `#[non_exhaustive]` for cross-crate consumers, but inside this crate
+    // the match is genuinely exhaustive: adding a variant will turn this
+    // into a compile error and prompt the developer to teach the
+    // dispatch about it.
+    match classify_input(&cfg) {
+        InputSpec::Testsrc => run_testsrc_chain(&cfg, chain),
+        InputSpec::V4l2(_) => run_v4l2_chain(&cfg, chain),
+        InputSpec::Unsupported(d) => Err(FluxError::Config {
+            reason: format!("input '{d}' is not handled"),
             hint: Some("supported inputs: testsrc, /dev/video* (V4L2)".into()),
-        })
+        }),
     }
 }

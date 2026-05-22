@@ -133,9 +133,12 @@ impl OutputPipeline {
             OutputSink::V4l2Loopback { device } => {
                 // Pre-open write check so EACCES/EBUSY/ENOENT surface with a
                 // hint *before* `v4l2sink` returns an opaque GStreamer error.
-                check_v4l2_output_access(&device)?;
+                // The returned path is canonicalised — feed that to v4l2sink
+                // rather than the user-supplied original to close the symlink
+                // race window between the pre-check and the kernel open.
+                let canon = check_v4l2_output_access(&device)?;
                 let elem = make_element("v4l2sink", "output_sink")?;
-                elem.set_property_from_str("device", device.to_string_lossy().as_ref());
+                elem.set_property_from_str("device", canon.to_string_lossy().as_ref());
                 elem
             }
         };

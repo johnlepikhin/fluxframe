@@ -51,19 +51,37 @@ pub fn run(_args: ListArgs) -> Result<(), FluxError> {
             println!("  {}", format_row(d));
         }
     }
-    info!(input = inputs.len(), output = outputs.len(), "device enumeration complete");
+    // `inputs.len() + outputs.len()` over-counts `Unknown` (intentionally
+    // shown in both buckets); log `total = devices.len()` separately so
+    // the operator sees the true device count instead of the inflated
+    // sum.
+    info!(
+        devices = devices.len(),
+        inputs = inputs.len(),
+        outputs = outputs.len(),
+        "device enumeration complete",
+    );
     Ok(())
 }
 
 fn partition(devices: &[V4l2Device]) -> (Vec<&V4l2Device>, Vec<&V4l2Device>) {
+    // Stage 2 update: `V4l2DeviceKind::Output` was removed (the heuristic
+    // never produced it).  `V4l2DeviceKind` is also `#[non_exhaustive]`,
+    // so we need a `_` arm to stay forward-compatible — future variants
+    // surface in both buckets so the user at least sees the device.
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
     for d in devices {
         match d.kind {
             V4l2DeviceKind::Input => inputs.push(d),
-            V4l2DeviceKind::Output | V4l2DeviceKind::Virtual => outputs.push(d),
+            V4l2DeviceKind::Virtual => outputs.push(d),
             V4l2DeviceKind::Unknown => {
                 // Show in both — caller can decide.
+                inputs.push(d);
+                outputs.push(d);
+            }
+            _ => {
+                // Future variants — show in both buckets as a safe default.
                 inputs.push(d);
                 outputs.push(d);
             }

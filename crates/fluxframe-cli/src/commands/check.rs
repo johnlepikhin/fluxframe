@@ -7,7 +7,6 @@
 
 use std::path::Path;
 
-use fluxframe_core::error::PipelineError;
 use fluxframe_core::{Diagnostic, FluxConfig, FluxError, normalise_effect_name};
 use fluxframe_gst::{V4l2DeviceKind, enumerate_devices};
 use tracing::{info, warn};
@@ -59,13 +58,25 @@ pub fn run(args: CheckArgs) -> Result<(), FluxError> {
         info!("all checks passed");
         Ok(())
     } else {
+        // Print every failure here, in §27 Error/Hint form, so the
+        // operator sees the full picture (not just the first failure).
         for failure in &failures {
             eprintln!("Error: {}", failure.reason());
             if let Some(hint) = failure.hint() {
                 eprintln!("Hint: {hint}");
             }
         }
-        Err(failures.into_iter().next().expect("non-empty by branch"))
+        // Return a *summary* error (without a Hint) so `main.rs` prints
+        // one extra line — "Error: N pre-flight check(s) failed; see
+        // messages above" — and not the first failure again.  Without
+        // this collapse, every failure would be printed three times
+        // (once here, once by `main.rs`, once by the `tracing::error!`
+        // there).
+        let n = failures.len();
+        Err(FluxError::Config {
+            reason: format!("{n} pre-flight check(s) failed; see messages above"),
+            hint: None,
+        })
     }
 }
 
@@ -87,25 +98,12 @@ fn check_input_device(cfg: &FluxConfig) -> Result<(), FluxError> {
             hint: Some("use --input testsrc or --input /dev/video<N>".into()),
         });
     }
-    let path = Path::new(device);
-    if !path.exists() {
-        return Err(FluxError::from(PipelineError::InputDeviceUnavailable {
-            device: device.clone(),
-            reason: "device does not exist".into(),
-            hint: "run 'fluxframe list' for available devices".into(),
-        }));
-    }
-    match std::fs::OpenOptions::new().read(true).open(path) {
-        Ok(_) => {
-            info!(device, "input device: readable");
-            Ok(())
-        }
-        Err(e) => Err(FluxError::from(PipelineError::InputDeviceUnavailable {
-            device: device.clone(),
-            reason: e.to_string(),
-            hint: input_open_hint(&e),
-        })),
-    }
+    // Delegate the actual canonicalisation + open-probe + hint-rendering
+    // to `fluxframe_gst::check_v4l2_input_access` so the §27 Error/Hint
+    // text is rendered in exactly one place across the workspace.
+    let canon = fluxframe_gst::check_v4l2_input_access(Path::new(device))?;
+    info!(device, canonical = %canon.display(), "input device: readable");
+    Ok(())
 }
 
 fn check_output_device(cfg: &FluxConfig) -> Result<(), FluxError> {
@@ -118,60 +116,24 @@ fn check_output_device(cfg: &FluxConfig) -> Result<(), FluxError> {
         info!(device, "output: fakesink (no device check needed)");
         return Ok(());
     }
-    let path = Path::new(device);
-    if !path.exists() {
-        return Err(FluxError::from(PipelineError::OutputDeviceUnavailable {
-            device: device.clone(),
-            reason: "device does not exist".into(),
-            hint: "load v4l2loopback (see README) or run 'fluxframe list'".into(),
-        }));
-    }
-    match std::fs::OpenOptions::new().write(true).open(path) {
-        Ok(_) => {
-            warn_if_not_loopback(device);
-            info!(device, "output device: writable");
-            Ok(())
-        }
-        Err(e) => Err(FluxError::from(PipelineError::OutputDeviceUnavailable {
-            device: device.clone(),
-            reason: e.to_string(),
-            hint: output_open_hint(&e),
-        })),
-    }
+    // Delegate to `fluxframe_gst::check_v4l2_output_access` for the same
+    // reason as on the input side — keep hint phrasing canonical.
+    let canon = fluxframe_gst::check_v4l2_output_access(Path::new(device))?;
+    warn_if_not_loopback(&canon);
+    info!(device, canonical = %canon.display(), "output device: writable");
+    Ok(())
 }
 
-fn warn_if_not_loopback(device: &str) {
+fn warn_if_not_loopback(canon: &Path) {
     let devices = enumerate_devices();
-    if let Some(d) = devices.iter().find(|d| d.path.to_string_lossy() == device) {
+    if let Some(d) = devices.iter().find(|d| d.path == canon) {
         if !matches!(d.kind, V4l2DeviceKind::Virtual) {
             warn!(
-                device = device,
+                device = %canon.display(),
                 kind = ?d.kind,
                 "output device does not look like a v4l2loopback; you may be writing to a real camera"
             );
         }
-    }
-}
-
-fn input_open_hint(e: &std::io::Error) -> String {
-    use std::io::ErrorKind;
-    match e.kind() {
-        ErrorKind::PermissionDenied => "add the user to the 'video' group or check udev rules".into(),
-        _ if e.raw_os_error() == Some(16) => {
-            "another application is holding the device; close it (e.g. browser tab, OBS)".into()
-        }
-        _ => "see 'dmesg' or 'v4l2-ctl --device=... --all' for kernel diagnostics".into(),
-    }
-}
-
-fn output_open_hint(e: &std::io::Error) -> String {
-    use std::io::ErrorKind;
-    match e.kind() {
-        ErrorKind::PermissionDenied => "add the user to the 'video' group".into(),
-        _ if e.raw_os_error() == Some(16) => {
-            "another application is using the loopback device".into()
-        }
-        _ => "see 'dmesg' or v4l2loopback module state".into(),
     }
 }
 

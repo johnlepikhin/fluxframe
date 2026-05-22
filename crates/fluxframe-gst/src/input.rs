@@ -6,7 +6,7 @@
 //! [`VideoFrame`] from a captured `gst::Sample` happens in exactly one
 //! place ([`crate::frame_conv::sample_to_frame`]).
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -94,14 +94,14 @@ impl InputPipeline {
     /// * [`PipelineError::MissingElement`] when the `v4l2src` plugin is
     ///   not registered.
     /// * Other [`PipelineError`] variants from element/link construction.
-    pub fn build_v4l2(device: PathBuf, params: InputParams) -> Result<Self, PipelineError> {
-        check_v4l2_input_access(&device)?;
+    pub fn build_v4l2(device: &Path, params: InputParams) -> Result<Self, PipelineError> {
+        // The check returns the canonicalised path (symlinks resolved,
+        // verified to be a /dev/ character device); feed that to v4l2src
+        // rather than the user-supplied original so the pipeline targets
+        // exactly the inode the access check authorised.
+        let canon = check_v4l2_input_access(device)?;
         let src = make_element("v4l2src", "input_src")?;
-        // Consume `device` here (rather than borrowing) so the public
-        // signature stays `PathBuf` per the Stage 2 contract while still
-        // satisfying clippy::needless_pass_by_value.
-        let device_str = device.into_os_string();
-        src.set_property_from_str("device", device_str.to_string_lossy().as_ref());
+        src.set_property_from_str("device", canon.to_string_lossy().as_ref());
         // `do-timestamp=true` so frames arriving from the camera carry a
         // PTS based on the running clock — required for the downstream
         // `appsink` to publish meaningful capture timestamps.
