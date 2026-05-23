@@ -4,6 +4,8 @@
 //! tunable via `passes`.  `radius` is the half-kernel size, so the
 //! kernel covers `2*radius + 1` pixels.
 
+use rayon::prelude::*;
+
 /// Apply a separable box blur to a packed RGB buffer.
 ///
 /// `src` and `dst` must be the same length: `width * height * 3`.
@@ -47,58 +49,66 @@ pub fn box_blur_rgb(
 /// kernel-sized window; sliding one pixel right means subtracting the
 /// pixel leaving on the left and adding the pixel entering on the
 /// right (both clamped to `[0, w-1]`).
-fn blur_horizontal(src: &[u8], dst: &mut [u8], width: u32, height: u32, radius: u32) {
+fn blur_horizontal(src: &[u8], dst: &mut [u8], width: u32, _height: u32, radius: u32) {
     let w = width as usize;
-    let h = height as usize;
     let r = radius as usize;
     let r_i32 = i32::try_from(r).expect("blur radius fits in i32");
     let kernel = 2 * r_i32 + 1;
     let w_last = w - 1;
-    for y in 0..h {
-        let row_base = y * w * 3;
-        // Build the initial sum for the window centred at x = 0.
-        // Kernel slots in [-r, r]; negative slots clamp to src[0],
-        // slots beyond w-1 clamp to src[w-1].
-        let mut sum = [0i32; 3];
-        // (r + 1) leftmost taps: clamp-to-edge for k in [-r, 0] all
-        // either land on src[0] (negative k) or on the actual pixel
-        // src[k] for k in [0, min(r, w-1)].
-        for k in 0..=r {
-            let nx = k.min(w_last);
-            let idx = row_base + nx * 3;
-            sum[0] += i32::from(src[idx]);
-            sum[1] += i32::from(src[idx + 1]);
-            sum[2] += i32::from(src[idx + 2]);
-        }
-        // Add `r` extra copies of src[0] to cover negative kernel slots.
-        let left_idx0 = row_base;
-        sum[0] += i32::from(src[left_idx0]) * r_i32;
-        sum[1] += i32::from(src[left_idx0 + 1]) * r_i32;
-        sum[2] += i32::from(src[left_idx0 + 2]) * r_i32;
+    let row_bytes = w * 3;
+    // Rows are independent — each output row only reads its own input
+    // row.  Parallelise across rows so multi-core CPUs absorb the cost
+    // and a heavy `box_blur_rgb` call does not serialise the entire
+    // effect chain on one thread.
+    dst.par_chunks_mut(row_bytes)
+        .zip(src.par_chunks(row_bytes))
+        .for_each(|(dst_row, src_row)| {
+            blur_row_horizontal(src_row, dst_row, w, w_last, r, r_i32, kernel);
+        });
+}
 
-        // Emit pixel 0.
-        let dst_idx = row_base;
-        dst[dst_idx] = (sum[0] / kernel) as u8;
-        dst[dst_idx + 1] = (sum[1] / kernel) as u8;
-        dst[dst_idx + 2] = (sum[2] / kernel) as u8;
+fn blur_row_horizontal(
+    src_row: &[u8],
+    dst_row: &mut [u8],
+    w: usize,
+    w_last: usize,
+    r: usize,
+    r_i32: i32,
+    kernel: i32,
+) {
+    // Build the initial sum for the window centred at x = 0.
+    // Kernel slots in [-r, r]; negative slots clamp to src[0],
+    // slots beyond w-1 clamp to src[w-1].
+    let mut sum = [0i32; 3];
+    for k in 0..=r {
+        let nx = k.min(w_last);
+        let idx = nx * 3;
+        sum[0] += i32::from(src_row[idx]);
+        sum[1] += i32::from(src_row[idx + 1]);
+        sum[2] += i32::from(src_row[idx + 2]);
+    }
+    // Add `r` extra copies of src[0] to cover negative kernel slots.
+    sum[0] += i32::from(src_row[0]) * r_i32;
+    sum[1] += i32::from(src_row[1]) * r_i32;
+    sum[2] += i32::from(src_row[2]) * r_i32;
 
-        // Slide window for x in 1..w.
-        for x in 1..w {
-            // Pixel leaving the window: previous left edge at x - 1 - r.
-            let leave_x = (x - 1).saturating_sub(r).min(w_last);
-            // Pixel entering the window: new right edge at x + r.
-            let enter_x = (x + r).min(w_last);
-            let leave_idx = row_base + leave_x * 3;
-            let enter_idx = row_base + enter_x * 3;
-            sum[0] += i32::from(src[enter_idx]) - i32::from(src[leave_idx]);
-            sum[1] += i32::from(src[enter_idx + 1]) - i32::from(src[leave_idx + 1]);
-            sum[2] += i32::from(src[enter_idx + 2]) - i32::from(src[leave_idx + 2]);
+    dst_row[0] = (sum[0] / kernel) as u8;
+    dst_row[1] = (sum[1] / kernel) as u8;
+    dst_row[2] = (sum[2] / kernel) as u8;
 
-            let dst_idx = row_base + x * 3;
-            dst[dst_idx] = (sum[0] / kernel) as u8;
-            dst[dst_idx + 1] = (sum[1] / kernel) as u8;
-            dst[dst_idx + 2] = (sum[2] / kernel) as u8;
-        }
+    for x in 1..w {
+        let leave_x = (x - 1).saturating_sub(r).min(w_last);
+        let enter_x = (x + r).min(w_last);
+        let leave_idx = leave_x * 3;
+        let enter_idx = enter_x * 3;
+        sum[0] += i32::from(src_row[enter_idx]) - i32::from(src_row[leave_idx]);
+        sum[1] += i32::from(src_row[enter_idx + 1]) - i32::from(src_row[leave_idx + 1]);
+        sum[2] += i32::from(src_row[enter_idx + 2]) - i32::from(src_row[leave_idx + 2]);
+
+        let dst_idx = x * 3;
+        dst_row[dst_idx] = (sum[0] / kernel) as u8;
+        dst_row[dst_idx + 1] = (sum[1] / kernel) as u8;
+        dst_row[dst_idx + 2] = (sum[2] / kernel) as u8;
     }
 }
 

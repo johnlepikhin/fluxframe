@@ -1,5 +1,14 @@
 //! Alpha compositing for packed RGB buffers with an `f32` mask.
 
+use rayon::prelude::*;
+
+/// Number of pixels per parallel work chunk.  Rayon splits the buffer
+/// into chunks of this size so each worker thread handles a sizeable
+/// contiguous run — small enough that 4-core machines saturate, large
+/// enough that the per-task overhead (~µs) stays well below the
+/// per-chunk arithmetic cost.
+const COMPOSITE_CHUNK_PIXELS: usize = 4_096;
+
 /// Composite `fg` over `bg` using `mask` as per-pixel alpha (1.0 → fg,
 /// 0.0 → bg).  `dst` receives the result.
 ///
@@ -36,17 +45,25 @@ pub fn alpha_composite_rgb(fg: &[u8], bg: &[u8], dst: &mut [u8], mask: &[f32]) {
 pub fn alpha_composite_rgb_in_place(fg_dst: &mut [u8], bg: &[u8], mask: &[f32]) {
     debug_assert_eq!(fg_dst.len(), mask.len() * 3);
     debug_assert_eq!(bg.len(), mask.len() * 3);
-    for (i, &alpha) in mask.iter().enumerate() {
-        let alpha = alpha.clamp(0.0, 1.0);
-        let one_minus = 1.0 - alpha;
-        let base = i * 3;
-        for c in 0..3 {
-            let fg_v = f32::from(fg_dst[base + c]);
-            let bg_v = f32::from(bg[base + c]);
-            let v = alpha * fg_v + one_minus * bg_v;
-            fg_dst[base + c] = v.round().clamp(0.0, 255.0) as u8;
-        }
-    }
+    let chunk_pixels = COMPOSITE_CHUNK_PIXELS;
+    let chunk_bytes = chunk_pixels * 3;
+    fg_dst
+        .par_chunks_mut(chunk_bytes)
+        .zip(bg.par_chunks(chunk_bytes))
+        .zip(mask.par_chunks(chunk_pixels))
+        .for_each(|((fg_chunk, bg_chunk), mask_chunk)| {
+            for (i, &alpha) in mask_chunk.iter().enumerate() {
+                let alpha = alpha.clamp(0.0, 1.0);
+                let one_minus = 1.0 - alpha;
+                let base = i * 3;
+                for c in 0..3 {
+                    let fg_v = f32::from(fg_chunk[base + c]);
+                    let bg_v = f32::from(bg_chunk[base + c]);
+                    let v = alpha * fg_v + one_minus * bg_v;
+                    fg_chunk[base + c] = v.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        });
 }
 
 #[cfg(test)]

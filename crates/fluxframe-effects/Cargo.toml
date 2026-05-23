@@ -23,6 +23,11 @@ serde = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 ort = { workspace = true, optional = true }
+# `rayon` powers data-parallelism in the image-processing primitives
+# (box blur, alpha composite).  Its work-stealing pool absorbs spikes
+# from other processes that would otherwise serialise the single
+# effect-chain thread and visibly stall the pipeline.
+rayon = { workspace = true }
 
 [lints]
 workspace = true

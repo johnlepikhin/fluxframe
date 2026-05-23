@@ -34,6 +34,7 @@ libc = "0.2"
 # `api-24` feature pins to ONNX Runtime ABI 1.24; required to compile
 # against `ort 2.0.0-rc.12` on top of newer OrtApi layouts.
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "std", "api-24"] }
+rayon = "1"
 
 [workspace.lints.rust]
 unsafe_code = "warn"
