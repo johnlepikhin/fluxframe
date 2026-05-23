@@ -89,13 +89,16 @@ pub struct RunArgs {
     /// Arguments shared with `check`/`benchmark`.
     #[command(flatten)]
     pub common: CommonRunArgs,
-    /// Override frame width in pixels.
+    /// Override input frame width in pixels.  Output dimensions are
+    /// derived from `[output] scale` × input — see `OutputConfig`.
     #[arg(long, value_name = "PIXELS")]
     pub width: Option<u32>,
-    /// Override frame height in pixels.
+    /// Override input frame height in pixels.  Output dimensions are
+    /// derived from `[output] scale` × input — see `OutputConfig`.
     #[arg(long, value_name = "PIXELS")]
     pub height: Option<u32>,
-    /// Override frame rate in frames per second.
+    /// Override input frame rate in frames per second.  Output fps
+    /// always equals input fps — no `--output-fps` exists.
     #[arg(long, value_name = "RATE")]
     pub fps: Option<u32>,
 }

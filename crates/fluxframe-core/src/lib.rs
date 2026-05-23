@@ -18,7 +18,7 @@ pub mod traits;
 
 pub use config::{
     BackendKind, EffectsConfig, FluxConfig, InputConfig, LoggingConfig, OutputConfig,
-    RealtimeConfig,
+    OutputScale, RealtimeConfig,
 };
 pub use context::{FrameContext, ProcessingContext, RuntimeState};
 pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineError};
@@ -137,6 +137,111 @@ chain = ["passthrough"]
         cfg.realtime.metrics_interval_secs = 0;
         cfg.validate()
             .expect("0 must be accepted as the disabled sentinel");
+    }
+
+    #[test]
+    fn output_scale_rejects_nonpositive() {
+        let err = config::OutputScale::new(0.0).expect_err("zero must be rejected");
+        assert!(format!("{err}").contains("output.scale"));
+        let err = config::OutputScale::new(-0.5).expect_err("negative must be rejected");
+        assert!(format!("{err}").contains("output.scale"));
+    }
+
+    #[test]
+    fn output_scale_rejects_nan_and_infinity() {
+        let err = config::OutputScale::new(f32::NAN).expect_err("NaN must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("NaN"), "NaN-specific message expected: {msg}");
+        let err = config::OutputScale::new(f32::INFINITY).expect_err("+inf must be rejected");
+        assert!(format!("{err}").contains("output.scale"));
+        let err =
+            config::OutputScale::new(f32::NEG_INFINITY).expect_err("-inf must be rejected");
+        assert!(format!("{err}").contains("output.scale"));
+    }
+
+    #[test]
+    fn output_scale_upper_bound_is_inclusive_at_one() {
+        // 1.0 must pass (identity), 1.0 + ε must fail.
+        config::OutputScale::new(1.0).expect("1.0 inclusive");
+        let just_over = 1.0_f32 + f32::EPSILON * 4.0; // a few ULPs above 1.
+        let err = config::OutputScale::new(just_over)
+            .expect_err("anything strictly above 1.0 must be rejected");
+        assert!(format!("{err}").contains("upscaling"));
+    }
+
+    #[test]
+    fn output_scale_rejects_below_min() {
+        let err =
+            config::OutputScale::new(1e-30).expect_err("sub-min scale must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("0.05"), "min bound must be reported: {msg}");
+    }
+
+    #[test]
+    fn output_scale_rejects_upscale() {
+        let err = config::OutputScale::new(1.5).expect_err("upscale must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("upscaling"), "hint must mention upscaling: {msg}");
+    }
+
+    #[test]
+    fn output_scale_accepts_valid_range() {
+        config::OutputScale::new(1.0).expect("1.0 = identity must pass");
+        config::OutputScale::new(0.5).expect("0.5 must pass");
+        config::OutputScale::new(0.05).expect("MIN_OUTPUT_SCALE must pass (inclusive)");
+    }
+
+    #[test]
+    fn output_scale_default_is_identity() {
+        let s = config::OutputScale::default();
+        assert!((s.value() - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn output_scale_deserialize_validates_at_parse_time() {
+        // Valid value through TOML.
+        let cfg = FluxConfig::from_toml_str(
+            "
+[output]
+scale = 0.5
+",
+        )
+        .expect("0.5 parses");
+        assert!((cfg.output.scale.value() - 0.5).abs() < f32::EPSILON);
+
+        // Out-of-range value rejected during parse, not at validate().
+        let err = FluxConfig::from_toml_str(
+            "
+[output]
+scale = 2.0
+",
+        )
+        .expect_err("upscale must fail at parse time");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("output.scale"),
+            "serde error must mention output.scale: {msg}"
+        );
+    }
+
+    #[test]
+    fn output_effective_dimensions_scales_and_rounds_even() {
+        let mut cfg = FluxConfig::default();
+        cfg.output.scale = config::OutputScale::IDENTITY;
+        assert_eq!(cfg.output.effective_dimensions(1280, 720), (1280, 720));
+        cfg.output.scale = config::OutputScale::new(0.5).expect("0.5 valid");
+        assert_eq!(cfg.output.effective_dimensions(1280, 720), (640, 360));
+        // 2/3 of 1920×1080 = 1280×720 exactly — confirm fraction works.
+        cfg.output.scale = config::OutputScale::new(2.0 / 3.0).expect("2/3 valid");
+        assert_eq!(cfg.output.effective_dimensions(1920, 1080), (1280, 720));
+        // Odd result rounded down to even.
+        cfg.output.scale = config::OutputScale::new(0.5).expect("0.5 valid");
+        assert_eq!(cfg.output.effective_dimensions(641, 481), (320, 240));
+        // Minimum scale produces a small but valid even output.
+        cfg.output.scale = config::OutputScale::new(0.05).expect("0.05 = MIN valid");
+        let (w, h) = cfg.output.effective_dimensions(1280, 720);
+        assert!(w >= 2 && h >= 2, "got {w}x{h}");
+        assert!(w & 1 == 0 && h & 1 == 0, "must be even: {w}x{h}");
     }
 
     #[test]

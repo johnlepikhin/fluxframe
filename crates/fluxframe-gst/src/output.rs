@@ -245,15 +245,15 @@ impl OutputPipeline {
 
         let sink_capsfilter = maybe_format_capsfilter(format, sink_format, fd_guard.is_some())?;
 
-        let mut elements: Vec<&gstreamer::Element> =
-            vec![&appsrc_elem, &queue, &videoconvert, &videoscale];
-        if let Some(cf) = &sink_capsfilter {
-            elements.push(cf);
-        }
-        for pre in &sink_pre {
-            elements.push(pre);
-        }
-        elements.push(&sink_elem);
+        let elements = assemble_pipeline_elements(
+            &appsrc_elem,
+            &queue,
+            &videoconvert,
+            Some(&videoscale),
+            sink_capsfilter.as_ref(),
+            &sink_pre,
+            &sink_elem,
+        );
 
         pipeline
             .add_many(elements.iter().copied())
@@ -278,30 +278,7 @@ impl OutputPipeline {
         appsrc.set_caps(Some(&caps));
         appsrc.set_format(gstreamer::Format::Time);
 
-        // Probe sink-pad CAPS events.  The first one is the initial
-        // negotiation (logged at debug); any subsequent CAPS event means
-        // a mid-stream renegotiation, which historically correlates with
-        // single-frame stride shifts in the rendered output and is worth
-        // a warn so it's tied to a concrete moment in the operator's
-        // log.  Segment/flush events are pipeline-lifecycle noise and
-        // are not probed.
-        if let Some(sink_pad) = sink_elem.static_pad("sink") {
-            let caps_seen = Arc::new(AtomicBool::new(false));
-            sink_pad.add_probe(gstreamer::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
-                if let Some(gstreamer::PadProbeData::Event(ref ev)) = info.data
-                    && let gstreamer::EventView::Caps(c) = ev.view()
-                {
-                    if caps_seen.swap(true, Ordering::Relaxed) {
-                        warn!(caps = %c.caps(), "sink pad CAPS event after initial negotiation (mid-stream renegotiation)");
-                    } else {
-                        tracing::debug!(caps = %c.caps(), "sink pad initial CAPS");
-                    }
-                }
-                gstreamer::PadProbeReturn::Ok
-            });
-        } else {
-            warn!("sink element has no `sink` pad — caps probe not installed");
-        }
+        install_sink_pad_probes(&sink_elem);
 
         Ok(Self {
             pipeline,
@@ -429,6 +406,67 @@ impl OutputPipeline {
     pub fn bus(&self) -> gstreamer::Bus {
         self.pipeline.bus().expect("pipelines always have a bus")
     }
+}
+
+/// Assemble the ordered element list passed to `pipeline.add_many` /
+/// `Element::link_many`.  The order encodes the dataflow:
+///
+/// `appsrc → queue → videoconvert → [videoscale] → [sink_capsfilter]
+///   → sink_pre... → sink`
+///
+/// Extracted from [`OutputPipeline::build`] so the latter reads
+/// top-to-bottom without an inline list-building paragraph.
+fn assemble_pipeline_elements<'a>(
+    appsrc_elem: &'a gstreamer::Element,
+    queue: &'a gstreamer::Element,
+    videoconvert: &'a gstreamer::Element,
+    videoscale: Option<&'a gstreamer::Element>,
+    sink_capsfilter: Option<&'a gstreamer::Element>,
+    sink_pre: &'a [gstreamer::Element],
+    sink_elem: &'a gstreamer::Element,
+) -> Vec<&'a gstreamer::Element> {
+    let mut elements: Vec<&gstreamer::Element> = vec![appsrc_elem, queue, videoconvert];
+    if let Some(vs) = videoscale {
+        elements.push(vs);
+    }
+    if let Some(cf) = sink_capsfilter {
+        elements.push(cf);
+    }
+    for pre in sink_pre {
+        elements.push(pre);
+    }
+    elements.push(sink_elem);
+    elements
+}
+
+/// Install the sink-pad CAPS event probe used for negotiation
+/// diagnostics.  The first CAPS event is logged at `debug!`
+/// (initial negotiation); any subsequent one is escalated to
+/// `warn!` because a mid-stream renegotiation historically
+/// correlates with single-frame stride shifts in the rendered
+/// output.
+///
+/// Extracted from [`OutputPipeline::build`] to keep that function
+/// readable; no state crosses back out — the probe captures its
+/// own `Arc` counter.
+fn install_sink_pad_probes(sink_elem: &gstreamer::Element) {
+    let Some(sink_pad) = sink_elem.static_pad("sink") else {
+        warn!("sink element has no `sink` pad — caps probe not installed");
+        return;
+    };
+    let caps_seen = Arc::new(AtomicBool::new(false));
+    sink_pad.add_probe(gstreamer::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+        if let Some(gstreamer::PadProbeData::Event(ref ev)) = info.data
+            && let gstreamer::EventView::Caps(c) = ev.view()
+        {
+            if caps_seen.swap(true, Ordering::Relaxed) {
+                warn!(caps = %c.caps(), "sink pad CAPS event after initial negotiation (mid-stream renegotiation)");
+            } else {
+                debug!(caps = %c.caps(), "sink pad initial CAPS");
+            }
+        }
+        gstreamer::PadProbeReturn::Ok
+    });
 }
 
 /// What `build_sink_chain` returns: zero or more pre-sink elements

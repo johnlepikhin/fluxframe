@@ -102,17 +102,18 @@ pub fn apply(mut cfg: FluxConfig, overrides: &CliOverrides) -> FluxConfig {
     if let Some(output) = &overrides.output {
         cfg.output.device.clone_from(output);
     }
+    // Output dimensions and fps are derived from the input by
+    // construction (see `OutputConfig` doc), so CLI `--width` /
+    // `--height` / `--fps` only steer the input — the supervisor
+    // computes the output from `output.scale` and `input.fps`.
     if let Some(width) = overrides.width {
         cfg.input.width = width;
-        cfg.output.width = width;
     }
     if let Some(height) = overrides.height {
         cfg.input.height = height;
-        cfg.output.height = height;
     }
     if let Some(fps) = overrides.fps {
         cfg.input.fps = fps;
-        cfg.output.fps = fps;
     }
     if let Some(effect) = &overrides.effect {
         cfg.effects.chain = vec![normalise_effect_name(effect)];

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::frame::PixelFormat;
 
@@ -44,6 +44,23 @@ pub const MAX_LATENCY_MS: u32 = 10_000;
 /// Default cadence of the metrics reporter (`[realtime] metrics_interval_secs`).
 /// `0` disables periodic reporting (the teardown summary still runs).
 pub const DEFAULT_METRICS_INTERVAL_SECS: u32 = 5;
+/// Default downscale factor applied to the output relative to input.
+/// `1.0` means "publish at exactly the input resolution"; `0.5` halves
+/// each dimension.  Values outside `[MIN_OUTPUT_SCALE, MAX_OUTPUT_SCALE]`
+/// are rejected — output is downscale-or-passthrough only, never
+/// upscale or stretch.
+pub const DEFAULT_OUTPUT_SCALE: f32 = 1.0;
+/// Lower inclusive bound on `output.scale`.  Sub-normal and absurdly
+/// tiny values (e.g. `1e-30`) would collapse to a 2×2 image while
+/// silently consuming a pipeline; `0.05` keeps the smallest sensible
+/// output above 64×36 from the reference 1280×720 input.
+pub const MIN_OUTPUT_SCALE: f32 = 0.05;
+/// Upper inclusive bound on `output.scale`.  Upscaling past the input
+/// resolution is not supported: it would inflate bandwidth without
+/// adding image information (the ML model has already discarded
+/// everything past its own input size).
+pub const MAX_OUTPUT_SCALE: f32 = 1.0;
+
 /// Upper bound on positive `metrics_interval_secs` accepted by
 /// [`FluxConfig::validate`].  `0` is always valid — it is the
 /// documented sentinel that disables the periodic reporter.
@@ -171,6 +188,14 @@ impl Default for InputConfig {
 // ---------------------------------------------------------------------------
 
 /// Output/sink configuration (`[output]` table).
+///
+/// Output dimensions and frame rate are NOT independent knobs: the
+/// supervisor publishes at `input.width × scale × input.height × scale`
+/// and at exactly `input.fps`.  This makes aspect-ratio drift and
+/// fps drift (videorate frame duplication/drop) impossible by
+/// construction — the operator cannot accidentally configure a
+/// stretched 1024×768 output from a 1280×720 camera, and cannot
+/// silently introduce a 30↔60 fps converter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutputConfig {
@@ -180,15 +205,11 @@ pub struct OutputConfig {
     /// Sink device path or backend-specific identifier (e.g. `/dev/video10`).
     #[serde(default = "default_output_device")]
     pub device: String,
-    /// Output frame width in pixels.
-    #[serde(default = "default_width")]
-    pub width: u32,
-    /// Output frame height in pixels.
-    #[serde(default = "default_height")]
-    pub height: u32,
-    /// Output frame rate (frames per second).
-    #[serde(default = "default_fps")]
-    pub fps: u32,
+    /// Downscale factor relative to the input resolution.  Constructed
+    /// through [`OutputScale`] (validated at TOML parse / try-from time)
+    /// so the runtime never sees an out-of-range value.
+    #[serde(default)]
+    pub scale: OutputScale,
     /// Pixel format pushed to the sink.  Defaults to `YUY2` for V4L2 loopback.
     #[serde(
         default = "default_output_format",
@@ -203,12 +224,120 @@ impl Default for OutputConfig {
         Self {
             backend: default_output_backend(),
             device: default_output_device(),
-            width: default_width(),
-            height: default_height(),
-            fps: default_fps(),
+            scale: OutputScale::default(),
             format: default_output_format(),
         }
     }
+}
+
+impl OutputConfig {
+    /// Resolve the effective output dimensions for the given input
+    /// frame size.  Result is rounded to the nearest even pixel
+    /// because chroma-subsampled formats (NV12, YUY2) require even
+    /// width/height per plane.  Guaranteed `≥ 2` for any positive
+    /// input.
+    #[must_use]
+    pub fn effective_dimensions(&self, input_w: u32, input_h: u32) -> (u32, u32) {
+        let scale = self.scale.value();
+        (scale_dimension(input_w, scale), scale_dimension(input_h, scale))
+    }
+}
+
+/// Validated downscale factor in `[MIN_OUTPUT_SCALE, MAX_OUTPUT_SCALE]`.
+///
+/// Constructed via [`OutputScale::new`] / `TryFrom<f32>` / serde — every
+/// path runs the same range check, so consumers see only values that
+/// have already been screened for `NaN`, `±∞`, `≤ 0`, sub-normal
+/// noise, and upscaling.  No `From<f32>` / `Deref` to discourage
+/// silent unwrap; reach for [`OutputScale::value`] when the raw `f32`
+/// is genuinely needed (e.g. arithmetic).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct OutputScale(f32);
+
+impl OutputScale {
+    /// The passthrough factor (`1.0`).  Sink publishes at the input
+    /// resolution; `videoscale` short-circuits.
+    pub const IDENTITY: Self = Self(DEFAULT_OUTPUT_SCALE);
+
+    /// Build from a raw `f32`, returning a structured config error
+    /// when the value falls outside the supported range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::FluxError::Config`] when the value is
+    /// `NaN`, non-finite, `≤ 0`, below [`MIN_OUTPUT_SCALE`], or above
+    /// [`MAX_OUTPUT_SCALE`].
+    pub fn new(value: f32) -> Result<Self, crate::error::FluxError> {
+        if value.is_nan() {
+            return Err(config_err(
+                "output.scale must be a finite number, got NaN".into(),
+            ));
+        }
+        if !value.is_finite() {
+            return Err(config_err(format!(
+                "output.scale must be finite, got {value}"
+            )));
+        }
+        if value <= 0.0 {
+            return Err(config_err(format!(
+                "output.scale must be positive, got {value} (use 1.0 for passthrough, 0.5 for half-size, …)"
+            )));
+        }
+        if value < MIN_OUTPUT_SCALE {
+            return Err(config_err(format!(
+                "output.scale must be >= {MIN_OUTPUT_SCALE}, got {value} (smaller values collapse to a sub-pixel output)"
+            )));
+        }
+        if value > MAX_OUTPUT_SCALE {
+            return Err(config_err(format!(
+                "output.scale must be <= {MAX_OUTPUT_SCALE} (upscaling is unsupported), got {value}"
+            )));
+        }
+        Ok(Self(value))
+    }
+
+    /// Raw factor — already validated to be in `[MIN_OUTPUT_SCALE,
+    /// MAX_OUTPUT_SCALE]`.  `const` so [`OutputScale::IDENTITY`] is
+    /// usable in const contexts.
+    #[inline]
+    #[must_use]
+    pub const fn value(self) -> f32 {
+        self.0
+    }
+}
+
+impl Default for OutputScale {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl TryFrom<f32> for OutputScale {
+    type Error = crate::error::FluxError;
+    fn try_from(value: f32) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for OutputScale {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = f32::deserialize(deserializer)?;
+        Self::new(raw).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Apply `scale` to `input` and round to the nearest even pixel.
+/// Minimum of 2 so a downscale of a tiny test input still yields a
+/// valid chroma-subsampled frame size.
+///
+/// Caller must pass a `scale` already validated through [`OutputScale`].
+fn scale_dimension(input: u32, scale: f32) -> u32 {
+    let scaled = (f64::from(input) * f64::from(scale)).round() as u32;
+    // Round down to even (chroma subsampling); guarantee ≥ 2.
+    ((scaled / 2) * 2).max(2)
 }
 
 // ---------------------------------------------------------------------------
@@ -342,9 +471,9 @@ impl FluxConfig {
         const RESERVED_EFFECTS_KEYS: &[&str] = &["chain"];
 
         check_dimensions("input", self.input.width, self.input.height)?;
-        check_dimensions("output", self.output.width, self.output.height)?;
         check_fps("input", self.input.fps)?;
-        check_fps("output", self.output.fps)?;
+        // `OutputConfig.scale: OutputScale` is validated at construction
+        // (TOML deserialize / TryFrom); no runtime re-check needed.
 
         if self.realtime.max_inflight_frames == 0
             || self.realtime.max_inflight_frames > MAX_INFLIGHT_FRAMES

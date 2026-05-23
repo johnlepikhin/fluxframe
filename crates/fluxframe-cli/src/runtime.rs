@@ -266,13 +266,47 @@ pub(crate) fn run_testsrc_chain(cfg: &FluxConfig, chain: EffectChain) -> Result<
 /// pre-open check fails), effect chain preparation, or runtime failures.
 #[tracing::instrument(skip_all, fields(device = %cfg.input.device, sink = ?cfg.output.device))]
 pub(crate) fn run_v4l2_chain(cfg: &FluxConfig, chain: EffectChain) -> Result<(), FluxError> {
-    // `build_v4l2` takes `&Path` (Stage 2 API change), but the builder
-    // closure must own its captured state because `run_chain` may invoke
-    // it on a different thread / after `cfg` has gone out of scope.  Move
-    // the owned `PathBuf` into the closure and re-borrow on each call.
+    // Auto-detect the camera's native mode so the input pipeline never
+    // has to scale.  A capture pipeline that silently anisotropically
+    // stretches the camera output (1280×720 forced on a 640×480-native
+    // camera) produces a "2× wider" image at consumers because the
+    // v4l2loopback transport strips pixel-aspect-ratio metadata.
+    // Operator's `[input] width/height/fps/format` become hints; the
+    // chosen mode is logged so the operator sees what the camera
+    // actually delivers.
     let device_path = PathBuf::from(&cfg.input.device);
-    run_chain(cfg, chain, "v4l2src", move |params| {
-        InputPipeline::build_v4l2(&device_path, params)
+    // The `v4l::Device` opened inside `detect_native_mode` is dropped
+    // at end-of-call (before the closure below opens the device via
+    // `v4l2src`).  Do not lift this call into the closure or a struct
+    // field — that would race v4l2src on VIDIOC_REQBUFS.
+    let detected = fluxframe_gst::v4l2_caps::detect_native_mode(&device_path, cfg.input.fps)?;
+    info!(
+        device = %device_path.display(),
+        cfg_w = cfg.input.width,
+        cfg_h = cfg.input.height,
+        cfg_fps = cfg.input.fps,
+        ?cfg.input.format,
+        detected_w = detected.width,
+        detected_h = detected.height,
+        detected_fps = detected.fps,
+        detected_format = ?detected.format,
+        "auto-detected v4l2 camera native mode"
+    );
+
+    // Override dims + fps with the detected native mode so videoscale
+    // is never asked to anisotropically stretch the camera output.
+    // KEEP operator's `format` — the input pipeline's videoconvert
+    // handles `detected.format → cfg.input.format` (effects like
+    // background_blur currently require RGB, regardless of what the
+    // camera natively delivers).
+    let mut resolved = cfg.clone();
+    resolved.input.width = detected.width;
+    resolved.input.height = detected.height;
+    resolved.input.fps = detected.fps;
+
+    let device_path_for_builder = device_path.clone();
+    run_chain(&resolved, chain, "v4l2src", move |params| {
+        InputPipeline::build_v4l2(&device_path_for_builder, params)
     })
 }
 
@@ -301,8 +335,19 @@ where
         .prepare_all(&processing_ctx)
         .map_err(FluxError::from)?;
 
+    let (effective_out_w, effective_out_h) = cfg
+        .output
+        .effective_dimensions(cfg.input.width, cfg.input.height);
     info!(
+        source = source_label,
+        sink = sink_label,
         effects = ?chain.names(),
+        input_w = cfg.input.width,
+        input_h = cfg.input.height,
+        input_fps = cfg.input.fps,
+        output_w = effective_out_w,
+        output_h = effective_out_h,
+        output_scale = cfg.output.scale.value(),
         input_format = ?cfg.input.format,
         output_format = ?cfg.output.format,
         "starting pipeline ({source_label} -> {sink_label})",
@@ -403,14 +448,20 @@ where
     );
     let sink = resolve_output_sink(cfg)?;
     let sink_label = output_sink_label(&sink);
-    // Effect chain never changes pixel format, so what appsrc receives is
-    // `cfg.input.format`.  `cfg.output.format` is the wire format
-    // negotiated with the sink — pinned via a downstream capsfilter so
-    // videoconvert actually runs when the two differ.
+    // Sink dimensions = input × `output.scale`, rounded to even
+    // pixels.  For v4l2 cameras the supervisor has already overridden
+    // `cfg.input.width/height` with the auto-detected native mode, so
+    // this multiplication produces the right output size for the
+    // operator's chosen scale.  fps is inherited verbatim — operator
+    // cannot misconfigure the output to a different rate (which would
+    // silently insert videorate, duplicating or dropping frames).
+    let (sink_w, sink_h) = cfg
+        .output
+        .effective_dimensions(cfg.input.width, cfg.input.height);
     let output_params = OutputParams::new(
-        cfg.output.width,
-        cfg.output.height,
-        cfg.output.fps,
+        sink_w,
+        sink_h,
+        cfg.input.fps,
         cfg.input.format,
         sink,
     )
