@@ -37,6 +37,18 @@ pub enum OutputSink {
         /// Loopback device path (e.g. `/dev/video10`).
         device: PathBuf,
     },
+    /// Publishes the stream as a PipeWire node via `pipewiresink`.
+    /// PipeWire's buffer pool synchronises producer↔consumer access at
+    /// the protocol level — unlike v4l2loopback there is no torn-buffer
+    /// race for downstream applications.  Modern apps (Firefox/Chrome
+    /// via xdg-desktop-portal-pipewire, OBS with PW backend, recent
+    /// cheese) see this node as a camera; older purely-V4L2 apps need
+    /// the `pipewire-v4l2` shim to bridge it.
+    Pipewire {
+        /// PipeWire node name advertised to consumers.  `None` lets
+        /// `pipewiresink` pick the default.
+        node_name: Option<String>,
+    },
 }
 
 /// Negotiated output parameters.
@@ -200,28 +212,7 @@ impl OutputPipeline {
         let videoconvert = make_element("videoconvert", "output_videoconvert")?;
         let videoscale = make_element("videoscale", "output_videoscale")?;
 
-        let sink_elem = match sink {
-            OutputSink::Fake => make_element("fakesink", "output_sink")?,
-            OutputSink::Auto => make_element("autovideosink", "output_sink")?,
-            OutputSink::V4l2Loopback { device } => {
-                // Pre-open write check so EACCES/EBUSY/ENOENT surface with a
-                // hint *before* `v4l2sink` returns an opaque GStreamer error.
-                // The returned path is canonicalised — feed that to v4l2sink
-                // rather than the user-supplied original to close the symlink
-                // race window between the pre-check and the kernel open.
-                let canon = check_v4l2_output_access(&device)?;
-                let elem = make_element("v4l2sink", "output_sink")?;
-                elem.set_property_from_str("device", canon.to_string_lossy().as_ref());
-                // NOTE: do NOT set `io-mode=rw`.  v4l2loopback with
-                // `exclusive_caps=1` only exposes the device's Video
-                // Capture capability to consumers when the writer uses
-                // mmap+QBUF.  `rw` puts v4l2sink on `write(2)` which
-                // keeps the device in Video Output mode only — cheese,
-                // Chrome and gst-launch consumers stop seeing it as a
-                // camera entirely.
-                elem
-            }
-        };
+        let sink_elem = build_sink_element(sink)?;
         sink_elem.set_property("sync", false);
 
         // When the operator requested a sink-side format different from
@@ -413,6 +404,58 @@ impl OutputPipeline {
     #[must_use]
     pub fn bus(&self) -> gstreamer::Bus {
         self.pipeline.bus().expect("pipelines always have a bus")
+    }
+}
+
+/// Construct the terminal sink element for the requested
+/// [`OutputSink`].  Extracted from [`OutputPipeline::build`] to keep
+/// the latter at a digestible size and to centralise the sink-specific
+/// quirks (loopback access checks, PipeWire client naming, …).
+fn build_sink_element(sink: OutputSink) -> Result<gstreamer::Element, PipelineError> {
+    match sink {
+        OutputSink::Fake => make_element("fakesink", "output_sink"),
+        OutputSink::Auto => make_element("autovideosink", "output_sink"),
+        OutputSink::V4l2Loopback { device } => {
+            // Pre-open write check so EACCES/EBUSY/ENOENT surface with a
+            // hint *before* `v4l2sink` returns an opaque GStreamer error.
+            // The returned path is canonicalised — feed that to v4l2sink
+            // rather than the user-supplied original to close the symlink
+            // race window between the pre-check and the kernel open.
+            let canon = check_v4l2_output_access(&device)?;
+            let elem = make_element("v4l2sink", "output_sink")?;
+            elem.set_property_from_str("device", canon.to_string_lossy().as_ref());
+            // NOTE: do NOT set `io-mode=rw`.  v4l2loopback with
+            // `exclusive_caps=1` only exposes the device's Video
+            // Capture capability to consumers when the writer uses
+            // mmap+QBUF.  `rw` puts v4l2sink on `write(2)` which
+            // keeps the device in Video Output mode only — cheese,
+            // Chrome and gst-launch consumers stop seeing it as a
+            // camera entirely.
+            Ok(elem)
+        }
+        OutputSink::Pipewire { node_name } => {
+            // `pipewiresink` is provided by `gst-plugin-pipewire`.
+            // `make_element` surfaces a structured MissingElement
+            // error (with install hint) if the plugin is missing.
+            let elem = make_element("pipewiresink", "output_sink")?;
+            // Advertise this stream as a video *source* in the PipeWire
+            // graph so consumers (Firefox via xdg-desktop-portal,
+            // OBS-PW, helvum) discover it as a camera.  Without
+            // `media.class = Video/Source` pipewiresink defaults to
+            // looking for a target consumer and exits with
+            // "no target node available" — exactly the smoke-test
+            // failure mode operators first hit on Stage 5.
+            let name = node_name.as_deref().unwrap_or("fluxframe");
+            let props = gstreamer::Structure::builder("properties")
+                .field("media.class", "Video/Source")
+                .field("media.role", "Camera")
+                .field("node.name", name)
+                .field("node.description", "FluxFrame Camera")
+                .build();
+            elem.set_property("stream-properties", props);
+            elem.set_property("client-name", name);
+            Ok(elem)
+        }
     }
 }
 

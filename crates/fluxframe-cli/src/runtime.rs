@@ -201,17 +201,43 @@ pub(crate) enum OutputSpec {
     Fake,
     /// `v4l2sink` to a loopback (or other writable V4L2) device.
     V4l2(PathBuf),
+    /// `pipewiresink` publishing a PipeWire node.  Optional name shows
+    /// up in PipeWire graph tools (`pw-cli`, `helvum`).
+    Pipewire(Option<String>),
     /// Unrecognised — caller surfaces a structured error.
     Unsupported(String),
 }
 
 /// Classify the output section of `cfg` into an [`OutputSpec`].
+///
+/// Recognised forms:
+///   * `auto` / `fakesink` — built-in GStreamer sinks.
+///   * `/dev/video*` — v4l2loopback (or any writable V4L2 device).
+///   * `pipewire` / `pipewire:<node-name>` — PipeWire stream.  The
+///     optional name suffix labels the PipeWire client in graph tools
+///     and lets multiple FluxFrame instances co-exist.
 #[must_use]
 pub(crate) fn classify_output(cfg: &FluxConfig) -> OutputSpec {
-    match cfg.output.device.as_str() {
+    let device = cfg.output.device.as_str();
+    if let Some(suffix) = device.strip_prefix("pipewire") {
+        if suffix.is_empty() {
+            return OutputSpec::Pipewire(None);
+        }
+        if let Some(rest) = suffix.strip_prefix(':') {
+            let trimmed = rest.trim();
+            return OutputSpec::Pipewire(if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            });
+        }
+        // `pipewireFOO` etc — neither bare nor `pipewire:NAME`.  Fall
+        // through to Unsupported so the operator sees a clear error.
+    }
+    match device {
         "auto" => OutputSpec::Auto,
         "fakesink" => OutputSpec::Fake,
-        device if device.starts_with("/dev/") => OutputSpec::V4l2(PathBuf::from(device)),
+        other if other.starts_with("/dev/") => OutputSpec::V4l2(PathBuf::from(other)),
         other => OutputSpec::Unsupported(other.to_string()),
     }
 }
@@ -514,10 +540,11 @@ fn teardown(input: &InputPipeline, output: &OutputPipeline, chain: &mut EffectCh
 
 fn resolve_output_sink(cfg: &FluxConfig) -> Result<OutputSink, FluxError> {
     // Routing rules (see Stage 2 plan, §"Output side"):
-    //   * "auto"      -> autovideosink (manual glance verification).
-    //   * "fakesink"  -> fakesink (CI / dev smoke without a loopback).
-    //   * /dev/...    -> v4l2sink to a loopback device.
-    //   * everything else -> structured §27 Config error.
+    //   * "auto"             -> autovideosink (manual glance verification).
+    //   * "fakesink"         -> fakesink (CI / dev smoke without a loopback).
+    //   * /dev/...           -> v4l2sink to a loopback device.
+    //   * "pipewire[:name]"  -> pipewiresink publishing a PW node.
+    //   * everything else    -> structured §27 Config error.
     //
     // Triage lives in [`classify_output`]; this function only maps the
     // typed `OutputSpec` onto the GStreamer-facing `OutputSink`.
@@ -525,9 +552,10 @@ fn resolve_output_sink(cfg: &FluxConfig) -> Result<OutputSink, FluxError> {
         OutputSpec::Auto => Ok(OutputSink::Auto),
         OutputSpec::Fake => Ok(OutputSink::Fake),
         OutputSpec::V4l2(device) => Ok(OutputSink::V4l2Loopback { device }),
+        OutputSpec::Pipewire(node_name) => Ok(OutputSink::Pipewire { node_name }),
         OutputSpec::Unsupported(d) => Err(FluxError::Config {
             reason: format!("output '{d}' is not supported"),
-            hint: Some("supported outputs: auto, fakesink, /dev/video<N>".into()),
+            hint: Some("supported outputs: auto, fakesink, /dev/video<N>, pipewire[:name]".into()),
         }),
     }
 }
@@ -541,6 +569,7 @@ fn output_sink_label(sink: &OutputSink) -> &'static str {
         OutputSink::Fake => "fakesink",
         OutputSink::Auto => "autovideosink",
         OutputSink::V4l2Loopback { .. } => "v4l2sink",
+        OutputSink::Pipewire { .. } => "pipewiresink",
     }
 }
 
@@ -707,6 +736,55 @@ mod tests {
         assert_eq!(
             classify_output(&cfg),
             OutputSpec::V4l2(PathBuf::from("/dev/video10"))
+        );
+    }
+
+    #[test]
+    fn classify_output_maps_pipewire_bare() {
+        let mut cfg = base_cfg();
+        cfg.output.device = "pipewire".into();
+        assert_eq!(classify_output(&cfg), OutputSpec::Pipewire(None));
+    }
+
+    #[test]
+    fn classify_output_maps_pipewire_with_name() {
+        let mut cfg = base_cfg();
+        cfg.output.device = "pipewire:my-cam".into();
+        assert_eq!(
+            classify_output(&cfg),
+            OutputSpec::Pipewire(Some("my-cam".to_string()))
+        );
+    }
+
+    #[test]
+    fn classify_output_treats_pipewire_typos_as_unsupported() {
+        // `pipewireFOO` is not a `pipewire:NAME` form — surface as
+        // unsupported rather than silently treating as PipeWire with
+        // garbage suffix.
+        let mut cfg = base_cfg();
+        cfg.output.device = "pipewirefoo".into();
+        match classify_output(&cfg) {
+            OutputSpec::Unsupported(s) => assert_eq!(s, "pipewirefoo"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_output_pipewire_colon_with_empty_name_is_anonymous() {
+        let mut cfg = base_cfg();
+        cfg.output.device = "pipewire:".into();
+        assert_eq!(classify_output(&cfg), OutputSpec::Pipewire(None));
+    }
+
+    #[test]
+    fn resolve_output_sink_maps_pipewire() {
+        let mut cfg = base_cfg();
+        cfg.output.device = "pipewire:flux".into();
+        assert_eq!(
+            resolve_output_sink(&cfg).expect("pipewire resolves"),
+            OutputSink::Pipewire {
+                node_name: Some("flux".into())
+            }
         );
     }
 }

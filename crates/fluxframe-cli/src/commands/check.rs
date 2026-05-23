@@ -154,9 +154,17 @@ fn check_output_device(cfg: &FluxConfig) -> Result<(), FluxError> {
             );
             Ok(())
         }
+        OutputSpec::Pipewire(node_name) => {
+            // No pre-flight to run: PipeWire availability and the
+            // `pipewiresink` element are validated at pipeline build
+            // time, which surfaces a structured MissingElement error
+            // when `gst-plugin-pipewire` is not installed.
+            info!(node = ?node_name, "output: pipewire (validated at pipeline build)");
+            Ok(())
+        }
         OutputSpec::Unsupported(d) => Err(FluxError::Config {
             reason: format!("output '{d}' is not supported"),
-            hint: Some("supported outputs: auto, fakesink, /dev/video<N>".into()),
+            hint: Some("supported outputs: auto, fakesink, /dev/video<N>, pipewire[:name]".into()),
         }),
     }
 }
