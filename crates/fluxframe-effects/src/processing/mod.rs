@@ -12,4 +12,4 @@ pub mod resize;
 pub use blur::box_blur_rgb;
 pub use compose::alpha_composite_rgb_in_place;
 pub use mask::{dilate, feather, smooth_temporal, threshold};
-pub use resize::{resize_mask_bilinear, resize_rgb_bilinear};
+pub use resize::{resize_mask_bilinear, resize_rgb_bilinear, resize_rgb_nearest};

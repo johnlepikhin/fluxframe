@@ -93,6 +93,54 @@ pub fn resize_rgb_bilinear(
     }
 }
 
+/// Nearest-neighbour resize for a packed RGB buffer.  Fast and
+/// allocation-free — used on the upscale leg of the downscaled-blur
+/// pipeline where the input is already low-frequency content and the
+/// blocky output is hidden by the feathered alpha mask.  Bilinear here
+/// would dominate the blur stage's CPU cost (a 4× upscale runs ~30
+/// float ops × output pixels — the upscale alone outweighed the cost
+/// of the box-blur it was meant to make cheap).
+///
+/// # Panics
+///
+/// Panics in debug builds if slice lengths don't match the dimensions.
+pub fn resize_rgb_nearest(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+) {
+    debug_assert_eq!(src.len(), (src_w * src_h * 3) as usize);
+    debug_assert_eq!(dst.len(), (dst_w * dst_h * 3) as usize);
+    if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
+        return;
+    }
+    let src_row_pixels = src_w as usize;
+    let dst_row_pixels = dst_w as usize;
+    let dst_rows = dst_h as usize;
+    // 16.16 fixed-point step keeps the inner loop branch-free and
+    // avoids a float→int per pixel.
+    let x_step = (u64::from(src_w) << 16) / u64::from(dst_w).max(1);
+    let y_step = (u64::from(src_h) << 16) / u64::from(dst_h).max(1);
+    let max_col_idx = u64::from(src_w) - 1;
+    let max_row_idx = u64::from(src_h) - 1;
+    for y in 0..dst_rows {
+        let row_idx = (((y as u64).wrapping_mul(y_step) >> 16).min(max_row_idx)) as usize;
+        let src_row = row_idx * src_row_pixels * 3;
+        let dst_row = y * dst_row_pixels * 3;
+        for x in 0..dst_row_pixels {
+            let col_idx = (((x as u64).wrapping_mul(x_step) >> 16).min(max_col_idx)) as usize;
+            let s = src_row + col_idx * 3;
+            let d = dst_row + x * 3;
+            dst[d] = src[s];
+            dst[d + 1] = src[s + 1];
+            dst[d + 2] = src[s + 2];
+        }
+    }
+}
+
 /// Bilinear resize for a single-channel `f32` mask.
 ///
 /// `src` length must equal `src_w * src_h`; same for `dst`.

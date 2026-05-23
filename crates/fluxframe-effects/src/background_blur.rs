@@ -42,7 +42,7 @@ use crate::ml::{
 };
 use crate::processing::{
     alpha_composite_rgb_in_place, box_blur_rgb, dilate, feather, resize_mask_bilinear,
-    resize_rgb_bilinear, smooth_temporal, threshold,
+    resize_rgb_bilinear, resize_rgb_nearest, smooth_temporal, threshold,
 };
 
 /// Default values for [`BlurConfig`].
@@ -54,6 +54,13 @@ pub mod defaults {
     pub const BLUR_RADIUS: u32 = 21;
     /// Number of box-blur passes.
     pub const BLUR_PASSES: u32 = 2;
+    /// Downscale factor applied to the frame before running the box
+    /// blur.  The blurred result is bilinear-upscaled back to the frame
+    /// resolution before compositing.  Cuts blur cost by roughly the
+    /// square of the factor with no visible quality loss for normal
+    /// blur radii (we're blurring the background to unrecognisable).
+    /// Set to `1` to disable and blur at full frame resolution.
+    pub const BLUR_DOWNSCALE: u32 = 4;
     /// Mask binarisation threshold in `[0, 1]`.
     pub const MASK_THRESHOLD: f32 = 0.5;
     /// EMA factor applied to the previous mask in `[0, 1]`.
@@ -72,6 +79,7 @@ pub mod defaults {
 // ---------------------------------------------------------------------------
 const MAX_BLUR_RADIUS: u32 = 256;
 const MAX_BLUR_PASSES: u32 = 16;
+const MAX_BLUR_DOWNSCALE: u32 = 8;
 const MAX_DILATE: u32 = 32;
 const MAX_FEATHER_RADIUS: u32 = 64;
 
@@ -88,19 +96,47 @@ pub struct BackgroundBlurEffect {
     /// mock implementation without touching ONNX Runtime.
     engine: Option<Box<dyn InferenceEngine + Send>>,
     // Frame-resolution scratch:
+    /// Output of the blur step at frame resolution — what
+    /// `alpha_composite` reads as the "background" plane.  Always
+    /// frame-sized regardless of `blur_downscale`.
     blurred: Vec<u8>,
+    /// Scratch for the box-blur primitive when blurring at full
+    /// resolution (`blur_downscale == 1`).  Empty otherwise.
     blur_scratch: Vec<u8>,
+    /// Fully post-processed mask resampled to frame resolution; the only
+    /// frame-sized mask buffer (down from four in the pre-Stage-5 design).
     mask_full: Vec<f32>,
-    mask_prev: Vec<f32>,
-    mask_dilate_scratch: Vec<f32>,
-    mask_feather_scratch: Vec<f32>,
+    // Downscaled-blur scratch (allocated when `blur_downscale > 1`):
+    /// Frame bilinear-downscaled to `(W/N) × (H/N)`, input to the
+    /// reduced-resolution box blur.
+    frame_down: Vec<u8>,
+    /// Box-blurred downscaled frame, bilinear-upscaled back to
+    /// `blurred` before compositing.
+    blurred_down: Vec<u8>,
+    /// Scratch for the downscaled box blur primitive.
+    blur_scratch_down: Vec<u8>,
+    /// Cached `(blur_down_w, blur_down_h)` after `prepare`.
+    blur_down_w: u32,
+    blur_down_h: u32,
+    /// Effective downscale factor used at runtime — equals
+    /// `config.blur_downscale` clamped so the downscaled image is at
+    /// least 2×2.  Set in `prepare`, consumed in `blend`.
+    blur_downscale_effective: u32,
     // Model-resolution scratch:
     model_input_u8: Vec<u8>,
     /// `f32`-normalised, layout-packed model input.  Length is
     /// `model_pixels * 3` and the channel order is dictated by
     /// `model_config.input_layout`.
     model_input_f32: Vec<f32>,
+    /// Raw segmentation mask decoded from the inference output.  Reused
+    /// as the smoothed/threshold/dilated/feathered mask after a swap
+    /// with `mask_prev_model` (see `build_mask`).
     mask_raw: Vec<f32>,
+    /// Previous frame's smoothed mask at model resolution; backs the EMA
+    /// state in `smooth_temporal`.
+    mask_prev_model: Vec<f32>,
+    mask_dilate_model_scratch: Vec<f32>,
+    mask_feather_model_scratch: Vec<f32>,
     // Negotiated:
     frame_w: u32,
     frame_h: u32,
@@ -132,6 +168,12 @@ pub struct BlurConfig {
     /// Number of box-blur passes.
     #[serde(default = "default_blur_passes")]
     pub blur_passes: u32,
+    /// Downscale factor for the blur pipeline.  Frame is bilinear-
+    /// downscaled by this factor, blurred at the smaller resolution,
+    /// then bilinear-upscaled back.  Default `4` cuts blur cost ~16×
+    /// with no visible quality loss.  Set to `1` to disable.
+    #[serde(default = "default_blur_downscale")]
+    pub blur_downscale: u32,
     /// Mask binarisation threshold in `[0, 1]`.
     #[serde(default = "default_mask_threshold")]
     pub mask_threshold: f32,
@@ -156,6 +198,9 @@ fn default_blur_radius() -> u32 {
 }
 fn default_blur_passes() -> u32 {
     defaults::BLUR_PASSES
+}
+fn default_blur_downscale() -> u32 {
+    defaults::BLUR_DOWNSCALE
 }
 fn default_mask_threshold() -> f32 {
     defaults::MASK_THRESHOLD
@@ -199,10 +244,16 @@ impl BackgroundBlurEffect {
             engine: None,
             blurred: Vec::new(),
             blur_scratch: Vec::new(),
+            frame_down: Vec::new(),
+            blurred_down: Vec::new(),
+            blur_scratch_down: Vec::new(),
+            blur_down_w: 0,
+            blur_down_h: 0,
+            blur_downscale_effective: 1,
             mask_full: Vec::new(),
-            mask_prev: Vec::new(),
-            mask_dilate_scratch: Vec::new(),
-            mask_feather_scratch: Vec::new(),
+            mask_prev_model: Vec::new(),
+            mask_dilate_model_scratch: Vec::new(),
+            mask_feather_model_scratch: Vec::new(),
             model_input_u8: Vec::new(),
             model_input_f32: Vec::new(),
             mask_raw: Vec::new(),
@@ -315,7 +366,7 @@ impl BackgroundBlurEffect {
                 // when inference recovers, the EMA does not blend a
                 // pre-failure mask into the post-recovery one.
                 if fails == 1 {
-                    self.mask_prev.fill(0.0);
+                    self.mask_prev_model.fill(0.0);
                 }
                 // Rate-limit warnings: emit the first failure, then only on
                 // power-of-two boundaries (1, 2, 4, 8, …).  Avoids flooding
@@ -362,7 +413,53 @@ impl BackgroundBlurEffect {
             model_config,
         )?;
 
-        // 6. Resize mask to frame resolution.
+        // 6. Temporal smoothing → threshold → dilate → feather, ALL at
+        // model resolution (~65k pixels for a 256² model vs 921k for a
+        // 1280×720 frame).  Doing post-processing here instead of at
+        // frame resolution cuts mask-stage CPU by ≈14× (memory traffic
+        // dominates each of these ops) — see Stage 5 plan.
+        // `smooth_temporal` writes the EMA result into its first
+        // argument (`mask_prev_model`); we swap so `mask_raw` ends up
+        // with the smoothed mask and `mask_prev_model` holds the raw
+        // current mask, ready to be overwritten on the next call.
+        smooth_temporal(
+            &mut self.mask_prev_model,
+            &self.mask_raw,
+            config.mask_smoothing,
+        );
+        std::mem::swap(&mut self.mask_raw, &mut self.mask_prev_model);
+
+        threshold(&mut self.mask_raw, config.mask_threshold);
+        // `mask_dilate` and `mask_feather_radius` in `BlurConfig` are
+        // FRAME-side intents (operator-friendly: "how many *visible*
+        // pixels of feather").  Since the actual ops run at model
+        // resolution, divide by the upscale ratio so the visible width
+        // after the bilinear upscale matches the operator's number.
+        // Without this the radii effectively N× too large in the final
+        // composite, producing fuzzy/over-grown masks.
+        let scale = (self.frame_w / self.model_w)
+            .max(self.frame_h / self.model_h)
+            .max(1);
+        let dilate_model = config.mask_dilate.div_ceil(scale);
+        let feather_model = config.mask_feather_radius.div_ceil(scale);
+        dilate(
+            &mut self.mask_raw,
+            &mut self.mask_dilate_model_scratch,
+            self.model_w,
+            self.model_h,
+            dilate_model,
+        );
+        feather(
+            &mut self.mask_raw,
+            &mut self.mask_feather_model_scratch,
+            self.model_w,
+            self.model_h,
+            feather_model,
+        );
+
+        // 7. Single resize of the fully post-processed model-resolution
+        // mask up to the frame resolution.  Bilinear preserves the
+        // feathered soft edge from step 6.
         resize_mask_bilinear(
             &self.mask_raw,
             self.model_w,
@@ -370,31 +467,6 @@ impl BackgroundBlurEffect {
             &mut self.mask_full,
             self.frame_w,
             self.frame_h,
-        );
-
-        // 7. Temporal smoothing → threshold → dilate → feather.
-        // `smooth_temporal` writes the EMA result into its first argument
-        // (`mask_prev`).  Swap the two buffers so `mask_full` ends up with
-        // the freshest mask and `mask_prev` retains the previous frame's
-        // mask, ready to be overwritten on the next call.  Avoids an 8.3MB
-        // memcpy per 1080p frame.
-        smooth_temporal(&mut self.mask_prev, &self.mask_full, config.mask_smoothing);
-        std::mem::swap(&mut self.mask_full, &mut self.mask_prev);
-
-        threshold(&mut self.mask_full, config.mask_threshold);
-        dilate(
-            &mut self.mask_full,
-            &mut self.mask_dilate_scratch,
-            self.frame_w,
-            self.frame_h,
-            config.mask_dilate,
-        );
-        feather(
-            &mut self.mask_full,
-            &mut self.mask_feather_scratch,
-            self.frame_w,
-            self.frame_h,
-            config.mask_feather_radius,
         );
         Ok(())
     }
@@ -431,16 +503,61 @@ impl BackgroundBlurEffect {
             }
         }
 
-        // 8. Blur the frame (background candidate).
-        box_blur_rgb(
-            frame.data.as_slice(),
-            &mut self.blurred,
-            &mut self.blur_scratch,
-            self.frame_w,
-            self.frame_h,
-            config.blur_radius,
-            config.blur_passes,
-        );
+        // 8. Blur the frame (background candidate).  When `blur_downscale`
+        // > 1 (the default), we bilinear-downscale the frame, blur the
+        // small image, then bilinear-upscale back into `self.blurred` —
+        // costs ~1/N² of the work for the box-blur step itself, and the
+        // upscale adds further softening that visually matches a larger
+        // full-res blur.  Stage 5.B.
+        if self.blur_downscale_effective <= 1 {
+            box_blur_rgb(
+                frame.data.as_slice(),
+                &mut self.blurred,
+                &mut self.blur_scratch,
+                self.frame_w,
+                self.frame_h,
+                config.blur_radius,
+                config.blur_passes,
+            );
+        } else {
+            resize_rgb_bilinear(
+                frame.data.as_slice(),
+                self.frame_w,
+                self.frame_h,
+                &mut self.frame_down,
+                self.blur_down_w,
+                self.blur_down_h,
+            );
+            // Auto-scale the radius down to match the smaller buffer:
+            // `blur_radius` in `BlurConfig` is operator-facing in
+            // frame pixels, so divide by the effective downscale factor.
+            let radius_down = config
+                .blur_radius
+                .div_ceil(self.blur_downscale_effective)
+                .max(1);
+            box_blur_rgb(
+                &self.frame_down,
+                &mut self.blurred_down,
+                &mut self.blur_scratch_down,
+                self.blur_down_w,
+                self.blur_down_h,
+                radius_down,
+                config.blur_passes,
+            );
+            // Nearest-neighbour upscale — much cheaper than bilinear
+            // (~10× fewer ops per output pixel) and visually equivalent
+            // for blurred content combined with the feathered alpha
+            // mask further downstream.  Bilinear on the upscale leg
+            // would dominate the whole blur stage cost.
+            resize_rgb_nearest(
+                &self.blurred_down,
+                self.blur_down_w,
+                self.blur_down_h,
+                &mut self.blurred,
+                self.frame_w,
+                self.frame_h,
+            );
+        }
 
         // 9. Promote the frame to Owned upfront so the in-place composite
         //    below can mutate it without paying a silent CoW.  When the
@@ -505,6 +622,12 @@ impl BlurConfig {
             return Err(invalid_config(format!(
                 "blur_passes must be <= {MAX_BLUR_PASSES}, got {}",
                 self.blur_passes
+            )));
+        }
+        if self.blur_downscale == 0 || self.blur_downscale > MAX_BLUR_DOWNSCALE {
+            return Err(invalid_config(format!(
+                "blur_downscale must be in 1..={MAX_BLUR_DOWNSCALE}, got {}",
+                self.blur_downscale
             )));
         }
         if self.mask_dilate > MAX_DILATE {
@@ -664,14 +787,41 @@ impl VideoEffect for BackgroundBlurEffect {
         let model_bytes = model_pixels * 3;
 
         self.blurred = vec![0u8; frame_bytes];
-        self.blur_scratch = vec![0u8; frame_bytes];
         self.mask_full = vec![0.0f32; frame_pixels];
-        self.mask_prev = vec![0.0f32; frame_pixels];
-        self.mask_dilate_scratch = vec![0.0f32; frame_pixels];
-        self.mask_feather_scratch = vec![0.0f32; frame_pixels];
         self.model_input_u8 = vec![0u8; model_bytes];
         self.model_input_f32 = vec![0.0f32; model_pixels * 3];
         self.mask_raw = vec![0.0f32; model_pixels];
+        self.mask_prev_model = vec![0.0f32; model_pixels];
+        self.mask_dilate_model_scratch = vec![0.0f32; model_pixels];
+        self.mask_feather_model_scratch = vec![0.0f32; model_pixels];
+
+        // Downscaled-blur buffers (Stage 5.B): box-blur runs on a
+        // (W/N) × (H/N) frame and is bilinear-upscaled back into
+        // `blurred`.  When `blur_downscale == 1` we keep the original
+        // full-resolution path and the *_down buffers stay empty.
+        // Effective downscale.  Capped so the downscaled buffer is at
+        // least 2×2 — `box_blur_rgb` indexes `w-1` and `h-1` and
+        // panics on a 1×N input.  Tiny frames simply degrade to the
+        // full-resolution blur path.
+        let max_downscale = (context.width.min(context.height) / 2).max(1);
+        let blur_downscale = config.blur_downscale.max(1).min(max_downscale);
+        self.blur_downscale_effective = blur_downscale;
+        if blur_downscale == 1 {
+            self.blur_down_w = context.width;
+            self.blur_down_h = context.height;
+            self.blur_scratch = vec![0u8; frame_bytes];
+            self.frame_down.clear();
+            self.blurred_down.clear();
+            self.blur_scratch_down.clear();
+        } else {
+            self.blur_down_w = (context.width / blur_downscale).max(1);
+            self.blur_down_h = (context.height / blur_downscale).max(1);
+            let down_bytes = (self.blur_down_w as usize) * (self.blur_down_h as usize) * 3;
+            self.frame_down = vec![0u8; down_bytes];
+            self.blurred_down = vec![0u8; down_bytes];
+            self.blur_scratch_down = vec![0u8; down_bytes];
+            self.blur_scratch.clear();
+        }
 
         self.consecutive_failures = 0;
         self.stage_us_inference = 0;
@@ -958,6 +1108,7 @@ mod tests {
             model_config: None,
             blur_radius: defaults::BLUR_RADIUS,
             blur_passes: defaults::BLUR_PASSES,
+            blur_downscale: defaults::BLUR_DOWNSCALE,
             mask_threshold: defaults::MASK_THRESHOLD,
             mask_smoothing: defaults::MASK_SMOOTHING,
             mask_feather_radius: defaults::MASK_FEATHER_RADIUS,
@@ -1206,12 +1357,12 @@ model = "/tmp/dummy.onnx"
         effect.blurred = vec![0u8; frame_bytes];
         effect.blur_scratch = vec![0u8; frame_bytes];
         effect.mask_full = vec![0.0; frame_pixels];
-        effect.mask_prev = vec![0.0; frame_pixels];
-        effect.mask_dilate_scratch = vec![0.0; frame_pixels];
-        effect.mask_feather_scratch = vec![0.0; frame_pixels];
         effect.model_input_u8 = vec![0u8; model_pixels * 3];
         effect.model_input_f32 = vec![0.0; model_pixels * 3];
         effect.mask_raw = vec![0.0; model_pixels];
+        effect.mask_prev_model = vec![0.0; model_pixels];
+        effect.mask_dilate_model_scratch = vec![0.0; model_pixels];
+        effect.mask_feather_model_scratch = vec![0.0; model_pixels];
 
         // Non-uniform 2×2 frame so the box blur actually changes pixel
         // values (uniform input would leave the blurred buffer identical
