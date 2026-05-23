@@ -7,14 +7,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use fluxframe_core::error::PipelineError;
 use fluxframe_core::frame::{PixelFormat, VideoFrame};
 use gstreamer::prelude::*;
 use gstreamer_app::AppSrc;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
-use crate::frame_conv::frame_to_buffer;
 use crate::util::{build_caps, check_v4l2_output_access, make_element};
 
 /// Output sink selection.
@@ -108,21 +108,59 @@ impl OutputParams {
     }
 }
 
+/// Latest composite published by the effect chain.  The writer thread
+/// re-publishes this at the configured `fps` so v4l2sink sees a steady
+/// frame rate even when the chain stalls.
+struct LatestComposite {
+    /// Packed pixel data in whatever format the appsrc declares.
+    /// `Arc<[u8]>` so cloning into the writer thread is a refcount bump
+    /// rather than a per-frame buffer copy.
+    bytes: Arc<[u8]>,
+    /// Effect-chain sequence number — propagated for tracing only.
+    seq: u64,
+}
+
 /// Output pipeline owning the GStreamer elements.
 ///
 /// The processing worker calls [`OutputPipeline::push_frame`] for every
 /// processed [`VideoFrame`]; this crate hides the `appsrc` plumbing.
+///
+/// The pipeline runs a dedicated *writer thread* that pushes the
+/// latest composite into `appsrc` at `fps` cadence — independently of
+/// how often the effect chain manages to produce a new one.  This
+/// closes the read/write race window in v4l2loopback (consumer at
+/// 30 fps reading while we wrote at ~15 fps produced visibly-torn
+/// "half-old, half-new" frames).
 pub struct OutputPipeline {
     pipeline: gstreamer::Pipeline,
     appsrc: AppSrc,
     started: Arc<AtomicBool>,
-    /// Last buffer PTS pushed into `appsrc` (nanoseconds).  Used only by
-    /// `push_frame` to warn on non-monotonic timestamps — v4l2sink and
-    /// v4l2loopback are picky about clock continuity, and a single
-    /// out-of-order / zero PTS shows up as a one-frame visual glitch
-    /// ("flicker") in downstream consumers.
-    last_pts_ns: std::sync::Mutex<Option<u64>>,
+    /// Target write cadence in Hz.  Cached at build time so the writer
+    /// thread can compute its sleep interval.  The actual writer ticks
+    /// at `WRITER_TICK_MULTIPLIER × fps` so v4l2loopback's read/write
+    /// race window shrinks proportionally — consumers reading at the
+    /// nominal `fps` see torn frames roughly `1/MULTIPLIER` as often.
+    fps: u32,
+    /// Latest composite from the effect chain.  Cloned cheaply (the
+    /// inner `Arc` is bumped, not the pixel bytes) by the writer thread
+    /// every tick.
+    latest: Arc<std::sync::Mutex<Option<LatestComposite>>>,
+    /// Writer thread handle.  Joined on `stop`.
+    writer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
+
+/// Writer pushes the latest composite into appsrc this many times per
+/// nominal output frame.  Repeated identical writes overwrite each
+/// other in v4l2loopback's buffer pool with no extra cost to consumers
+/// (each consumer DQBUF still gets the latest), and the higher rate
+/// statistically narrows the window where a consumer DQBUF lands
+/// mid-write — observably the dominant cause of the horizontal-seam
+/// torn frames operators see at the nominal cadence.
+///
+/// Capped further down to ensure the writer never ticks faster than
+/// `WRITER_MAX_HZ` regardless of operator-requested `fps`.
+const WRITER_TICK_MULTIPLIER: u32 = 3;
+const WRITER_MAX_HZ: u32 = 120;
 
 impl OutputPipeline {
     /// Build the pipeline.
@@ -265,11 +303,14 @@ impl OutputPipeline {
             pipeline,
             appsrc,
             started: Arc::new(AtomicBool::new(false)),
-            last_pts_ns: std::sync::Mutex::new(None),
+            fps: fps.max(1),
+            latest: Arc::new(std::sync::Mutex::new(None)),
+            writer_handle: std::sync::Mutex::new(None),
         })
     }
 
-    /// Transition the pipeline to PLAYING.
+    /// Transition the pipeline to PLAYING and spawn the writer thread
+    /// that re-publishes the latest composite at `fps` cadence.
     ///
     /// # Errors
     ///
@@ -283,59 +324,60 @@ impl OutputPipeline {
                 reason: format!("set_state(Playing) failed: {e}"),
             })?;
         self.started.store(true, Ordering::Release);
+
+        // Spawn the writer thread.  It owns its own monotonic PTS
+        // counter so consumers see strictly-monotonic timestamps with
+        // no drift even when the supervisor stalls the effect chain.
+        let started = Arc::clone(&self.started);
+        let latest = Arc::clone(&self.latest);
+        let appsrc = self.appsrc.clone();
+        let writer_hz = (self.fps.saturating_mul(WRITER_TICK_MULTIPLIER)).min(WRITER_MAX_HZ);
+        let interval = Duration::from_nanos(1_000_000_000_u64 / u64::from(writer_hz));
+        debug!(
+            sink_fps = self.fps,
+            writer_hz, "spawning output writer thread"
+        );
+        let handle = std::thread::Builder::new()
+            .name("fluxframe-out-writer".into())
+            .spawn(move || writer_loop(&started, &latest, &appsrc, interval))
+            .map_err(|e| PipelineError::Runtime {
+                reason: format!("writer thread spawn failed: {e}"),
+            })?;
+        *self.writer_handle.lock().expect("writer_handle poisoned") = Some(handle);
         Ok(())
     }
 
-    /// Push one processed frame into the pipeline.
-    ///
-    /// Takes the frame by value as a forward-compatibility hook for the
-    /// Stage 5 zero-copy path: the frame's backing memory will need to
-    /// transfer into the `gst::Buffer` so the mapping outlives this call.
-    /// Today the body still copies the pixel data regardless.
+    /// Publish a processed frame as the latest composite.  The writer
+    /// thread reads this slot at every tick; if a new frame has not
+    /// arrived since the last tick the previous one is re-pushed so
+    /// downstream sees a steady framerate.
     ///
     /// # Errors
     ///
-    /// Returns [`PipelineError`] if buffer construction fails or the
-    /// `appsrc` rejects the push (e.g. pipeline closed).
+    /// Returns [`PipelineError::Runtime`] when called before `start`.
     pub fn push_frame(&self, frame: VideoFrame) -> Result<(), PipelineError> {
         if !self.started.load(Ordering::Acquire) {
             return Err(PipelineError::Runtime {
                 reason: "output pipeline not started".into(),
             });
         }
+        // Pull pixel bytes into an `Arc<Vec<u8>>` so handing the slot to
+        // the writer is a refcount bump, not a buffer copy.  We
+        // discard `frame`'s PTS / duration deliberately: the writer
+        // synthesises its own clock to keep cadence steady.
         let seq = frame.meta.sequence;
-        let pts_ns = frame.meta.timestamp.as_nanos();
-        // Monotonicity probe: v4l2sink and v4l2loopback rely on PTS being
-        // strictly increasing.  A zero PTS, a duplicate, or an
-        // out-of-order one each manifests as a single-frame visual
-        // glitch in downstream consumers (cheese, Chrome, OBS).
-        {
-            let mut guard = self.last_pts_ns.lock().expect("last_pts_ns poisoned");
-            if pts_ns == 0 {
-                warn!(seq, "outgoing frame has PTS=0 — downstream may glitch");
-            } else if let Some(prev) = *guard
-                && pts_ns <= prev
-            {
-                warn!(
-                    seq,
-                    pts_ns,
-                    prev_pts_ns = prev,
-                    "outgoing PTS is non-monotonic — downstream may glitch (one-frame flicker)"
-                );
-            }
-            *guard = Some(pts_ns);
-        }
-        let buffer = frame_to_buffer(frame)?;
-        trace!(seq, pts_ns, "pushing frame to appsrc");
-        self.appsrc
-            .push_buffer(buffer)
-            .map(|_| ())
-            .map_err(|e| PipelineError::Runtime {
-                reason: format!("appsrc.push_buffer failed: {e}"),
-            })
+        let bytes: Arc<[u8]> = match frame.data {
+            fluxframe_core::frame::FrameBuffer::Owned(v) => Arc::from(v.into_boxed_slice()),
+            fluxframe_core::frame::FrameBuffer::Shared(arc) => arc,
+        };
+        let composite = LatestComposite { bytes, seq };
+        *self.latest.lock().expect("latest poisoned") = Some(composite);
+        trace!(seq, "published composite to writer thread");
+        Ok(())
     }
 
-    /// Stop the pipeline; signals EOS to the sink and tears down.
+    /// Stop the pipeline; signals EOS to the sink, joins the writer
+    /// thread and tears down.
     ///
     /// # Errors
     ///
@@ -344,6 +386,15 @@ impl OutputPipeline {
         if self.started.swap(false, Ordering::AcqRel) {
             // End-of-stream so downstream drains cleanly.
             let _ = self.appsrc.end_of_stream();
+        }
+        if let Some(handle) = self
+            .writer_handle
+            .lock()
+            .expect("writer_handle poisoned")
+            .take()
+            && let Err(e) = handle.join()
+        {
+            warn!(?e, "writer thread panicked while joining");
         }
         self.pipeline
             .set_state(gstreamer::State::Null)
@@ -363,6 +414,123 @@ impl OutputPipeline {
     pub fn bus(&self) -> gstreamer::Bus {
         self.pipeline.bus().expect("pipelines always have a bus")
     }
+}
+
+/// Writer thread loop.  Wakes every `interval`, takes a cheap `Arc`
+/// clone of the latest composite (or the previous one if the chain
+/// has not delivered a new frame in time), wraps it in a fresh
+/// `gst::Buffer` with a fabricated monotonic PTS and pushes it to
+/// `appsrc`.  Exits when `started` flips to `false`.
+fn writer_loop(
+    started: &Arc<AtomicBool>,
+    latest: &Arc<std::sync::Mutex<Option<LatestComposite>>>,
+    appsrc: &AppSrc,
+    interval: Duration,
+) {
+    let start_instant = Instant::now();
+    let mut next_tick = start_instant + interval;
+    let mut last_pushed_seq: Option<u64> = None;
+    let mut frames_pushed: u64 = 0;
+    let mut frames_duplicated: u64 = 0;
+    while started.load(Ordering::Acquire) {
+        let now = Instant::now();
+        if now < next_tick {
+            std::thread::sleep(next_tick - now);
+        } else {
+            // We are late.  Skip past missed ticks rather than burst the
+            // entire backlog into appsrc (which would defeat the point
+            // of a steady cadence).
+            while next_tick < now {
+                next_tick += interval;
+            }
+        }
+        next_tick += interval;
+
+        // Snapshot the latest composite.  Cloning the `Arc<Vec<u8>>` is
+        // a single refcount bump regardless of buffer size.
+        let snapshot = latest
+            .lock()
+            .expect("latest poisoned")
+            .as_ref()
+            .map(|c| (Arc::clone(&c.bytes), c.seq));
+        let Some((bytes, seq)) = snapshot else {
+            // Effect chain hasn't produced anything yet — nothing to
+            // push.  Cheap idle.
+            continue;
+        };
+        let is_dup = last_pushed_seq == Some(seq);
+        if is_dup {
+            frames_duplicated += 1;
+        }
+        last_pushed_seq = Some(seq);
+
+        // Build the gst::Buffer with a clock-derived PTS.  We deliberately
+        // synthesise PTS here (rather than reuse the supervisor's frame
+        // timestamp) so v4l2sink sees a strictly-monotonic 1/fps cadence
+        // even when the chain produces frames in bursts.
+        let pts_ns = u64::try_from(
+            next_tick
+                .saturating_duration_since(start_instant)
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX);
+        match build_buffer(&bytes, pts_ns, interval) {
+            Ok(buf) => {
+                if let Err(e) = appsrc.push_buffer(buf) {
+                    // The most common failure here is the shutdown race —
+                    // `stop()` sent EOS but the writer's loop iteration
+                    // was already past the `started` check.  Stay silent
+                    // in that case; surface anything else.
+                    if started.load(Ordering::Acquire) {
+                        warn!(error = %e, seq, "writer: appsrc.push_buffer failed");
+                    }
+                }
+                frames_pushed += 1;
+            }
+            Err(e) => {
+                warn!(error = %e, seq, "writer: buffer build failed");
+            }
+        }
+    }
+    debug!(
+        frames_pushed,
+        frames_duplicated, "output writer thread exited"
+    );
+}
+
+/// Wrap the latest composite bytes into a fresh `gst::Buffer` ready
+/// for `appsrc.push_buffer`.  PTS is supplied by the caller (writer
+/// thread) so consumers see a strictly-monotonic clock.
+fn build_buffer(
+    bytes: &[u8],
+    pts_ns: u64,
+    duration: Duration,
+) -> Result<gstreamer::Buffer, PipelineError> {
+    let mut buffer =
+        gstreamer::Buffer::with_size(bytes.len()).map_err(|e| PipelineError::Runtime {
+            reason: format!("Buffer::with_size failed: {e}"),
+        })?;
+    {
+        let buffer_ref = buffer
+            .get_mut()
+            .expect("buffer is uniquely owned immediately after with_size allocation");
+        let mut map = buffer_ref
+            .map_writable()
+            .map_err(|_| PipelineError::Runtime {
+                reason: "failed to map buffer for writing".into(),
+            })?;
+        map.as_mut_slice().copy_from_slice(bytes);
+    }
+    {
+        let buffer_ref = buffer
+            .get_mut()
+            .expect("buffer is uniquely owned immediately after with_size allocation");
+        buffer_ref.set_pts(gstreamer::ClockTime::from_nseconds(pts_ns));
+        if let Ok(d_ns) = u64::try_from(duration.as_nanos()) {
+            buffer_ref.set_duration(gstreamer::ClockTime::from_nseconds(d_ns));
+        }
+    }
+    Ok(buffer)
 }
 
 #[cfg(test)]
