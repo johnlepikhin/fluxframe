@@ -13,6 +13,7 @@ pub mod config;
 pub mod context;
 pub mod error;
 pub mod frame;
+pub mod metrics;
 pub mod traits;
 
 pub use config::{
@@ -22,6 +23,9 @@ pub use config::{
 pub use context::{FrameContext, ProcessingContext, RuntimeState};
 pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineError};
 pub use frame::{FrameBuffer, FrameMeta, PixelFormat, Timestamp, VideoFrame};
+pub use metrics::{
+    CounterValues, Counters, LatencyHistogram, LatencySnapshot, MetricsSnapshot,
+};
 pub use traits::{
     InferenceEngine, InferenceInput, InferenceOutput, ModelInfo, RawEffectParams, VideoEffect,
     VideoSink, VideoSource,
