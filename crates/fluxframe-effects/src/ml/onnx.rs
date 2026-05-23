@@ -120,16 +120,24 @@ impl OnnxEngine {
         // CLI can render the §27 "install/configure ORT" guidance.
         // Cap thread usage and disable busy-spinning.  ORT defaults grab
         // every available core for intra-op parallelism AND keep the
-        // pool spinning between inferences — at 15 fps with ~30 ms of
-        // actual work per frame the operator sees 100% CPU because the
-        // idle ~970 ms/s is spent in spin-wait, not sleeping.  Two
-        // intra-op threads is enough for a 256x256 segmentation model
-        // and leaves CPU for the rest of the pipeline + the OS.
+        // pool spinning between inferences — that combination pegs every
+        // core at 100% even between inferences (idle time is spin-wait,
+        // not sleep).  We pick a small thread count that still scales
+        // the inference but leaves cores for the rest of the pipeline
+        // and the OS:
+        //   * intra_threads = min(4, available_parallelism - 1), at least 2
+        //   * inter_threads = 1 (we don't have op-graph parallelism on this model)
+        //   * spinning      = false (sleep between inferences)
+        let intra_threads = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(2)
+            .saturating_sub(1)
+            .clamp(2, 4);
         let session = Session::builder()
             .map_err(|e| map_backend_or_load_error(&e.to_string()))?
-            .with_intra_threads(2)
+            .with_intra_threads(intra_threads)
             .map_err(|e| InferenceError::ModelLoadFailed {
-                reason: format!("with_intra_threads: {e}"),
+                reason: format!("with_intra_threads({intra_threads}): {e}"),
             })?
             .with_inter_threads(1)
             .map_err(|e| InferenceError::ModelLoadFailed {

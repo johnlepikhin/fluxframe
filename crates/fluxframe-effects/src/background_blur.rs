@@ -108,6 +108,13 @@ pub struct BackgroundBlurEffect {
     model_h: u32,
     // Fallback tracking:
     consecutive_failures: u32,
+    // Per-stage latency rolling averages (microseconds), logged every
+    // `STATS_LOG_PERIOD` processed frames so the operator can see
+    // warm-up effects and steady-state numbers without per-frame noise.
+    stage_us_inference: u64,
+    stage_us_mask: u64,
+    stage_us_blend: u64,
+    stats_frames_since_log: u32,
 }
 
 /// User-configurable parameters for [`BackgroundBlurEffect`].
@@ -204,6 +211,10 @@ impl BackgroundBlurEffect {
             model_w: 0,
             model_h: 0,
             consecutive_failures: 0,
+            stage_us_inference: 0,
+            stage_us_mask: 0,
+            stage_us_blend: 0,
+            stats_frames_since_log: 0,
         }
     }
 
@@ -517,6 +528,47 @@ impl BlurConfig {
     }
 }
 
+/// How many processed frames to accumulate before emitting a per-stage
+/// timing summary at info level.  Calibrated for ~2 seconds at 30 fps;
+/// at lower effective rates the period stretches but the log line still
+/// reflects useful steady-state numbers.
+const STATS_LOG_PERIOD: u32 = 60;
+
+impl BackgroundBlurEffect {
+    /// Update rolling per-stage timing averages and emit a summary line
+    /// every [`STATS_LOG_PERIOD`] frames.  Helps the operator see
+    /// warm-up regressions (e.g. ORT arena growing, CPU throttling) vs.
+    /// steady-state numbers without per-frame log noise.
+    fn record_stage_stats(
+        &mut self,
+        frame_seq: u64,
+        inference_us: u64,
+        mask_us: u64,
+        blend_us: u64,
+    ) {
+        // EMA with α = 1/STATS_LOG_PERIOD smooths a noisy single-frame
+        // measurement without losing reactivity to a sustained shift.
+        let alpha = u64::from(STATS_LOG_PERIOD);
+        self.stage_us_inference = (self.stage_us_inference * (alpha - 1) + inference_us) / alpha;
+        self.stage_us_mask = (self.stage_us_mask * (alpha - 1) + mask_us) / alpha;
+        self.stage_us_blend = (self.stage_us_blend * (alpha - 1) + blend_us) / alpha;
+        self.stats_frames_since_log += 1;
+        if self.stats_frames_since_log >= STATS_LOG_PERIOD {
+            self.stats_frames_since_log = 0;
+            let total_us = self.stage_us_inference + self.stage_us_mask + self.stage_us_blend;
+            info!(
+                seq = frame_seq,
+                inference_us = self.stage_us_inference,
+                mask_us = self.stage_us_mask,
+                blend_us = self.stage_us_blend,
+                total_us,
+                budget_us_30fps = 33_333_u64,
+                "background_blur stage timings (EMA)"
+            );
+        }
+    }
+}
+
 /// Build an [`EffectError::InvalidConfig`] with the effect name pre-filled.
 fn invalid_config(reason: impl Into<String>) -> EffectError {
     let reason = reason.into();
@@ -622,6 +674,44 @@ impl VideoEffect for BackgroundBlurEffect {
         self.mask_raw = vec![0.0f32; model_pixels];
 
         self.consecutive_failures = 0;
+        self.stage_us_inference = 0;
+        self.stage_us_mask = 0;
+        self.stage_us_blend = 0;
+        self.stats_frames_since_log = 0;
+
+        // ORT pre-warm.  The default arena-based allocator grows on
+        // first-N inferences as it sees op output sizes for the first
+        // time — without a warm-up that startup tax is spread across
+        // the operator's first ~minute of camera frames (visible
+        // 4 fps → 15 fps speed-up reported during stage-4 testing).
+        // One synthetic infer with a zero tensor is enough to populate
+        // the arena to its steady-state working set.
+        let warmup_shape: [usize; 4] = match self.model_config.as_ref() {
+            Some(mc) => match mc.input_layout {
+                InputLayout::Nhwc => [1, self.model_h as usize, self.model_w as usize, 3],
+                InputLayout::Nchw => [1, 3, self.model_h as usize, self.model_w as usize],
+            },
+            None => [1, self.model_h as usize, self.model_w as usize, 3],
+        };
+        let warmup_start = std::time::Instant::now();
+        if let Some(engine) = self.engine.as_mut() {
+            match engine.infer(InferenceInput {
+                data: &self.model_input_f32,
+                shape: &warmup_shape,
+            }) {
+                Ok(_) => {
+                    info!(
+                        warmup_us =
+                            u64::try_from(warmup_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        "ORT pre-warm inference complete"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "ORT pre-warm inference failed; continuing anyway");
+                }
+            }
+        }
+
         info!(
             model = %config.model.display(),
             frame = ?(context.width, context.height),
@@ -650,6 +740,7 @@ impl VideoEffect for BackgroundBlurEffect {
 
         // Run inference.  On transient failure the frame is passed through
         // unchanged; consecutive failures eventually escalate to an error.
+        let t_inference_start = std::time::Instant::now();
         let output = match self.run_inference(frame) {
             InferenceOutcome::Ok(out) => out,
             InferenceOutcome::Fallback => {
@@ -658,9 +749,17 @@ impl VideoEffect for BackgroundBlurEffect {
             }
             InferenceOutcome::Fatal(err) => return Err(err),
         };
+        let inference_us = u64::try_from(t_inference_start.elapsed().as_micros()).unwrap_or(0);
 
+        let t_mask_start = std::time::Instant::now();
         self.build_mask(&output)?;
+        let mask_us = u64::try_from(t_mask_start.elapsed().as_micros()).unwrap_or(0);
+
+        let t_blend_start = std::time::Instant::now();
         self.blend(frame)?;
+        let blend_us = u64::try_from(t_blend_start.elapsed().as_micros()).unwrap_or(0);
+
+        self.record_stage_stats(frame.meta.sequence, inference_us, mask_us, blend_us);
 
         debug!(frame_seq = frame.meta.sequence, "background_blur applied");
         Ok(())
