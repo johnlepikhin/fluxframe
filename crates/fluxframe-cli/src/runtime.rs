@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::PipelineError;
@@ -24,16 +24,18 @@ use fluxframe_gst::output::{OutputParams, OutputPipeline, OutputSink};
 use fluxframe_gst::{BusEvent, BusListener, BusSource, LatestFrameSlot, WatchedPipeline};
 use tracing::{error, info, warn};
 
+use crate::runtime_metrics::RuntimeMetrics;
+
 /// How long the worker waits on an empty frame slot before re-checking the
 /// shutdown flag.  Short enough to be responsive to Ctrl-C, long enough to
 /// avoid spinning when the source briefly stalls.
 const WORKER_POLL_TIMEOUT: Duration = Duration::from_millis(50);
 
-// TODO(stage-5/metrics): re-introduce a periodic drop-summary tick once the
-// metrics subsystem owns observability.  The previous implementation lived
-// inside the bus listener thread, which was the wrong layer: the bus thread
-// should only translate GStreamer messages, not poll counters.  For Stage 1
-// we log the cumulative drop count once at teardown.
+/// Reconcile slot drop counter into [`RuntimeMetrics`] every Nth frame.
+/// Picked low enough that a brief burst surfaces within a second at
+/// 30 fps; high enough to keep the supervisor loop free of per-frame
+/// atomic chatter on the slot's counter.
+const DROPPED_SYNC_INTERVAL: u64 = 30;
 
 /// Process-wide registry of live [`RunToken`]s.  The Ctrl-C signal handler
 /// walks this list and broadcasts a shutdown request to every concurrent
@@ -324,7 +326,8 @@ where
         slot.clone(),
     );
 
-    let process_result = run_process_loop(&running, &slot, &mut chain, &output);
+    let metrics = RuntimeMetrics::new();
+    let process_result = run_process_loop(&running, &slot, &mut chain, &output, &metrics);
 
     // Ensure the bus listener wakes and exits.  Dropping `_bus_listener`
     // at the end of the function calls `BusListener::stop` via Drop, but
@@ -335,9 +338,29 @@ where
 
     teardown(&input, &output, &mut chain);
 
-    tracing::debug!(
-        dropped = slot.dropped_count(),
-        "total capture-side dropped frames",
+    // Final reconciliation: pull whatever the slot dropped between the
+    // last sync inside the loop and shutdown.
+    metrics.sync_dropped(slot.dropped_count());
+    let snap = metrics.snapshot();
+    // Emit per-field structured values so log-ingestors (ELK, Vector,
+    // tracing-subscriber JSON layer) can query each metric without
+    // string-parsing.  The default fmt layer prints both the message
+    // and the fields, so we keep the message a plain prefix —
+    // `format_snapshot_summary` is reserved for the human-only
+    // periodic reporter (5.D.3) where it's the single emit.
+    info!(
+        frames_in = snap.counters.frames_in,
+        frames_out = snap.counters.frames_out,
+        frames_dropped = snap.counters.frames_dropped,
+        fallback = snap.counters.fallback_count,
+        effect_err = snap.counters.effect_error_count,
+        processing_p50_us = snap.processing.percentile_us(0.5),
+        processing_p95_us = snap.processing.percentile_us(0.95),
+        output_p50_us = snap.output.percentile_us(0.5),
+        output_p95_us = snap.output.percentile_us(0.95),
+        end_to_end_p50_us = snap.end_to_end.percentile_us(0.5),
+        end_to_end_p95_us = snap.end_to_end.percentile_us(0.95),
+        "run metrics"
     );
 
     // Surface bus-reported errors when the processing loop itself was
@@ -490,37 +513,61 @@ fn run_process_loop(
     slot: &LatestFrameSlot,
     chain: &mut EffectChain,
     output: &OutputPipeline,
+    metrics: &RuntimeMetrics,
 ) -> Result<(), FluxError> {
     let mut frame_context = FrameContext::default();
     // Track fallback edges so a single-frame visual artefact ("flicker")
     // caused by an inference miss surfaces as a warn line tied to the
     // exact frame_seq, instead of being lost in the per-frame debug noise.
     let mut prev_fallback = false;
+    let mut frames_seen: u64 = 0;
     while running.load(Ordering::Acquire) {
         let Some(mut frame) = slot.recv_timeout(WORKER_POLL_TIMEOUT) else {
             // Either timeout (no frame within the poll window) or slot
             // closed by shutdown.  Re-check the flag and continue.
             continue;
         };
+        let recv_at = Instant::now();
+        metrics.counters.inc_frames_in();
+        frames_seen += 1;
+
         frame_context.frame_sequence = frame.meta.sequence;
         frame_context.frame_timestamp = frame.meta.timestamp;
         frame_context.fallback_active = false;
 
+        let pre_process = Instant::now();
         if let Err(e) = chain.process(&mut frame, &mut frame_context) {
+            metrics.counters.inc_effect_error();
             error!(error = %e, "effect chain failed; stopping");
             return Err(FluxError::from(e));
         }
+        metrics.processing.record_duration(pre_process.elapsed());
+
         if frame_context.fallback_active != prev_fallback {
             warn!(
                 frame_seq = frame_context.frame_sequence,
                 fallback_active = frame_context.fallback_active,
                 "effect-chain fallback state changed (passthrough frame)"
             );
+            if frame_context.fallback_active {
+                // Count edges into fallback only — a steady passthrough
+                // run would otherwise inflate the counter every frame.
+                metrics.counters.inc_fallback();
+            }
             prev_fallback = frame_context.fallback_active;
         }
+
+        let pre_push = Instant::now();
         if let Err(e) = output.push_frame(frame) {
             error!(error = %e, "output.push_frame failed; stopping");
             return Err(e.into());
+        }
+        metrics.output.record_duration(pre_push.elapsed());
+        metrics.end_to_end.record_duration(recv_at.elapsed());
+        metrics.counters.inc_frames_out();
+
+        if frames_seen % DROPPED_SYNC_INTERVAL == 0 {
+            metrics.sync_dropped(slot.dropped_count());
         }
     }
     Ok(())

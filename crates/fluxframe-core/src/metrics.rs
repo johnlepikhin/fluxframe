@@ -27,6 +27,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Process-wide event counters.
 ///
@@ -160,6 +161,17 @@ impl LatencyHistogram {
         }
     }
 
+    /// Record one latency sample given as a [`Duration`].  Saturates at
+    /// `u64::MAX` µs (≈584 942 years) so no real latency ever truncates;
+    /// the cap exists only to keep the API total in the face of an
+    /// arithmetic bug elsewhere.  Thin wrapper around
+    /// [`LatencyHistogram::record_us`].
+    #[inline]
+    pub fn record_duration(&self, d: Duration) {
+        let us = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        self.record_us(us);
+    }
+
     /// Record one latency sample in microseconds.  Evicts the oldest
     /// sample if the ring is already full.
     ///
@@ -168,6 +180,7 @@ impl LatencyHistogram {
     /// into a kill of the producer.  The contents stay valid because
     /// every critical section is one `pop_front` + `push_back` with no
     /// invariants that span operations.
+    #[inline]
     pub fn record_us(&self, value: u64) {
         let mut buf = self
             .samples
@@ -249,6 +262,9 @@ impl LatencySnapshot {
         let last = n - 1;
         // Nearest-rank: position = ceil(p * n), index = position - 1.
         // p == 0 returns the minimum, p == 1 returns the maximum.
+        // `as usize` is safe here: post-clamp `p ∈ [0, 1]` and `n` fits
+        // in usize by construction, so the f64 result is in `[0, n]` ⊂
+        // `[0, usize::MAX]` — saturating-cast semantics never trigger.
         let position = (f64::from(p) * n as f64).ceil() as usize;
         let idx = position.saturating_sub(1).min(last);
         self.sorted[idx]
@@ -257,6 +273,12 @@ impl LatencySnapshot {
 
 /// Combined snapshot of all metrics — what the periodic reporter
 /// consumes for one `info!` line.
+///
+/// `#[non_exhaustive]` so adding a per-stage histogram (e.g. a
+/// future GPU-encode stage) does not break downstream consumers.
+/// Construct via [`MetricsSnapshot::new`] / `with_*` builders rather
+/// than the record literal syntax (which is forbidden cross-crate by
+/// the `#[non_exhaustive]` attribute).
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct MetricsSnapshot {
@@ -273,6 +295,59 @@ pub struct MetricsSnapshot {
     pub inference: LatencySnapshot,
     /// Output-side latency: effect chain exit → output push.
     pub output: LatencySnapshot,
+}
+
+impl MetricsSnapshot {
+    /// Construct an empty snapshot.  Every stage histogram defaults to
+    /// empty; counters default to zero.  Combine with the `with_*`
+    /// builders below to populate stages a producer actually tracks.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the counter snapshot.
+    #[must_use]
+    pub fn with_counters(mut self, counters: CounterValues) -> Self {
+        self.counters = counters;
+        self
+    }
+
+    /// Replace the end-to-end latency snapshot.
+    #[must_use]
+    pub fn with_end_to_end(mut self, snap: LatencySnapshot) -> Self {
+        self.end_to_end = snap;
+        self
+    }
+
+    /// Replace the capture-side latency snapshot.
+    #[must_use]
+    pub fn with_capture(mut self, snap: LatencySnapshot) -> Self {
+        self.capture = snap;
+        self
+    }
+
+    /// Replace the effect-chain processing latency snapshot.
+    #[must_use]
+    pub fn with_processing(mut self, snap: LatencySnapshot) -> Self {
+        self.processing = snap;
+        self
+    }
+
+    /// Replace the inference-only latency snapshot (subset of
+    /// processing).
+    #[must_use]
+    pub fn with_inference(mut self, snap: LatencySnapshot) -> Self {
+        self.inference = snap;
+        self
+    }
+
+    /// Replace the output-side latency snapshot.
+    #[must_use]
+    pub fn with_output(mut self, snap: LatencySnapshot) -> Self {
+        self.output = snap;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -508,5 +583,49 @@ mod tests {
         assert_eq!(s.counters.frames_in, 0);
         assert!(s.end_to_end.is_empty());
         assert!(s.inference.is_empty());
+    }
+
+    #[test]
+    fn record_duration_converts_to_microseconds() {
+        let h = LatencyHistogram::with_capacity(4);
+        h.record_duration(Duration::from_millis(2));
+        h.record_duration(Duration::from_micros(500));
+        h.record_duration(Duration::ZERO);
+        let snap = h.snapshot();
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap.percentile_us(0.0), 0);
+        assert_eq!(snap.percentile_us(0.5), 500);
+        assert_eq!(snap.percentile_us(1.0), 2_000);
+    }
+
+    #[test]
+    fn record_duration_saturates_on_overflow() {
+        let h = LatencyHistogram::with_capacity(1);
+        // Far above u64::MAX microseconds — saturate, don't panic.
+        h.record_duration(Duration::MAX);
+        let snap = h.snapshot();
+        assert_eq!(snap.percentile_us(1.0), u64::MAX);
+    }
+
+    #[test]
+    fn metrics_snapshot_builders_compose() {
+        let c = Counters::new();
+        c.inc_frames_in();
+        c.inc_frames_in();
+        let h = LatencyHistogram::with_capacity(8);
+        h.record_us(100);
+        h.record_us(200);
+        let snap = MetricsSnapshot::new()
+            .with_counters(c.snapshot())
+            .with_processing(h.snapshot())
+            .with_end_to_end(h.snapshot());
+        assert_eq!(snap.counters.frames_in, 2);
+        assert_eq!(snap.processing.len(), 2);
+        assert_eq!(snap.processing.percentile_us(1.0), 200);
+        assert_eq!(snap.end_to_end.len(), 2);
+        // Untouched stages remain empty.
+        assert!(snap.capture.is_empty());
+        assert!(snap.inference.is_empty());
+        assert!(snap.output.is_empty());
     }
 }
