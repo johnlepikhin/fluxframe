@@ -41,6 +41,16 @@ pub const MAX_FPS: u32 = 240;
 pub const MAX_INFLIGHT_FRAMES: u32 = 64;
 /// Upper bound on `max_latency_ms` accepted by [`FluxConfig::validate`].
 pub const MAX_LATENCY_MS: u32 = 10_000;
+/// Default cadence of the metrics reporter (`[realtime] metrics_interval_secs`).
+/// `0` disables periodic reporting (the teardown summary still runs).
+pub const DEFAULT_METRICS_INTERVAL_SECS: u32 = 5;
+/// Upper bound on positive `metrics_interval_secs` accepted by
+/// [`FluxConfig::validate`].  `0` is always valid — it is the
+/// documented sentinel that disables the periodic reporter.
+/// 1 h is well past any realistic operator setting; the cap exists
+/// only to catch typos like `metrics_interval_secs = 50000` that
+/// would effectively silence the reporter.
+pub const MAX_METRICS_INTERVAL_SECS: u32 = 3600;
 
 // ---------------------------------------------------------------------------
 // Backend selection
@@ -220,6 +230,11 @@ pub struct RealtimeConfig {
     /// (§22 bounded-queue invariant).
     #[serde(default = "default_max_inflight")]
     pub max_inflight_frames: u32,
+    /// How often the metrics reporter emits a per-window summary, in
+    /// seconds.  `0` disables periodic reporting (the teardown summary
+    /// is unconditional).
+    #[serde(default = "default_metrics_interval_secs")]
+    pub metrics_interval_secs: u32,
 }
 
 impl Default for RealtimeConfig {
@@ -228,6 +243,7 @@ impl Default for RealtimeConfig {
             max_latency_ms: default_max_latency_ms(),
             drop_late_frames: default_drop_late(),
             max_inflight_frames: default_max_inflight(),
+            metrics_interval_secs: default_metrics_interval_secs(),
         }
     }
 }
@@ -345,6 +361,17 @@ impl FluxConfig {
             )));
         }
 
+        // `0` is the documented "disable periodic reporting" sentinel;
+        // any positive value must stay within the sane upper bound so
+        // `metrics_interval_secs = 50000` does not silently turn into
+        // a ~14 h cadence the operator never sees.
+        if self.realtime.metrics_interval_secs > MAX_METRICS_INTERVAL_SECS {
+            return Err(config_err(format!(
+                "realtime.metrics_interval_secs must be 0 (disabled) or in 1..={MAX_METRICS_INTERVAL_SECS}, got {}",
+                self.realtime.metrics_interval_secs
+            )));
+        }
+
         for key in self.effects.per_effect.keys() {
             if RESERVED_EFFECTS_KEYS.contains(&key.as_str()) {
                 return Err(crate::error::FluxError::Config {
@@ -427,6 +454,9 @@ fn default_drop_late() -> bool {
 }
 fn default_max_inflight() -> u32 {
     DEFAULT_MAX_INFLIGHT_FRAMES
+}
+fn default_metrics_interval_secs() -> u32 {
+    DEFAULT_METRICS_INTERVAL_SECS
 }
 fn default_log_level() -> String {
     DEFAULT_LOG_LEVEL.to_string()

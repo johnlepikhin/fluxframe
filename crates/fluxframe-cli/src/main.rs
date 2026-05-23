@@ -15,6 +15,7 @@ mod cli;
 mod commands;
 mod config_merge;
 mod logging;
+mod metrics_reporter;
 mod runtime;
 mod runtime_metrics;
 

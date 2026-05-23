@@ -24,7 +24,7 @@ pub use context::{FrameContext, ProcessingContext, RuntimeState};
 pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineError};
 pub use frame::{FrameBuffer, FrameMeta, PixelFormat, Timestamp, VideoFrame};
 pub use metrics::{
-    CounterValues, Counters, LatencyHistogram, LatencySnapshot, MetricsSnapshot,
+    CounterValues, Counters, EffectTelemetry, LatencyHistogram, LatencySnapshot, MetricsSnapshot,
 };
 pub use traits::{
     InferenceEngine, InferenceInput, InferenceOutput, ModelInfo, RawEffectParams, VideoEffect,
@@ -111,6 +111,32 @@ chain = ["passthrough"]
             msg.contains("240"),
             "error must mention the fps upper bound, got: {msg}"
         );
+    }
+
+    #[test]
+    fn config_validation_rejects_excessive_metrics_interval() {
+        let mut cfg = FluxConfig::default();
+        cfg.realtime.metrics_interval_secs = 50_000;
+        let err = cfg
+            .validate()
+            .expect_err("oversized metrics_interval_secs must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("metrics_interval_secs"),
+            "error must mention the offending field, got: {msg}"
+        );
+        assert!(
+            msg.contains("3600"),
+            "error must mention the upper bound, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_validation_accepts_zero_metrics_interval_as_disabled() {
+        let mut cfg = FluxConfig::default();
+        cfg.realtime.metrics_interval_secs = 0;
+        cfg.validate()
+            .expect("0 must be accepted as the disabled sentinel");
     }
 
     #[test]

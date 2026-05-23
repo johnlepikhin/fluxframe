@@ -6,6 +6,7 @@
 //! per-frame data across frames.
 
 use crate::frame::{PixelFormat, Timestamp};
+use crate::metrics::EffectTelemetry;
 
 /// Pipeline-wide context handed to every effect once during `prepare`.
 #[derive(Debug, Clone)]
@@ -30,6 +31,10 @@ pub struct FrameContext {
     pub frame_timestamp: Timestamp,
     /// Set by an effect (or the runtime) when it had to fall back for this frame.
     pub fallback_active: bool,
+    /// Sink for per-stage timings.  The supervisor populates this before
+    /// invoking the effect chain; defaults to a no-op so test/stand-alone
+    /// constructions of [`FrameContext`] work without wiring metrics.
+    pub telemetry: EffectTelemetry,
 }
 
 /// Coarse runtime state used by the metrics layer and shutdown logic.

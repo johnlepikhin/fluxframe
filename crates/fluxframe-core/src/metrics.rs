@@ -25,6 +25,7 @@
 //! struct at all.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -295,6 +296,41 @@ pub struct MetricsSnapshot {
     pub inference: LatencySnapshot,
     /// Output-side latency: effect chain exit → output push.
     pub output: LatencySnapshot,
+}
+
+/// Telemetry sink handed to an effect via [`crate::context::FrameContext`].
+///
+/// An effect that owns per-stage timings (e.g. ML inference inside a
+/// composite effect) calls [`EffectTelemetry::record_inference`] on
+/// each frame; the supervisor reads the underlying histogram via
+/// [`crate::metrics::MetricsSnapshot::inference`].
+///
+/// `Default` returns a no-op sink: tests and downstream callers that
+/// do not wire metrics can still hand a [`crate::context::FrameContext`]
+/// to an effect without fabricating a real [`LatencyHistogram`].
+#[derive(Debug, Clone, Default)]
+pub struct EffectTelemetry {
+    inference: Option<Arc<LatencyHistogram>>,
+}
+
+impl EffectTelemetry {
+    /// Build a telemetry sink that publishes inference timings into
+    /// the given histogram.
+    #[must_use]
+    pub fn with_inference(inference: Arc<LatencyHistogram>) -> Self {
+        Self {
+            inference: Some(inference),
+        }
+    }
+
+    /// Record one inference latency sample.  No-op when the sink was
+    /// built without an inference histogram (test/default path).
+    #[inline]
+    pub fn record_inference(&self, d: Duration) {
+        if let Some(h) = &self.inference {
+            h.record_duration(d);
+        }
+    }
 }
 
 impl MetricsSnapshot {
@@ -605,6 +641,36 @@ mod tests {
         h.record_duration(Duration::MAX);
         let snap = h.snapshot();
         assert_eq!(snap.percentile_us(1.0), u64::MAX);
+    }
+
+    #[test]
+    fn effect_telemetry_default_is_noop() {
+        let t = EffectTelemetry::default();
+        t.record_inference(Duration::from_millis(5));
+        // No panic, no observable side effect — defaults to no histogram.
+    }
+
+    #[test]
+    fn effect_telemetry_with_inference_records_into_histogram() {
+        let h = Arc::new(LatencyHistogram::with_capacity(4));
+        let t = EffectTelemetry::with_inference(Arc::clone(&h));
+        t.record_inference(Duration::from_micros(7_500));
+        t.record_inference(Duration::from_micros(12_000));
+        let snap = h.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap.percentile_us(0.5), 7_500);
+        assert_eq!(snap.percentile_us(1.0), 12_000);
+    }
+
+    #[test]
+    fn effect_telemetry_clone_shares_underlying_histogram() {
+        let h = Arc::new(LatencyHistogram::with_capacity(4));
+        let a = EffectTelemetry::with_inference(Arc::clone(&h));
+        let b = a.clone();
+        a.record_inference(Duration::from_micros(1));
+        b.record_inference(Duration::from_micros(2));
+        let snap = h.snapshot();
+        assert_eq!(snap.len(), 2);
     }
 
     #[test]

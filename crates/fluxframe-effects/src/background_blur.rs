@@ -35,7 +35,7 @@ use fluxframe_core::error::{EffectError, InferenceError};
 use fluxframe_core::frame::{PixelFormat, VideoFrame};
 use fluxframe_core::traits::{InferenceEngine, InferenceInput, RawEffectParams, VideoEffect};
 use serde::Deserialize;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::ml::{
     InputLayout, ModelConfig, OnnxEngine, OutputLayout, OutputType, load_sidecar_or_placeholder,
@@ -144,13 +144,6 @@ pub struct BackgroundBlurEffect {
     model_h: u32,
     // Fallback tracking:
     consecutive_failures: u32,
-    // Per-stage latency rolling averages (microseconds), logged every
-    // `STATS_LOG_PERIOD` processed frames so the operator can see
-    // warm-up effects and steady-state numbers without per-frame noise.
-    stage_us_inference: u64,
-    stage_us_mask: u64,
-    stage_us_blend: u64,
-    stats_frames_since_log: u32,
 }
 
 /// User-configurable parameters for [`BackgroundBlurEffect`].
@@ -262,10 +255,6 @@ impl BackgroundBlurEffect {
             model_w: 0,
             model_h: 0,
             consecutive_failures: 0,
-            stage_us_inference: 0,
-            stage_us_mask: 0,
-            stage_us_blend: 0,
-            stats_frames_since_log: 0,
         }
     }
 
@@ -651,47 +640,6 @@ impl BlurConfig {
     }
 }
 
-/// How many processed frames to accumulate before emitting a per-stage
-/// timing summary at info level.  Calibrated for ~2 seconds at 30 fps;
-/// at lower effective rates the period stretches but the log line still
-/// reflects useful steady-state numbers.
-const STATS_LOG_PERIOD: u32 = 60;
-
-impl BackgroundBlurEffect {
-    /// Update rolling per-stage timing averages and emit a summary line
-    /// every [`STATS_LOG_PERIOD`] frames.  Helps the operator see
-    /// warm-up regressions (e.g. ORT arena growing, CPU throttling) vs.
-    /// steady-state numbers without per-frame log noise.
-    fn record_stage_stats(
-        &mut self,
-        frame_seq: u64,
-        inference_us: u64,
-        mask_us: u64,
-        blend_us: u64,
-    ) {
-        // EMA with α = 1/STATS_LOG_PERIOD smooths a noisy single-frame
-        // measurement without losing reactivity to a sustained shift.
-        let alpha = u64::from(STATS_LOG_PERIOD);
-        self.stage_us_inference = (self.stage_us_inference * (alpha - 1) + inference_us) / alpha;
-        self.stage_us_mask = (self.stage_us_mask * (alpha - 1) + mask_us) / alpha;
-        self.stage_us_blend = (self.stage_us_blend * (alpha - 1) + blend_us) / alpha;
-        self.stats_frames_since_log += 1;
-        if self.stats_frames_since_log >= STATS_LOG_PERIOD {
-            self.stats_frames_since_log = 0;
-            let total_us = self.stage_us_inference + self.stage_us_mask + self.stage_us_blend;
-            info!(
-                seq = frame_seq,
-                inference_us = self.stage_us_inference,
-                mask_us = self.stage_us_mask,
-                blend_us = self.stage_us_blend,
-                total_us,
-                budget_us_30fps = 33_333_u64,
-                "background_blur stage timings (EMA)"
-            );
-        }
-    }
-}
-
 /// Build an [`EffectError::InvalidConfig`] with the effect name pre-filled.
 fn invalid_config(reason: impl Into<String>) -> EffectError {
     let reason = reason.into();
@@ -824,10 +772,6 @@ impl VideoEffect for BackgroundBlurEffect {
         }
 
         self.consecutive_failures = 0;
-        self.stage_us_inference = 0;
-        self.stage_us_mask = 0;
-        self.stage_us_blend = 0;
-        self.stats_frames_since_log = 0;
 
         // ORT pre-warm.  The default arena-based allocator grows on
         // first-N inferences as it sees op output sizes for the first
@@ -901,6 +845,14 @@ impl VideoEffect for BackgroundBlurEffect {
         };
         let inference_us = u64::try_from(t_inference_start.elapsed().as_micros()).unwrap_or(0);
 
+        // Publish inference timing through the supervisor-owned sink.
+        // The supervisor surfaces it as `inference_p50_us`/`p95_us` in
+        // the periodic reporter — no per-effect aggregation needed
+        // anymore.
+        frame_ctx
+            .telemetry
+            .record_inference(t_inference_start.elapsed());
+
         let t_mask_start = std::time::Instant::now();
         self.build_mask(&output)?;
         let mask_us = u64::try_from(t_mask_start.elapsed().as_micros()).unwrap_or(0);
@@ -909,8 +861,17 @@ impl VideoEffect for BackgroundBlurEffect {
         self.blend(frame)?;
         let blend_us = u64::try_from(t_blend_start.elapsed().as_micros()).unwrap_or(0);
 
-        self.record_stage_stats(frame.meta.sequence, inference_us, mask_us, blend_us);
-
+        // `mask_us` / `blend_us` are not (yet) plumbed through the
+        // supervisor metrics — keep them in `trace!` for deep-dive
+        // debugging (`RUST_LOG=fluxframe_effects=trace`) without
+        // adding info-level noise that overlaps the reporter line.
+        trace!(
+            frame_seq = frame.meta.sequence,
+            inference_us,
+            mask_us,
+            blend_us,
+            "background_blur per-stage timings"
+        );
         debug!(frame_seq = frame.meta.sequence, "background_blur applied");
         Ok(())
     }

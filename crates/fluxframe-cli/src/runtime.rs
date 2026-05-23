@@ -24,6 +24,7 @@ use fluxframe_gst::output::{OutputParams, OutputPipeline, OutputSink};
 use fluxframe_gst::{BusEvent, BusListener, BusSource, LatestFrameSlot, WatchedPipeline};
 use tracing::{error, info, warn};
 
+use crate::metrics_reporter::MetricsReporter;
 use crate::runtime_metrics::RuntimeMetrics;
 
 /// How long the worker waits on an empty frame slot before re-checking the
@@ -327,6 +328,14 @@ where
     );
 
     let metrics = RuntimeMetrics::new();
+
+    // Periodic reporter: emits per-window fps + percentiles via `info!`
+    // at the cadence configured in `[realtime] metrics_interval_secs`.
+    // `metrics_interval_secs = 0` disables it (teardown summary still
+    // runs). `_reporter` is dropped at the end of this function — its
+    // `Drop` impl joins the thread before we tear down counters.
+    let _reporter = spawn_metrics_reporter(cfg, &metrics, &running);
+
     let process_result = run_process_loop(&running, &slot, &mut chain, &output, &metrics);
 
     // Ensure the bus listener wakes and exits.  Dropping `_bus_listener`
@@ -344,10 +353,9 @@ where
     let snap = metrics.snapshot();
     // Emit per-field structured values so log-ingestors (ELK, Vector,
     // tracing-subscriber JSON layer) can query each metric without
-    // string-parsing.  The default fmt layer prints both the message
-    // and the fields, so we keep the message a plain prefix —
-    // `format_snapshot_summary` is reserved for the human-only
-    // periodic reporter (5.D.3) where it's the single emit.
+    // string-parsing.  Mirrors the periodic reporter's per-tick line
+    // (`metrics_reporter::emit`) but covers absolute totals at
+    // teardown, not the rolling-window deltas the reporter shows.
     info!(
         frames_in = snap.counters.frames_in,
         frames_out = snap.counters.frames_out,
@@ -508,6 +516,33 @@ fn on_bus_event(
     }
 }
 
+/// Build a [`MetricsReporter`] when periodic reporting is enabled by
+/// the config, otherwise return `None`.  A `None` return means the
+/// teardown summary is the only line the operator sees — useful for
+/// CI / tests that do not want the per-window noise.
+fn spawn_metrics_reporter(
+    cfg: &FluxConfig,
+    metrics: &RuntimeMetrics,
+    running: &Arc<AtomicBool>,
+) -> Option<MetricsReporter> {
+    let secs = cfg.realtime.metrics_interval_secs;
+    if secs == 0 {
+        tracing::debug!("metrics reporter disabled by config (metrics_interval_secs = 0)");
+        return None;
+    }
+    let interval = Duration::from_secs(u64::from(secs));
+    match MetricsReporter::spawn(metrics.clone(), interval, Arc::clone(running)) {
+        Ok(handle) => {
+            tracing::debug!(secs, "metrics reporter spawned");
+            Some(handle)
+        }
+        Err(e) => {
+            warn!(error = %e, "could not spawn metrics reporter; teardown summary only");
+            None
+        }
+    }
+}
+
 fn run_process_loop(
     running: &AtomicBool,
     slot: &LatestFrameSlot,
@@ -515,7 +550,13 @@ fn run_process_loop(
     output: &OutputPipeline,
     metrics: &RuntimeMetrics,
 ) -> Result<(), FluxError> {
-    let mut frame_context = FrameContext::default();
+    let mut frame_context = FrameContext {
+        // Hand the supervisor's inference histogram to every effect
+        // via the per-frame telemetry sink.  Cheap `Arc` clone, set
+        // once before the loop.
+        telemetry: metrics.effect_telemetry(),
+        ..FrameContext::default()
+    };
     // Track fallback edges so a single-frame visual artefact ("flicker")
     // caused by an inference miss surfaces as a warn line tied to the
     // exact frame_seq, instead of being lost in the per-frame debug noise.

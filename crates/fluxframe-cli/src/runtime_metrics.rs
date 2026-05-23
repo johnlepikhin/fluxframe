@@ -5,17 +5,20 @@
 //! periodic CLI reporter (5.D.3) can hold its own handle without
 //! blocking the writer.
 //!
-//! Stage coverage in 5.D.2:
+//! Stage coverage as of 5.D.3:
 //! * `processing` — wall-clock around `EffectChain::process`.
 //! * `output`     — wall-clock around `OutputPipeline::push_frame`.
 //! * `end_to_end` — supervisor-side latency: `recv` → post-`push`.
+//! * `inference`  — written by ML effects via
+//!   [`fluxframe_core::EffectTelemetry`] on
+//!   [`fluxframe_core::FrameContext::telemetry`].  The supervisor wires
+//!   the bundle's `inference` histogram into the per-frame context
+//!   before calling [`fluxframe_effects::EffectChain::process`].
 //!
-//! Not wired yet (need plumbing from outside the supervisor):
+//! Not wired yet:
 //! * `capture` — needs the GStreamer pipeline clock to subtract from
 //!   `frame.meta.timestamp` (a monotonic nanos value, not a
 //!   wall-clock `Instant`).  Delegated to a future task.
-//! * `inference` — needs per-stage telemetry exported from
-//!   `background_blur`; today those numbers live in trace logs only.
 //!
 //! `frames_dropped` is synced from the input slot's running counter
 //! (see [`RuntimeMetrics::sync_dropped_from_slot`]) rather than
@@ -24,7 +27,9 @@
 
 use std::sync::Arc;
 
-use fluxframe_core::metrics::{Counters, LatencyHistogram, MetricsSnapshot};
+use fluxframe_core::metrics::{
+    Counters, EffectTelemetry, LatencyHistogram, MetricsSnapshot,
+};
 
 /// Number of samples retained per per-stage histogram.  Sized for the
 /// periodic reporter cadence (≈5 s) and a 30 fps producer: 1024
@@ -35,8 +40,10 @@ const PER_STAGE_HISTOGRAM_CAPACITY: usize = 1024;
 
 /// Metrics bundle owned by a single [`crate::runtime`] run.
 ///
-/// `Clone` is a cheap `Arc` bump — both the supervisor and any future
-/// reporter share the same underlying counters/histograms.
+/// `Clone` is a cheap `Arc` bump — the supervisor, the periodic
+/// reporter thread, and any effect writing through
+/// [`EffectTelemetry`] all share the same underlying
+/// counters/histograms.
 #[derive(Clone)]
 pub(crate) struct RuntimeMetrics {
     /// Process-wide event counters.
@@ -47,6 +54,10 @@ pub(crate) struct RuntimeMetrics {
     pub(crate) output: Arc<LatencyHistogram>,
     /// End-to-end supervisor latency: `recv` → post-`push`.
     pub(crate) end_to_end: Arc<LatencyHistogram>,
+    /// ML inference latency, populated by effects via
+    /// [`EffectTelemetry::record_inference`].  Empty for non-ML
+    /// pipelines (passthrough leaves this untouched).
+    pub(crate) inference: Arc<LatencyHistogram>,
 }
 
 impl RuntimeMetrics {
@@ -58,18 +69,27 @@ impl RuntimeMetrics {
             processing: hist(),
             output: hist(),
             end_to_end: hist(),
+            inference: hist(),
         }
     }
 
+    /// Build the [`EffectTelemetry`] sink the supervisor hands to
+    /// effects via [`fluxframe_core::FrameContext::telemetry`].
+    /// Cheap `Arc` clone.
+    pub(crate) fn effect_telemetry(&self) -> EffectTelemetry {
+        EffectTelemetry::with_inference(Arc::clone(&self.inference))
+    }
+
     /// Take a unified [`MetricsSnapshot`] across counters and the
-    /// stages we actually populate.  `capture` and `inference`
-    /// remain empty until their plumbing lands (see module header).
+    /// stages we actually populate.  `capture` remains empty until
+    /// its plumbing lands (see module header).
     pub(crate) fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot::new()
             .with_counters(self.counters.snapshot())
             .with_processing(self.processing.snapshot())
             .with_output(self.output.snapshot())
             .with_end_to_end(self.end_to_end.snapshot())
+            .with_inference(self.inference.snapshot())
     }
 
     /// Reconcile [`Counters::add_frames_dropped`] against the input
@@ -110,8 +130,20 @@ mod tests {
         assert!(s.processing.is_empty());
         assert!(s.output.is_empty());
         assert!(s.end_to_end.is_empty());
-        assert!(s.capture.is_empty(), "capture stays unwired in 5.D.2");
-        assert!(s.inference.is_empty(), "inference stays unwired in 5.D.2");
+        assert!(s.inference.is_empty());
+        assert!(s.capture.is_empty(), "capture stays unwired in 5.D.3");
+    }
+
+    #[test]
+    fn effect_telemetry_writes_to_shared_inference_histogram() {
+        let m = RuntimeMetrics::new();
+        let t = m.effect_telemetry();
+        t.record_inference(std::time::Duration::from_micros(8_000));
+        t.record_inference(std::time::Duration::from_micros(12_500));
+        let s = m.snapshot();
+        assert_eq!(s.inference.len(), 2);
+        assert_eq!(s.inference.percentile_us(0.5), 8_000);
+        assert_eq!(s.inference.percentile_us(1.0), 12_500);
     }
 
     #[test]
