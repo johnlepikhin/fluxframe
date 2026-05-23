@@ -118,8 +118,31 @@ impl OnnxEngine {
         // dlopen libonnxruntime.  Failures there are remapped to
         // `BackendUnavailable` (with the ORT_DYLIB_PATH hint) so the
         // CLI can render the §27 "install/configure ORT" guidance.
+        // Cap thread usage and disable busy-spinning.  ORT defaults grab
+        // every available core for intra-op parallelism AND keep the
+        // pool spinning between inferences — at 15 fps with ~30 ms of
+        // actual work per frame the operator sees 100% CPU because the
+        // idle ~970 ms/s is spent in spin-wait, not sleeping.  Two
+        // intra-op threads is enough for a 256x256 segmentation model
+        // and leaves CPU for the rest of the pipeline + the OS.
         let session = Session::builder()
             .map_err(|e| map_backend_or_load_error(&e.to_string()))?
+            .with_intra_threads(2)
+            .map_err(|e| InferenceError::ModelLoadFailed {
+                reason: format!("with_intra_threads: {e}"),
+            })?
+            .with_inter_threads(1)
+            .map_err(|e| InferenceError::ModelLoadFailed {
+                reason: format!("with_inter_threads: {e}"),
+            })?
+            .with_intra_op_spinning(false)
+            .map_err(|e| InferenceError::ModelLoadFailed {
+                reason: format!("with_intra_op_spinning: {e}"),
+            })?
+            .with_inter_op_spinning(false)
+            .map_err(|e| InferenceError::ModelLoadFailed {
+                reason: format!("with_inter_op_spinning: {e}"),
+            })?
             .commit_from_file(&canonical)
             .map_err(|e| InferenceError::ModelLoadFailed {
                 reason: format!("commit_from_file({}): {e}", canonical.display()),

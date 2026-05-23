@@ -115,8 +115,38 @@ pub fn sample_to_frame(
         });
     }
 
-    let data = FrameBuffer::Owned(map.as_slice()[..expected].to_vec());
-    let stride = Stride::Packed(width as usize * bytes_per_pixel);
+    let packed_row = (width as usize) * bytes_per_pixel;
+    let layout = inspect_row_layout(buffer, &info, packed_row);
+    if layout.needs_row_copy {
+        warn!(
+            seq = sequence.load(Ordering::Relaxed),
+            width,
+            height,
+            ?format,
+            packed_row,
+            row_stride = layout.row_stride,
+            offset = layout.offset,
+            buffer_size = map.size(),
+            "input buffer has non-packed stride/offset; falling back to row-by-row copy",
+        );
+    }
+    if map.size() != expected {
+        warn!(
+            seq = sequence.load(Ordering::Relaxed),
+            buffer_size = map.size(),
+            expected,
+            "input buffer size differs from packed W*H*bpp; trailing bytes ignored",
+        );
+    }
+
+    let data = copy_packed_rgb(
+        map.as_slice(),
+        &layout,
+        packed_row,
+        height as usize,
+        expected,
+    )?;
+    let stride = Stride::Packed(packed_row);
 
     let seq = sequence.fetch_add(1, Ordering::Relaxed);
     let source_timestamp = buffer.pts().map(|ts| Timestamp::from_nanos(ts.nseconds()));
@@ -137,6 +167,82 @@ pub fn sample_to_frame(
             duration,
         },
     })
+}
+
+/// Per-buffer row layout descriptor: actual byte stride and plane
+/// offset of the first plane, plus whether either differs from the
+/// packed `width * bpp` layout that downstream code assumes.
+struct RowLayout {
+    /// Actual bytes per row in the buffer.
+    row_stride: usize,
+    /// Byte offset of the plane within the buffer (usually `0`; nonzero
+    /// when a multi-plane buffer puts the active plane after metadata).
+    offset: usize,
+    /// `true` when either `row_stride != packed_row` or `offset != 0`.
+    needs_row_copy: bool,
+}
+
+/// Inspect a buffer's row layout, preferring `VideoMeta` (per-buffer
+/// overlay) over `VideoInfo::stride` (caps-derived default).  Picks the
+/// maximum reasonable row_stride so a misreported value never under-counts
+/// bytes and walks off the end of the buffer.
+fn inspect_row_layout(
+    buffer: &gstreamer::BufferRef,
+    info: &VideoInfo,
+    packed_row: usize,
+) -> RowLayout {
+    let packed_row_i32 = i32::try_from(packed_row).unwrap_or(i32::MAX);
+    let info_stride = info.stride().first().copied().unwrap_or(packed_row_i32);
+    let info_stride_usize = usize::try_from(info_stride).unwrap_or(packed_row);
+    let (vm_stride_usize, vm_offset) =
+        buffer
+            .meta::<gstreamer_video::VideoMeta>()
+            .map_or((packed_row, 0_usize), |vm| {
+                let s = vm.stride().first().copied().unwrap_or(packed_row_i32);
+                let s_usize = usize::try_from(s).unwrap_or(packed_row);
+                let o = vm.offset().first().copied().unwrap_or(0);
+                (s_usize, o)
+            });
+    let row_stride = vm_stride_usize.max(info_stride_usize).max(packed_row);
+    RowLayout {
+        row_stride,
+        offset: vm_offset,
+        needs_row_copy: row_stride != packed_row || vm_offset != 0,
+    }
+}
+
+/// Copy `raw` (a mapped GStreamer buffer slice) into a freshly-owned
+/// packed RGB `Vec`, honouring `layout`.  When the buffer is already
+/// packed the fast bulk-copy path is used; otherwise we copy row-by-row.
+fn copy_packed_rgb(
+    raw: &[u8],
+    layout: &RowLayout,
+    packed_row: usize,
+    height: usize,
+    expected: usize,
+) -> Result<FrameBuffer, PipelineError> {
+    if !layout.needs_row_copy {
+        return Ok(FrameBuffer::Owned(raw[..expected].to_vec()));
+    }
+    let needed = layout
+        .offset
+        .saturating_add(layout.row_stride.saturating_mul(height));
+    if raw.len() < needed {
+        return Err(PipelineError::Runtime {
+            reason: format!(
+                "buffer too small for row-aware copy: have {}, need {needed} (stride {}, offset {})",
+                raw.len(),
+                layout.row_stride,
+                layout.offset,
+            ),
+        });
+    }
+    let mut packed = Vec::with_capacity(expected);
+    for row in 0..height {
+        let row_start = layout.offset + row * layout.row_stride;
+        packed.extend_from_slice(&raw[row_start..row_start + packed_row]);
+    }
+    Ok(FrameBuffer::Owned(packed))
 }
 
 /// Wrap a [`VideoFrame`] into a fresh `gst::Buffer` that can be pushed
@@ -164,6 +270,23 @@ pub fn frame_to_buffer(frame: VideoFrame) -> Result<gstreamer::Buffer, PipelineE
         "buffer is uniquely owned immediately after with_size allocation";
 
     let bytes = frame.data.as_slice();
+    // Catch effect-chain bugs at the output boundary: if `bytes.len()`
+    // disagrees with `width × height × bpp`, downstream `videoconvert`
+    // reads the buffer through the caps-declared geometry and either
+    // truncates or runs off the end → flicker / row-shift in the sink.
+    let bpp = frame.format.bytes_per_pixel().unwrap_or(0);
+    let expected_packed = (frame.width as usize) * (frame.height as usize) * bpp;
+    if bpp > 0 && bytes.len() != expected_packed {
+        warn!(
+            seq = frame.meta.sequence,
+            width = frame.width,
+            height = frame.height,
+            format = ?frame.format,
+            bytes_len = bytes.len(),
+            expected_packed,
+            "output frame buffer size does not match packed W*H*bpp; sink will see a stride/length-shifted frame"
+        );
+    }
     let mut buffer =
         gstreamer::Buffer::with_size(bytes.len()).map_err(|e| PipelineError::Runtime {
             reason: format!("Buffer::with_size failed: {e}"),

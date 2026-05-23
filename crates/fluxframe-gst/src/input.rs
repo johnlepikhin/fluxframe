@@ -120,6 +120,12 @@ impl InputPipeline {
 
         let videoconvert = make_element("videoconvert", "input_videoconvert")?;
         let videoscale = make_element("videoscale", "input_videoscale")?;
+        // `videorate` enforces `params.fps` BEFORE the effect chain sees
+        // frames.  Without it, testsrc happily generates at its own rate
+        // and v4l2 cameras ignore `framerate` hints in capsfilter — both
+        // would push every captured frame through the chain, defeating
+        // the operator's ability to lower CPU load via `[input] fps`.
+        let videorate = make_element("videorate", "input_videorate")?;
         let capsfilter = make_element("capsfilter", "input_capsfilter")?;
 
         let caps = build_caps(params.width, params.height, params.fps, params.format)?;
@@ -136,6 +142,7 @@ impl InputPipeline {
                 &queue,
                 &videoconvert,
                 &videoscale,
+                &videorate,
                 &capsfilter,
                 &appsink_elem,
             ])
@@ -148,6 +155,7 @@ impl InputPipeline {
             &queue,
             &videoconvert,
             &videoscale,
+            &videorate,
             &capsfilter,
             &appsink_elem,
         ])

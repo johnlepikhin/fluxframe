@@ -346,13 +346,18 @@ where
     );
     let sink = resolve_output_sink(cfg)?;
     let sink_label = output_sink_label(&sink);
+    // Effect chain never changes pixel format, so what appsrc receives is
+    // `cfg.input.format`.  `cfg.output.format` is the wire format
+    // negotiated with the sink — pinned via a downstream capsfilter so
+    // videoconvert actually runs when the two differ.
     let output_params = OutputParams::new(
         cfg.output.width,
         cfg.output.height,
         cfg.output.fps,
-        cfg.output.format,
+        cfg.input.format,
         sink,
-    );
+    )
+    .with_sink_format(cfg.output.format);
 
     let input = input_builder(input_params)?;
     let output = OutputPipeline::build(output_params)?;
@@ -461,6 +466,10 @@ fn run_process_loop(
     output: &OutputPipeline,
 ) -> Result<(), FluxError> {
     let mut frame_context = FrameContext::default();
+    // Track fallback edges so a single-frame visual artefact ("flicker")
+    // caused by an inference miss surfaces as a warn line tied to the
+    // exact frame_seq, instead of being lost in the per-frame debug noise.
+    let mut prev_fallback = false;
     while running.load(Ordering::Acquire) {
         let Some(mut frame) = slot.recv_timeout(WORKER_POLL_TIMEOUT) else {
             // Either timeout (no frame within the poll window) or slot
@@ -474,6 +483,14 @@ fn run_process_loop(
         if let Err(e) = chain.process(&mut frame, &mut frame_context) {
             error!(error = %e, "effect chain failed; stopping");
             return Err(FluxError::from(e));
+        }
+        if frame_context.fallback_active != prev_fallback {
+            warn!(
+                frame_seq = frame_context.frame_sequence,
+                fallback_active = frame_context.fallback_active,
+                "effect-chain fallback state changed (passthrough frame)"
+            );
+            prev_fallback = frame_context.fallback_active;
         }
         if let Err(e) = output.push_frame(frame) {
             error!(error = %e, "output.push_frame failed; stopping");

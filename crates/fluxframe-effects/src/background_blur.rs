@@ -395,6 +395,31 @@ impl BackgroundBlurEffect {
             .as_ref()
             .ok_or_else(|| process_err("process called before configure"))?;
 
+        // Mask sanity probe.  When the segmentation model produces a
+        // mask that is ≥95% foreground or ≥95% background, the composite
+        // `mask*fg + (1-mask)*bg` degenerates to `fg` (no blur visible)
+        // or `bg` (entire frame blurred including the person), each
+        // rendering as a single-frame visual glitch.  Surfaced as warn
+        // so it stands out in the operator's log without per-frame noise
+        // for the common case.
+        if !self.mask_full.is_empty() {
+            let total = self.mask_full.len() as f32;
+            let above_high = self.mask_full.iter().filter(|&&v| v > 0.95).count();
+            let below_low = self.mask_full.iter().filter(|&&v| v < 0.05).count();
+            let frac_high = above_high as f32 / total;
+            let frac_low = below_low as f32 / total;
+            if frac_high > 0.95 || frac_low > 0.95 {
+                let mean: f32 = self.mask_full.iter().sum::<f32>() / total;
+                warn!(
+                    seq = frame.meta.sequence,
+                    mask_mean = mean,
+                    frac_above_0_95 = frac_high,
+                    frac_below_0_05 = frac_low,
+                    "degenerate mask: composite will look like full passthrough or full blur for this frame"
+                );
+            }
+        }
+
         // 8. Blur the frame (background candidate).
         box_blur_rgb(
             frame.data.as_slice(),
