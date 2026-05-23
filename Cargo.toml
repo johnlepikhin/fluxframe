@@ -35,9 +35,23 @@ libc = "0.2"
 # against `ort 2.0.0-rc.12` on top of newer OrtApi layouts.
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "ndarray", "std", "api-24"] }
 rayon = "1"
+# Safe wrapper around the V4L2 ioctls.  Pulled in solely so the
+# V4L2-loopback output sink can pre-negotiate format via ioctl and
+# hand the resulting fd to GStreamer's `fdsink` — the only way to
+# bypass `v4l2sink`'s race-prone mmap pool (gst-plugins-good's
+# `v4l2sink` for OUTPUT has an unimplemented `io-mode=rw` and only
+# offers MMAP, which races against the consumer; see
+# <https://github.com/umlaeute/v4l2loopback/issues/191>).
+v4l = "0.14"
 
 [workspace.lints.rust]
-unsafe_code = "warn"
+# `forbid` (not `deny`) so a stray `#[allow(unsafe_code)]` somewhere in
+# the tree cannot quietly re-enable `unsafe`.  The MVP processing path
+# is pure safe Rust by design; if a future stage genuinely needs unsafe
+# (SIMD intrinsics, FFI helpers beyond the existing GStreamer/ORT
+# wrappers) the operator can downgrade this knob deliberately rather
+# than having a subtle dependency creep it in.
+unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

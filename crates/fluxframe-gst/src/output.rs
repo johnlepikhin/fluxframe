@@ -1,10 +1,23 @@
 //! GStreamer output pipeline construction.
 //!
-//! Stage 1 supported `fakesink` (CI/tests, no display) and `autovideosink`
-//! (manual glance verification).  Stage 2 adds the `v4l2sink` branch for
-//! `v4l2loopback` virtual cameras.
+//! Pipeline topology:
+//! `appsrc → queue → videoconvert → videoscale → [capsfilter] → sink`,
+//! where `sink` is one of:
+//!
+//! * `fakesink` — discards buffers (CI / tests, no display).
+//! * `autovideosink` — picks a platform display sink (manual verification).
+//! * `fdsink` writing directly to a `v4l2loopback` device fd.  We bypass
+//!   GStreamer's `v4l2sink` entirely on this path because v4l2sink's MMAP
+//!   io-mode shares the kernel buffer pool with the consumer non-atomically;
+//!   `write(2)` on the device fd serialises against consumer reads in the
+//!   kernel.  See `build_v4l2_direct_chain` for the full rationale.
+//! * `pipewiresink` — publishes the stream as a PipeWire video source node.
+//!
+//! A dedicated writer thread (`writer_loop`) re-pushes the latest composite
+//! into `appsrc` at the configured `fps` cadence so downstream sees a steady
+//! framerate even when the effect chain stalls or runs slower than the sink.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -38,12 +51,19 @@ pub enum OutputSink {
         device: PathBuf,
     },
     /// Publishes the stream as a PipeWire node via `pipewiresink`.
+    ///
     /// PipeWire's buffer pool synchronises producer↔consumer access at
-    /// the protocol level — unlike v4l2loopback there is no torn-buffer
-    /// race for downstream applications.  Modern apps (Firefox/Chrome
-    /// via xdg-desktop-portal-pipewire, OBS with PW backend, recent
-    /// cheese) see this node as a camera; older purely-V4L2 apps need
-    /// the `pipewire-v4l2` shim to bridge it.
+    /// the protocol layer, so there is no torn-buffer race like the one
+    /// `v4l2loopback` exhibits.
+    ///
+    /// Consumer discovery is host-setup dependent.  With
+    /// `xdg-desktop-portal` running and a portal-aware app, Firefox
+    /// usually picks the node up.  Chrome, even with
+    /// `chrome://flags/#enable-webrtc-pipewire-camera` enabled and a
+    /// portal present, does NOT see this node reliably in practice —
+    /// kept here as an *experimental* sink, not a recommended default.
+    /// Older purely-V4L2 apps need the `pipewire-v4l2` shim to bridge
+    /// the node into a `/dev/video*` device.
     Pipewire {
         /// PipeWire node name advertised to consumers.  `None` lets
         /// `pipewiresink` pick the default.
@@ -148,11 +168,13 @@ pub struct OutputPipeline {
     appsrc: AppSrc,
     started: Arc<AtomicBool>,
     /// Target write cadence in Hz.  Cached at build time so the writer
-    /// thread can compute its sleep interval.  The actual writer ticks
-    /// at `WRITER_TICK_MULTIPLIER × fps` so v4l2loopback's read/write
-    /// race window shrinks proportionally — consumers reading at the
-    /// nominal `fps` see torn frames roughly `1/MULTIPLIER` as often.
+    /// thread can compute its sleep interval.
     fps: u32,
+    /// RAII guard keeping the V4L2 device fd open under `fdsink` on the
+    /// V4l2Loopback direct-write path.  See [`V4lFdGuard`] for the
+    /// load-bearing rationale.  Declared after `pipeline` so drop order
+    /// tears the fdsink down first.
+    _fd_guard: Option<V4lFdGuard>,
     /// Latest composite from the effect chain.  Cloned cheaply (the
     /// inner `Arc` is bumped, not the pixel bytes) by the writer thread
     /// every tick.
@@ -161,18 +183,14 @@ pub struct OutputPipeline {
     writer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
-/// Writer pushes the latest composite into appsrc this many times per
-/// nominal output frame.  Repeated identical writes overwrite each
-/// other in v4l2loopback's buffer pool with no extra cost to consumers
-/// (each consumer DQBUF still gets the latest), and the higher rate
-/// statistically narrows the window where a consumer DQBUF lands
-/// mid-write — observably the dominant cause of the horizontal-seam
-/// torn frames operators see at the nominal cadence.
-///
-/// Capped further down to ensure the writer never ticks faster than
-/// `WRITER_MAX_HZ` regardless of operator-requested `fps`.
-const WRITER_TICK_MULTIPLIER: u32 = 3;
-const WRITER_MAX_HZ: u32 = 120;
+// Writer tick rate equals the configured output `fps`.  Empirical
+// observation: changing the multiplier (1×, 3×, or even sub-1× / 20 Hz)
+// has no measurable effect on the torn-frame rate operators see in
+// v4l2loopback consumers.  The tearing therefore is not a
+// producer↔consumer race in the kernel pool that we can mitigate from
+// userspace by adjusting cadence — it sits somewhere else in the
+// transport.  Match the sink's nominal rate for predictability and
+// minimal CPU.
 
 impl OutputPipeline {
     /// Build the pipeline.
@@ -212,33 +230,28 @@ impl OutputPipeline {
         let videoconvert = make_element("videoconvert", "output_videoconvert")?;
         let videoscale = make_element("videoscale", "output_videoscale")?;
 
-        let sink_elem = build_sink_element(sink)?;
+        // Effective sink-side pixel format.  We need this concrete
+        // value for the V4l2Loopback direct-write path (it has to do
+        // VIDIOC_S_FMT BEFORE handing the fd to fdsink) so it can no
+        // longer be `Option`-shaped.
+        let effective_sink_format = sink_format.unwrap_or(format);
+
+        let SinkChainResult {
+            pre_sink: sink_pre,
+            sink: sink_elem,
+            fd_guard,
+        } = build_sink_chain(sink, width, height, effective_sink_format)?;
         sink_elem.set_property("sync", false);
 
-        // When the operator requested a sink-side format different from
-        // what the effect chain produces, pin it via a `capsfilter` so
-        // `videoconvert` actually performs the conversion.  Only the
-        // pixel format gets pinned — width/height/framerate stay
-        // flexible so v4l2sink negotiates them with the device.
-        // Over-pinning was the previous failure mode (`not-negotiated`
-        // at PLAYING).
-        let sink_capsfilter = sink_format
-            .filter(|sf| *sf != format)
-            .map(|sf| -> Result<gstreamer::Element, PipelineError> {
-                let cf = make_element("capsfilter", "output_sink_caps")?;
-                let gst_fmt = crate::frame_conv::pixel_format_to_gst(sf);
-                let caps = gstreamer::Caps::builder("video/x-raw")
-                    .field("format", gst_fmt.to_str())
-                    .build();
-                cf.set_property("caps", caps);
-                Ok(cf)
-            })
-            .transpose()?;
+        let sink_capsfilter = maybe_format_capsfilter(format, sink_format, fd_guard.is_some())?;
 
         let mut elements: Vec<&gstreamer::Element> =
             vec![&appsrc_elem, &queue, &videoconvert, &videoscale];
         if let Some(cf) = &sink_capsfilter {
             elements.push(cf);
+        }
+        for pre in &sink_pre {
+            elements.push(pre);
         }
         elements.push(&sink_elem);
 
@@ -295,6 +308,7 @@ impl OutputPipeline {
             appsrc,
             started: Arc::new(AtomicBool::new(false)),
             fps: fps.max(1),
+            _fd_guard: fd_guard,
             latest: Arc::new(std::sync::Mutex::new(None)),
             writer_handle: std::sync::Mutex::new(None),
         })
@@ -322,7 +336,7 @@ impl OutputPipeline {
         let started = Arc::clone(&self.started);
         let latest = Arc::clone(&self.latest);
         let appsrc = self.appsrc.clone();
-        let writer_hz = (self.fps.saturating_mul(WRITER_TICK_MULTIPLIER)).min(WRITER_MAX_HZ);
+        let writer_hz = self.fps.max(1);
         let interval = Duration::from_nanos(1_000_000_000_u64 / u64::from(writer_hz));
         debug!(
             sink_fps = self.fps,
@@ -374,10 +388,17 @@ impl OutputPipeline {
     ///
     /// Returns [`PipelineError::StateChangeFailed`] on teardown failure.
     pub fn stop(&self) -> Result<(), PipelineError> {
-        if self.started.swap(false, Ordering::AcqRel) {
-            // End-of-stream so downstream drains cleanly.
-            let _ = self.appsrc.end_of_stream();
-        }
+        // Shutdown order:
+        //   1. flip `started` to false so the writer loop exits at its
+        //      next iteration check;
+        //   2. join the writer BEFORE sending EOS, otherwise the writer
+        //      can race past the `started` check and push one more
+        //      buffer into `appsrc` after we've already called
+        //      `end_of_stream` on it (illegal-state warning at best,
+        //      lost EOS at worst);
+        //   3. send EOS so downstream drains cleanly;
+        //   4. tear the pipeline down to Null.
+        let was_started = self.started.swap(false, Ordering::AcqRel);
         if let Some(handle) = self
             .writer_handle
             .lock()
@@ -386,6 +407,9 @@ impl OutputPipeline {
             && let Err(e) = handle.join()
         {
             warn!(?e, "writer thread panicked while joining");
+        }
+        if was_started {
+            let _ = self.appsrc.end_of_stream();
         }
         self.pipeline
             .set_state(gstreamer::State::Null)
@@ -407,56 +431,263 @@ impl OutputPipeline {
     }
 }
 
-/// Construct the terminal sink element for the requested
-/// [`OutputSink`].  Extracted from [`OutputPipeline::build`] to keep
-/// the latter at a digestible size and to centralise the sink-specific
-/// quirks (loopback access checks, PipeWire client naming, …).
-fn build_sink_element(sink: OutputSink) -> Result<gstreamer::Element, PipelineError> {
-    match sink {
-        OutputSink::Fake => make_element("fakesink", "output_sink"),
-        OutputSink::Auto => make_element("autovideosink", "output_sink"),
-        OutputSink::V4l2Loopback { device } => {
-            // Pre-open write check so EACCES/EBUSY/ENOENT surface with a
-            // hint *before* `v4l2sink` returns an opaque GStreamer error.
-            // The returned path is canonicalised — feed that to v4l2sink
-            // rather than the user-supplied original to close the symlink
-            // race window between the pre-check and the kernel open.
-            let canon = check_v4l2_output_access(&device)?;
-            let elem = make_element("v4l2sink", "output_sink")?;
-            elem.set_property_from_str("device", canon.to_string_lossy().as_ref());
-            // NOTE: do NOT set `io-mode=rw`.  v4l2loopback with
-            // `exclusive_caps=1` only exposes the device's Video
-            // Capture capability to consumers when the writer uses
-            // mmap+QBUF.  `rw` puts v4l2sink on `write(2)` which
-            // keeps the device in Video Output mode only — cheese,
-            // Chrome and gst-launch consumers stop seeing it as a
-            // camera entirely.
-            Ok(elem)
-        }
-        OutputSink::Pipewire { node_name } => {
-            // `pipewiresink` is provided by `gst-plugin-pipewire`.
-            // `make_element` surfaces a structured MissingElement
-            // error (with install hint) if the plugin is missing.
-            let elem = make_element("pipewiresink", "output_sink")?;
-            // Advertise this stream as a video *source* in the PipeWire
-            // graph so consumers (Firefox via xdg-desktop-portal,
-            // OBS-PW, helvum) discover it as a camera.  Without
-            // `media.class = Video/Source` pipewiresink defaults to
-            // looking for a target consumer and exits with
-            // "no target node available" — exactly the smoke-test
-            // failure mode operators first hit on Stage 5.
-            let name = node_name.as_deref().unwrap_or("fluxframe");
-            let props = gstreamer::Structure::builder("properties")
-                .field("media.class", "Video/Source")
-                .field("media.role", "Camera")
-                .field("node.name", name)
-                .field("node.description", "FluxFrame Camera")
-                .build();
-            elem.set_property("stream-properties", props);
-            elem.set_property("client-name", name);
-            Ok(elem)
-        }
+/// What `build_sink_chain` returns: zero or more pre-sink elements
+/// (linked in order immediately upstream of `sink`), the terminal sink
+/// itself, and an optional fd guard that the caller MUST hold alive
+/// for the lifetime of the pipeline.  Only the V4l2Loopback
+/// direct-write path populates `fd_guard`.
+struct SinkChainResult {
+    pre_sink: Vec<gstreamer::Element>,
+    sink: gstreamer::Element,
+    fd_guard: Option<V4lFdGuard>,
+}
+
+/// RAII guard holding the v4l2 device fd open for the lifetime of the
+/// pipeline.  `fdsink` only *borrows* the fd (it has no `auto-close`
+/// property and its stop() leaves the fd open); if this guard is
+/// dropped first the next pipeline tick writes to a closed fd.  Do
+/// not remove the field that holds this guard — see
+/// `build_v4l2_direct_chain` for why.
+struct V4lFdGuard(#[allow(dead_code)] v4l::Device);
+
+/// Default PipeWire node name advertised when the caller does not pass
+/// one through.  Kept as a const so the magic string is named at its
+/// definition site rather than buried in the sink builder.
+const PIPEWIRE_DEFAULT_NODE_NAME: &str = "fluxframe";
+
+/// Build the optional gstreamer-side `capsfilter` that pins the
+/// pixel format when the operator's requested sink format differs
+/// from the appsrc-declared format.  Width/height/framerate stay
+/// flexible so the sink can negotiate them.
+///
+/// Skipped entirely on the V4l2Loopback direct-write path
+/// (`is_v4l2_direct == true`) — that path attaches its own fully-
+/// pinned capsfilter as part of `pre_sink` because `fdsink` does
+/// not negotiate v4l2 caps.
+fn maybe_format_capsfilter(
+    appsrc_format: PixelFormat,
+    sink_format: Option<PixelFormat>,
+    is_v4l2_direct: bool,
+) -> Result<Option<gstreamer::Element>, PipelineError> {
+    if is_v4l2_direct {
+        return Ok(None);
     }
+    sink_format
+        .filter(|sf| *sf != appsrc_format)
+        .map(|sf| build_format_capsfilter("output_sink_caps", sf, None, None))
+        .transpose()
+}
+
+/// Build a `capsfilter` element pinning `video/x-raw,format=<fmt>` and
+/// optionally `width`/`height`.  Centralises the caps-builder boilerplate
+/// shared between the soft pin in `maybe_format_capsfilter` and the
+/// fully-pinned filter in `build_v4l2_direct_chain` (the latter has to
+/// pin width/height too because `fdsink` cannot negotiate v4l2 caps with
+/// the kernel).
+fn build_format_capsfilter(
+    name: &str,
+    fmt: PixelFormat,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<gstreamer::Element, PipelineError> {
+    let cf = make_element("capsfilter", name)?;
+    let gst_fmt = crate::frame_conv::pixel_format_to_gst(fmt);
+    let mut builder = gstreamer::Caps::builder("video/x-raw").field("format", gst_fmt.to_str());
+    if let Some(w) = width {
+        builder = builder.field("width", i32::try_from(w).unwrap_or(i32::MAX));
+    }
+    if let Some(h) = height {
+        builder = builder.field("height", i32::try_from(h).unwrap_or(i32::MAX));
+    }
+    cf.set_property("caps", builder.build());
+    Ok(cf)
+}
+
+/// Construct the terminal sink element (and any pre-sink helper)
+/// for the requested [`OutputSink`].  Extracted from
+/// [`OutputPipeline::build`] to keep the latter at a digestible size
+/// and to centralise the sink-specific quirks.
+///
+/// `effective_format` is the pixel format the operator wants on the
+/// wire — needed by the V4l2Loopback direct-write path to negotiate
+/// `VIDIOC_S_FMT` on the device before handing the fd to fdsink.
+/// Other sink paths ignore it (they delegate format negotiation to
+/// the sink element itself).
+fn build_sink_chain(
+    sink: OutputSink,
+    width: u32,
+    height: u32,
+    effective_format: PixelFormat,
+) -> Result<SinkChainResult, PipelineError> {
+    match sink {
+        OutputSink::Fake => Ok(SinkChainResult {
+            pre_sink: Vec::new(),
+            sink: make_element("fakesink", "output_sink")?,
+            fd_guard: None,
+        }),
+        OutputSink::Auto => Ok(SinkChainResult {
+            pre_sink: Vec::new(),
+            sink: make_element("autovideosink", "output_sink")?,
+            fd_guard: None,
+        }),
+        OutputSink::V4l2Loopback { device } => {
+            build_v4l2_direct_chain(&device, width, height, effective_format)
+        }
+        OutputSink::Pipewire { node_name } => Ok(SinkChainResult {
+            pre_sink: Vec::new(),
+            sink: build_pipewire_sink(node_name.as_deref())?,
+            fd_guard: None,
+        }),
+    }
+}
+
+/// Build the V4l2Loopback output chain that bypasses GStreamer's
+/// `v4l2sink` entirely.
+///
+/// Why bypass v4l2sink:
+///   * `gst-plugins-good`'s v4l2sink for OUTPUT only implements MMAP
+///     io-mode (`io-mode=rw` is a literal FIXME no-op).  In MMAP mode
+///     the kernel's mmap'd buffer pool is shared between v4l2sink's
+///     per-row memcpy and the consumer's DQBUF/read; v4l2loopback
+///     provides no atomicity around this — see
+///     <https://github.com/umlaeute/v4l2loopback/issues/191>.
+///     Consumers see horizontal-seam torn frames whenever the
+///     producer takes long enough for a memcpy that the consumer
+///     reads the slot mid-write.
+///   * `identity drop-allocation=true`, `min-queued-buffers`, queue
+///     decoupling, writer cadence — all only narrow the race window
+///     and do not eliminate it (operator confirmed empirically).
+///   * The kernel `vidioc_write` handler IS atomic (serialised under
+///     `image_mutex`), so writing via the `write(2)` syscall against
+///     a fd opened directly on /dev/video10 produces no torn frames.
+///     This is the approach OBS Studio uses for its virtual camera.
+///
+/// Implementation: open the device via the `v4l` crate (which keeps
+/// us in safe Rust, the unsafe ioctls live behind its API), call
+/// `VIDIOC_S_FMT` for the desired output format, then hand the
+/// resulting fd to GStreamer's `fdsink`.  fdsink writes each
+/// incoming buffer to the fd in one `write(2)` call, the kernel
+/// serialises the write against any concurrent consumer read.
+///
+/// The `v4l::Device` is returned alongside so the caller can keep
+/// it alive for the lifetime of the pipeline (fdsink does NOT take
+/// ownership of the fd — when the device drops, the fd closes).
+fn build_v4l2_direct_chain(
+    device_path: &Path,
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+) -> Result<SinkChainResult, PipelineError> {
+    // Pre-open write check first so EACCES/EBUSY/ENOENT surface with
+    // a hint *before* the v4l crate emits a less-specific I/O error.
+    let canon = check_v4l2_output_access(device_path)?;
+
+    let device =
+        v4l::Device::with_path(&canon).map_err(|e| PipelineError::OutputDeviceUnavailable {
+            device: canon.display().to_string(),
+            reason: format!("v4l::Device::with_path failed: {e}"),
+            hint: "ensure the v4l2loopback module is loaded and the device exists".into(),
+        })?;
+
+    let fourcc = pixel_format_to_v4l_fourcc(pixel_format);
+    let mut want = v4l::Format::new(width, height, fourcc);
+    // v4l2loopback ignores the per-row stride request and computes
+    // its own; setting `stride` to 0 means "let the driver decide".
+    want.stride = 0;
+    want.size = 0;
+    let got = v4l::video::Output::set_format(&device, &want).map_err(|e| {
+        PipelineError::OutputDeviceUnavailable {
+            device: canon.display().to_string(),
+            reason: format!("VIDIOC_S_FMT({width}x{height} {fourcc}) failed: {e}"),
+            hint: "the requested format may not be supported by v4l2loopback".into(),
+        }
+    })?;
+    if got.width != width || got.height != height || got.fourcc != fourcc {
+        return Err(PipelineError::OutputDeviceUnavailable {
+            device: canon.display().to_string(),
+            reason: format!(
+                "v4l2 negotiated {}x{} {} (wanted {}x{} {})",
+                got.width, got.height, got.fourcc, width, height, fourcc
+            ),
+            hint: "v4l2loopback rejected the format change — restart the module".into(),
+        });
+    }
+    debug!(
+        device = %canon.display(),
+        width = got.width,
+        height = got.height,
+        fourcc = %got.fourcc,
+        "v4l2 output format negotiated",
+    );
+
+    let fd = device.handle().fd();
+    let sink_elem = make_element("fdsink", "output_sink")?;
+    sink_elem.set_property("fd", fd);
+    // fdsink has no `auto-close` property (unlike fdsrc / multifdsink) and
+    // its stop() leaves the fd open — verified against gst-plugins-base
+    // gstfdsink.c.  The fd's lifecycle is therefore owned exclusively by
+    // `fd_guard` below; there is no double-close to defend against here.
+    // Decouple the heavy effect-chain thread from the fdsink write
+    // thread.  Tiny buffer + leaky=downstream so a stall in the
+    // syscall never holds back the effect chain.
+    let sink_queue = make_element("queue", "output_sink_queue")?;
+    sink_queue.set_property("max-size-buffers", 2u32);
+    sink_queue.set_property_from_str("leaky", "downstream");
+    sink_queue.set_property("max-size-bytes", 0u32);
+    sink_queue.set_property("max-size-time", 0u64);
+    // Pin the wire format fully — fdsink doesn't negotiate v4l2
+    // caps, so we must guarantee upstream produces buffers in the
+    // exact format the kernel was told to expect via VIDIOC_S_FMT.
+    let capsfilter = build_format_capsfilter(
+        "output_sink_caps",
+        pixel_format,
+        Some(width),
+        Some(height),
+    )?;
+
+    Ok(SinkChainResult {
+        pre_sink: vec![sink_queue, capsfilter],
+        sink: sink_elem,
+        fd_guard: Some(V4lFdGuard(device)),
+    })
+}
+
+/// Map our [`PixelFormat`] enum to the V4L2 FOURCC used by
+/// `VIDIOC_S_FMT`.  All current variants have a corresponding
+/// v4l2 fourcc — the helper stays `infallible` rather than
+/// `Result` because there's no failure mode at this level.
+fn pixel_format_to_v4l_fourcc(fmt: PixelFormat) -> v4l::FourCC {
+    let code: &[u8; 4] = match fmt {
+        PixelFormat::Yuy2 => b"YUYV",
+        PixelFormat::Nv12 => b"NV12",
+        PixelFormat::Rgb => b"RGB3",
+        PixelFormat::Bgr => b"BGR3",
+        PixelFormat::Rgba => b"RGB4",
+        PixelFormat::Gray8 => b"GREY",
+    };
+    v4l::FourCC::new(code)
+}
+
+fn build_pipewire_sink(node_name: Option<&str>) -> Result<gstreamer::Element, PipelineError> {
+    // `pipewiresink` is provided by `gst-plugin-pipewire`.
+    // `make_element` surfaces a structured MissingElement error (with
+    // install hint) if the plugin is missing.
+    let elem = make_element("pipewiresink", "output_sink")?;
+    // Advertise this stream as a video *source* in the PipeWire graph
+    // so consumers (Firefox via xdg-desktop-portal, OBS-PW, helvum)
+    // discover it as a camera.  Without `media.class = Video/Source`
+    // pipewiresink defaults to looking for a target consumer and exits
+    // with "no target node available".
+    let name = node_name.unwrap_or(PIPEWIRE_DEFAULT_NODE_NAME);
+    let props = gstreamer::Structure::builder("properties")
+        .field("media.class", "Video/Source")
+        .field("media.role", "Camera")
+        .field("node.name", name)
+        .field("node.description", "FluxFrame Camera")
+        .build();
+    elem.set_property("stream-properties", props);
+    elem.set_property("client-name", name);
+    Ok(elem)
 }
 
 /// Writer thread loop.  Wakes every `interval`, takes a cheap `Arc`
@@ -587,6 +818,27 @@ mod tests {
         };
         let cloned = sink.clone();
         assert!(matches!(cloned, OutputSink::V4l2Loopback { .. }));
+    }
+
+    #[test]
+    fn pixel_format_to_v4l_fourcc_table() {
+        let cases: &[(PixelFormat, &[u8; 4])] = &[
+            (PixelFormat::Yuy2, b"YUYV"),
+            (PixelFormat::Nv12, b"NV12"),
+            (PixelFormat::Rgb, b"RGB3"),
+            (PixelFormat::Bgr, b"BGR3"),
+            (PixelFormat::Rgba, b"RGB4"),
+            (PixelFormat::Gray8, b"GREY"),
+        ];
+        for (fmt, code) in cases {
+            let got = pixel_format_to_v4l_fourcc(*fmt);
+            assert_eq!(
+                got.repr, **code,
+                "fourcc mismatch for {fmt:?}: got {:?}, want {:?}",
+                got.repr, code
+            );
+            assert_eq!(got, v4l::FourCC::new(code));
+        }
     }
 
     #[test]

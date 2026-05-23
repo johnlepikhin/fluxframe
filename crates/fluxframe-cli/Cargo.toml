@@ -31,6 +31,12 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 ctrlc = { workspace = true }
+# Rayon's global thread pool defaults to `available_parallelism()`,
+# which on many-core machines saturates every CPU during the parallel
+# image-processing passes.  We cap it from `main.rs` to keep cores free
+# for the kernel's USB-isoc soft-IRQs — without that, the UVC driver
+# silently drops packets under load and emits torn camera frames.
+rayon = { workspace = true }
 
 [lints]
 workspace = true
