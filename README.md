@@ -92,6 +92,31 @@ pre-commit install
 
 Hooks run `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test`. They assume you are inside the Guix dev shell when committing.
 
+## GPU acceleration (Stage 7)
+
+FluxFrame builds with a `wgpu` (Vulkan compute) blur backend behind
+the default-on `wgpu` Cargo feature.  On the current pipeline
+(640×480 input, `blur_downscale=4`) the GPU implementation
+**loses to the CPU box-blur** — Stage 7 measurement showed
+`processing_p95` +50%, fps -20% and `inference_p95` +40% (iGPU
+contention with ORT).  Therefore the factory's `Auto` branch
+deliberately keeps the CPU backend; the GPU path stays reachable
+for debugging or future workloads through:
+
+```bash
+FLUXFRAME_FORCE_BLUR_BACKEND=wgpu fluxframe run --config fluxframe.toml ...
+# or, to lock in CPU explicitly:
+FLUXFRAME_FORCE_BLUR_BACKEND=cpu  fluxframe run --config fluxframe.toml ...
+```
+
+When `Wgpu` is forced and no Vulkan adapter is available, FluxFrame
+exits with a structured error instead of silently demoting — see
+`doc/plan/stage-7-wgpu-blur.md` "Closure" for the full finding and
+the upgrade path (`Rgba16Float` intermediate, async readback,
+DMA-BUF zero-copy, …).  Slim builds without GPU support compile
+with `cargo build -p fluxframe-effects --no-default-features` (or
+add only the `ml` feature).
+
 ## Roadmap
 
 | Stage | Status |

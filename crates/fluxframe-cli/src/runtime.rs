@@ -324,7 +324,15 @@ where
 {
     fluxframe_gst::init()?;
 
-    let (input, output, processing_ctx, sink_label) = build_pipelines(cfg, input_builder)?;
+    // Build metrics BEFORE `prepare_all` so the runtime can hand the
+    // shared `Arc<Counters>` to effects through `ProcessingContext`.
+    // This lets, e.g., the Stage 7 sticky-fallback decorator inside
+    // `BackgroundBlurEffect`'s blur backend publish transition events
+    // through the same counter bundle the supervisor reads later.
+    let metrics = RuntimeMetrics::new();
+
+    let (input, output, mut processing_ctx, sink_label) = build_pipelines(cfg, input_builder)?;
+    processing_ctx.counters = Some(Arc::clone(&metrics.counters));
     // Configure must precede prepare: effects parse their per-effect TOML
     // table here, surface `InvalidConfig` for missing fields (e.g.
     // `background_blur` requires `model`) before resource acquisition.
@@ -372,7 +380,9 @@ where
         slot.clone(),
     );
 
-    let metrics = RuntimeMetrics::new();
+    // `metrics` was constructed above (before `prepare_all`) so the
+    // counters Arc could be threaded into `ProcessingContext`.  Same
+    // bundle owns the histograms used by the periodic reporter below.
 
     // Periodic reporter: emits per-window fps + percentiles via `info!`
     // at the cadence configured in `[realtime] metrics_interval_secs`.
@@ -458,14 +468,8 @@ where
     let (sink_w, sink_h) = cfg
         .output
         .effective_dimensions(cfg.input.width, cfg.input.height);
-    let output_params = OutputParams::new(
-        sink_w,
-        sink_h,
-        cfg.input.fps,
-        cfg.input.format,
-        sink,
-    )
-    .with_sink_format(cfg.output.format);
+    let output_params = OutputParams::new(sink_w, sink_h, cfg.input.fps, cfg.input.format, sink)
+        .with_sink_format(cfg.output.format);
 
     let input = input_builder(input_params)?;
     let output = OutputPipeline::build(output_params)?;
@@ -475,6 +479,11 @@ where
         height: cfg.input.height,
         format: cfg.input.format,
         fps: cfg.input.fps,
+        // The caller (`run_chain`) fills in the supervisor's
+        // `Arc<Counters>` after `build_pipelines` returns.  `None`
+        // here is the correct default for any standalone caller that
+        // doesn't run a full supervisor.
+        counters: None,
     };
 
     Ok((input, output, processing_ctx, sink_label))

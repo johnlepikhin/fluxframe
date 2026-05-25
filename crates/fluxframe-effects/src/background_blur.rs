@@ -5,7 +5,8 @@
 //!    aspect-ratio-preserving letterboxing is a Stage 5 follow-up).
 //! 2. Normalise to f32 using `input_scale` + `input_zero_point` and pack
 //!    into the layout (`NHWC`/`NCHW`) the model expects.
-//! 3. Run inference via the supplied [`OnnxEngine`].
+//! 3. Run inference through the [`InferenceEngine`] supplied by
+//!    [`crate::backend::build_inference_engine`].
 //! 4. Decode the output tensor into a `[0,1]` confidence mask.
 //! 5. Resize the mask back to the frame resolution.
 //! 6. Temporal-smooth, threshold, dilate, feather the mask.
@@ -28,7 +29,8 @@
 //! fallback_threshold = 3
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::{EffectError, InferenceError};
@@ -37,13 +39,30 @@ use fluxframe_core::traits::{InferenceEngine, InferenceInput, RawEffectParams, V
 use serde::Deserialize;
 use tracing::{debug, info, trace, warn};
 
-use crate::ml::{
-    InputLayout, ModelConfig, OnnxEngine, OutputLayout, OutputType, load_sidecar_or_placeholder,
-};
+use crate::backend::{BackendOverrides, BlurBackend, build_blur_backend, build_inference_engine};
+use crate::ml::{InputLayout, ModelConfig, OutputLayout, OutputType, load_sidecar_or_placeholder};
 use crate::processing::{
-    alpha_composite_rgb_in_place, box_blur_rgb, dilate, feather, resize_mask_bilinear,
-    resize_rgb_bilinear, resize_rgb_nearest, smooth_temporal, threshold,
+    alpha_composite_rgb_in_place, dilate, feather, resize_mask_bilinear, resize_rgb_bilinear,
+    resize_rgb_nearest, smooth_temporal, threshold,
 };
+
+/// Factory closure that constructs an [`InferenceEngine`] from a model
+/// path and a parsed [`ModelConfig`].  Used to inject a mock engine
+/// into [`BackgroundBlurEffect`] from tests without going through ORT.
+///
+/// Consumed once per effect (inside [`VideoEffect::prepare`]), hence
+/// `FnOnce`.  `Send` so the effect itself stays `Send`.
+pub type InferenceFactory = Box<
+    dyn FnOnce(&Path, ModelConfig) -> Result<Box<dyn InferenceEngine + Send>, InferenceError>
+        + Send,
+>;
+
+/// Factory closure that constructs a [`BlurBackend`].  Symmetrical
+/// counterpart of [`InferenceFactory`] for the blur stage.  The
+/// returned backend is NOT yet `prepare`d — the effect's `prepare`
+/// invokes that with the frame dimensions it negotiates.
+pub type BlurBackendFactory =
+    Box<dyn FnOnce() -> Result<Box<dyn BlurBackend + Send>, EffectError> + Send>;
 
 /// Default values for [`BlurConfig`].
 ///
@@ -95,14 +114,21 @@ pub struct BackgroundBlurEffect {
     /// Inference engine.  Boxed behind the trait so tests can substitute a
     /// mock implementation without touching ONNX Runtime.
     engine: Option<Box<dyn InferenceEngine + Send>>,
+    /// Optional override factory consumed by `prepare()` instead of
+    /// the default [`build_inference_engine`].  Set via
+    /// [`Self::with_inference_factory`]; consumed exactly once.
+    inference_factory: Option<InferenceFactory>,
+    /// Blur backend.  Owns whatever scratch / device buffers the
+    /// active implementation needs.  Set in `prepare`.
+    blur_backend: Option<Box<dyn BlurBackend + Send>>,
+    /// Optional override factory for the blur backend.  See
+    /// [`Self::with_blur_factory`].
+    blur_factory: Option<BlurBackendFactory>,
     // Frame-resolution scratch:
     /// Output of the blur step at frame resolution — what
     /// `alpha_composite` reads as the "background" plane.  Always
     /// frame-sized regardless of `blur_downscale`.
     blurred: Vec<u8>,
-    /// Scratch for the box-blur primitive when blurring at full
-    /// resolution (`blur_downscale == 1`).  Empty otherwise.
-    blur_scratch: Vec<u8>,
     /// Fully post-processed mask resampled to frame resolution; the only
     /// frame-sized mask buffer (down from four in the pre-Stage-5 design).
     mask_full: Vec<f32>,
@@ -113,8 +139,6 @@ pub struct BackgroundBlurEffect {
     /// Box-blurred downscaled frame, bilinear-upscaled back to
     /// `blurred` before compositing.
     blurred_down: Vec<u8>,
-    /// Scratch for the downscaled box blur primitive.
-    blur_scratch_down: Vec<u8>,
     /// Cached `(blur_down_w, blur_down_h)` after `prepare`.
     blur_down_w: u32,
     blur_down_h: u32,
@@ -235,11 +259,12 @@ impl BackgroundBlurEffect {
             config: None,
             model_config: None,
             engine: None,
+            inference_factory: None,
+            blur_backend: None,
+            blur_factory: None,
             blurred: Vec::new(),
-            blur_scratch: Vec::new(),
             frame_down: Vec::new(),
             blurred_down: Vec::new(),
-            blur_scratch_down: Vec::new(),
             blur_down_w: 0,
             blur_down_h: 0,
             blur_downscale_effective: 1,
@@ -258,15 +283,102 @@ impl BackgroundBlurEffect {
         }
     }
 
-    /// Construct an instance with a pre-built inference engine.  Used by
-    /// tests to inject a mock without going through `prepare()` (and thus
-    /// without loading an ONNX file).  Production code should prefer
-    /// `configure` + `prepare`.
+    /// Install a custom inference-engine factory.  Consumed once
+    /// inside [`VideoEffect::prepare`] in place of the default
+    /// [`build_inference_engine`].  Intended for tests that want to
+    /// inject a mock engine or wrap a sticky-fallback decorator
+    /// around real engines without rebuilding the effect.
+    ///
+    /// Calling this after `prepare()` has already consumed the
+    /// previous factory is a no-op for the active engine — the
+    /// effect uses whichever engine is in `self.engine` once
+    /// constructed.
+    #[must_use]
+    pub fn with_inference_factory(mut self, factory: InferenceFactory) -> Self {
+        self.inference_factory = Some(factory);
+        self
+    }
+
+    /// Install a custom blur-backend factory.  Symmetrical to
+    /// [`Self::with_inference_factory`].
+    #[must_use]
+    pub fn with_blur_factory(mut self, factory: BlurBackendFactory) -> Self {
+        self.blur_factory = Some(factory);
+        self
+    }
+
+    /// Test-only constructor that injects both a pre-built inference
+    /// engine and a pre-built blur backend, bypassing the production
+    /// factories entirely.  Used by unit tests that also bypass
+    /// `configure` / `prepare` (and thus the sidecar loader and
+    /// scratch allocation) — see the existing
+    /// `process_with_mock_engine_blends_known_mask` test.
+    ///
+    /// Production code must use [`Self::new`] + (`VideoEffect`
+    /// lifecycle) instead.
     #[cfg(test)]
-    fn with_engine(engine: Box<dyn InferenceEngine + Send>) -> Self {
+    fn with_test_components(
+        engine: Box<dyn InferenceEngine + Send>,
+        blur_backend: Box<dyn BlurBackend + Send>,
+    ) -> Self {
         let mut effect = Self::new();
         effect.engine = Some(engine);
+        effect.blur_backend = Some(blur_backend);
         effect
+    }
+
+    /// Build a blur backend through the installed factory or — if
+    /// none — through the production [`build_blur_backend`], then
+    /// [`BlurBackend::prepare`] it at `(blur_w, blur_h)`.  Extracted
+    /// from [`VideoEffect::prepare`] to keep that function under the
+    /// clippy `too_many_lines` ceiling.
+    ///
+    /// `counters` flows through from `ProcessingContext::counters`
+    /// (Stage 7 wiring) so the factory can hand the supervisor's
+    /// counter bundle into a sticky-fallback decorator when one is
+    /// needed.  `None` is legal and means "no decorator" — see
+    /// [`build_blur_backend`].
+    fn construct_blur_backend(
+        &mut self,
+        blur_w: u32,
+        blur_h: u32,
+        counters: Option<Arc<fluxframe_core::Counters>>,
+    ) -> Result<Box<dyn BlurBackend + Send>, EffectError> {
+        let mut backend = match self.blur_factory.take() {
+            Some(factory) => factory(),
+            None => build_blur_backend(BackendOverrides::current(), counters),
+        }?;
+        backend.prepare(blur_w, blur_h)?;
+        Ok(backend)
+    }
+
+    /// Build the inference engine through the installed factory (test
+    /// override) or — if none — the production
+    /// [`build_inference_engine`].  Counters flow from
+    /// `ProcessingContext::counters` so Stage 8 step 5 can wrap the
+    /// OpenVINO primary in a sticky-fallback decorator without
+    /// touching this call site again.  Extracted from
+    /// [`VideoEffect::prepare`] to keep that function under the
+    /// clippy `too_many_lines` ceiling.
+    fn construct_inference_engine(
+        &mut self,
+        model_path: &Path,
+        model_config: ModelConfig,
+        counters: Option<Arc<fluxframe_core::Counters>>,
+    ) -> Result<Box<dyn InferenceEngine + Send>, EffectError> {
+        match self.inference_factory.take() {
+            Some(factory) => factory(model_path, model_config),
+            None => build_inference_engine(
+                model_path,
+                model_config,
+                BackendOverrides::current(),
+                counters,
+            ),
+        }
+        .map_err(|e: InferenceError| EffectError::Inference {
+            name: Self::NAME.to_string(),
+            source: e,
+        })
     }
 
     fn validate_frame(&self, frame: &VideoFrame) -> Result<(), EffectError> {
@@ -498,16 +610,26 @@ impl BackgroundBlurEffect {
         // costs ~1/N² of the work for the box-blur step itself, and the
         // upscale adds further softening that visually matches a larger
         // full-res blur.  Stage 5.B.
+        //
+        // The blur primitive itself sits behind the [`BlurBackend`]
+        // trait (Stage 6); `self.blur_backend` was constructed +
+        // prepared in `prepare()` with the dimensions that match
+        // whichever path runs here.  An error from `blur()` is rare
+        // for the CPU backend but possible for future GPU ones, hence
+        // the `?` propagation.
+        let blur_backend = self
+            .blur_backend
+            .as_mut()
+            .ok_or_else(|| process_err("process called before prepare"))?;
         if self.blur_downscale_effective <= 1 {
-            box_blur_rgb(
+            blur_backend.blur(
                 frame.data.as_slice(),
                 &mut self.blurred,
-                &mut self.blur_scratch,
                 self.frame_w,
                 self.frame_h,
                 config.blur_radius,
                 config.blur_passes,
-            );
+            )?;
         } else {
             resize_rgb_bilinear(
                 frame.data.as_slice(),
@@ -524,15 +646,14 @@ impl BackgroundBlurEffect {
                 .blur_radius
                 .div_ceil(self.blur_downscale_effective)
                 .max(1);
-            box_blur_rgb(
+            blur_backend.blur(
                 &self.frame_down,
                 &mut self.blurred_down,
-                &mut self.blur_scratch_down,
                 self.blur_down_w,
                 self.blur_down_h,
                 radius_down,
                 config.blur_passes,
-            );
+            )?;
             // Nearest-neighbour upscale — much cheaper than bilinear
             // (~10× fewer ops per output pixel) and visually equivalent
             // for blurred content combined with the feathered alpha
@@ -703,27 +824,37 @@ impl VideoEffect for BackgroundBlurEffect {
                 context.format
             )));
         }
-        let config = self
-            .config
-            .as_ref()
-            .ok_or_else(|| prepare_err("prepare called before configure"))?;
+        // Snapshot the small handful of config fields the rest of
+        // this function reads.  Cloning the model PathBuf releases
+        // the `&self.config` borrow up front so subsequent `&mut
+        // self` operations (factory invocation, scratch alloc) are
+        // not blocked by an outstanding immutable borrow.
+        let (model_path, cfg_blur_downscale) = {
+            let config = self
+                .config
+                .as_ref()
+                .ok_or_else(|| prepare_err("prepare called before configure"))?;
+            (config.model.clone(), config.blur_downscale)
+        };
 
         // Load model configuration sidecar (or placeholder for unknown models).
-        let model_config = load_sidecar_or_placeholder(&config.model)
+        let model_config = load_sidecar_or_placeholder(&model_path)
             .map_err(|e: InferenceError| prepare_err(e.to_string()))?;
         self.model_w = model_config.input_width;
         self.model_h = model_config.input_height;
 
-        // Build engine.  Preserve the structured `InferenceError` so the
-        // §27 CLI hint detector can distinguish `ModelNotFound` from
-        // `BackendUnavailable` etc. without string-sniffing.
-        let engine = OnnxEngine::load(&config.model, model_config.clone()).map_err(
-            |e: InferenceError| EffectError::Inference {
-                name: Self::NAME.to_string(),
-                source: e,
-            },
+        // Build inference engine through the backend factory (or the
+        // caller-supplied test override if one is installed via
+        // `with_inference_factory`).  The default path goes through
+        // `build_inference_engine` which currently selects the ONNX
+        // Runtime CPU session — same code path the previous direct
+        // `OnnxEngine::load` call used.
+        let engine = self.construct_inference_engine(
+            &model_path,
+            model_config.clone(),
+            context.counters.clone(),
         )?;
-        self.engine = Some(Box::new(engine));
+        self.engine = Some(engine);
         self.model_config = Some(model_config);
 
         // Allocate scratch.
@@ -748,38 +879,46 @@ impl VideoEffect for BackgroundBlurEffect {
         // `blurred`.  When `blur_downscale == 1` we keep the original
         // full-resolution path and the *_down buffers stay empty.
         // Effective downscale.  Capped so the downscaled buffer is at
-        // least 2×2 — `box_blur_rgb` indexes `w-1` and `h-1` and
-        // panics on a 1×N input.  Tiny frames simply degrade to the
-        // full-resolution blur path.
+        // least 2×2 — the box-blur primitive indexes `w-1` and `h-1`
+        // and panics on a 1×N input.  Tiny frames simply degrade to
+        // the full-resolution blur path.
         let max_downscale = (context.width.min(context.height) / 2).max(1);
-        let blur_downscale = config.blur_downscale.max(1).min(max_downscale);
+        let blur_downscale = cfg_blur_downscale.max(1).min(max_downscale);
         self.blur_downscale_effective = blur_downscale;
         if blur_downscale == 1 {
             self.blur_down_w = context.width;
             self.blur_down_h = context.height;
-            self.blur_scratch = vec![0u8; frame_bytes];
             self.frame_down.clear();
             self.blurred_down.clear();
-            self.blur_scratch_down.clear();
         } else {
             self.blur_down_w = (context.width / blur_downscale).max(1);
             self.blur_down_h = (context.height / blur_downscale).max(1);
             let down_bytes = (self.blur_down_w as usize) * (self.blur_down_h as usize) * 3;
             self.frame_down = vec![0u8; down_bytes];
             self.blurred_down = vec![0u8; down_bytes];
-            self.blur_scratch_down = vec![0u8; down_bytes];
-            self.blur_scratch.clear();
         }
+
+        // Construct + prepare the blur backend at the resolution
+        // the blur primitive will actually see (frame-size when
+        // downscale is 1, downscaled size otherwise).  Scratch is
+        // owned by the backend now — the effect no longer holds
+        // blur-stage buffers.
+        let (blur_w, blur_h) = if blur_downscale == 1 {
+            (context.width, context.height)
+        } else {
+            (self.blur_down_w, self.blur_down_h)
+        };
+        self.blur_backend =
+            Some(self.construct_blur_backend(blur_w, blur_h, context.counters.clone())?);
 
         self.consecutive_failures = 0;
 
-        // ORT pre-warm.  The default arena-based allocator grows on
-        // first-N inferences as it sees op output sizes for the first
-        // time — without a warm-up that startup tax is spread across
-        // the operator's first ~minute of camera frames (visible
-        // 4 fps → 15 fps speed-up reported during stage-4 testing).
-        // One synthetic infer with a zero tensor is enough to populate
-        // the arena to its steady-state working set.
+        // Engine pre-warm.  ORT's default arena allocator grows on
+        // first-N inferences; OpenVINO does compile-on-first-infer
+        // for some op kernels.  Either way, one synthetic infer with
+        // a zero tensor populates internal caches and avoids spreading
+        // the startup tax across the operator's first ~minute of
+        // camera frames (Stage 4 testing showed 4 fps → 15 fps).
         let warmup_shape: [usize; 4] = match self.model_config.as_ref() {
             Some(mc) => match mc.input_layout {
                 InputLayout::Nhwc => [1, self.model_h as usize, self.model_w as usize, 3],
@@ -797,17 +936,17 @@ impl VideoEffect for BackgroundBlurEffect {
                     info!(
                         warmup_us =
                             u64::try_from(warmup_start.elapsed().as_micros()).unwrap_or(u64::MAX),
-                        "ORT pre-warm inference complete"
+                        "inference engine pre-warm complete"
                     );
                 }
                 Err(e) => {
-                    warn!(error = %e, "ORT pre-warm inference failed; continuing anyway");
+                    warn!(error = %e, "inference engine pre-warm failed; continuing anyway");
                 }
             }
         }
 
         info!(
-            model = %config.model.display(),
+            model = %model_path.display(),
             frame = ?(context.width, context.height),
             model_input = ?(self.model_w, self.model_h),
             "background_blur prepared"
@@ -867,10 +1006,7 @@ impl VideoEffect for BackgroundBlurEffect {
         // adding info-level noise that overlaps the reporter line.
         trace!(
             frame_seq = frame.meta.sequence,
-            inference_us,
-            mask_us,
-            blend_us,
-            "background_blur per-stage timings"
+            inference_us, mask_us, blend_us, "background_blur per-stage timings"
         );
         debug!(frame_seq = frame.meta.sequence, "background_blur applied");
         Ok(())
@@ -1298,14 +1434,26 @@ model = "/tmp/dummy.onnx"
 
     #[test]
     fn process_with_mock_engine_blends_known_mask() {
-        // Build effect manually (no on-disk model load).
-        let mut effect = BackgroundBlurEffect::with_engine(Box::new(MockEngine {
-            // 2×2 mask: foreground top-left, background elsewhere.
-            output: InferenceOutput {
-                data: vec![1.0, 0.0, 0.0, 0.0],
-                shape: vec![2, 2],
-            },
-        }));
+        // Build effect manually (no on-disk model load).  Inject
+        // both a mock InferenceEngine and a pre-prepared CPU blur
+        // backend through the cfg(test) `with_test_components`
+        // helper — this bypasses configure/prepare entirely, which
+        // is what we want here (the test exercises `process()` on
+        // its own).
+        let mut blur_backend = Box::new(crate::backend::CpuBlurBackend::new());
+        blur_backend
+            .prepare(2, 2)
+            .expect("cpu blur backend prepare");
+        let mut effect = BackgroundBlurEffect::with_test_components(
+            Box::new(MockEngine {
+                // 2×2 mask: foreground top-left, background elsewhere.
+                output: InferenceOutput {
+                    data: vec![1.0, 0.0, 0.0, 0.0],
+                    shape: vec![2, 2],
+                },
+            }),
+            blur_backend,
+        );
         effect.config = Some(valid_blur_config());
         effect.model_config = Some(ModelConfig::new("mock", 2, 2));
         effect.frame_w = 2;
@@ -1316,7 +1464,6 @@ model = "/tmp/dummy.onnx"
         let frame_bytes = frame_pixels * 3;
         let model_pixels = 4;
         effect.blurred = vec![0u8; frame_bytes];
-        effect.blur_scratch = vec![0u8; frame_bytes];
         effect.mask_full = vec![0.0; frame_pixels];
         effect.model_input_u8 = vec![0u8; model_pixels * 3];
         effect.model_input_f32 = vec![0.0; model_pixels * 3];

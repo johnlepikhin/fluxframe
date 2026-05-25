@@ -17,8 +17,8 @@ pub mod metrics;
 pub mod traits;
 
 pub use config::{
-    BackendKind, EffectsConfig, FluxConfig, InputConfig, LoggingConfig, OutputConfig,
-    OutputScale, RealtimeConfig,
+    BackendKind, EffectsConfig, FluxConfig, InputConfig, LoggingConfig, OutputConfig, OutputScale,
+    RealtimeConfig,
 };
 pub use context::{FrameContext, ProcessingContext, RuntimeState};
 pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineError};
@@ -154,8 +154,7 @@ chain = ["passthrough"]
         assert!(msg.contains("NaN"), "NaN-specific message expected: {msg}");
         let err = config::OutputScale::new(f32::INFINITY).expect_err("+inf must be rejected");
         assert!(format!("{err}").contains("output.scale"));
-        let err =
-            config::OutputScale::new(f32::NEG_INFINITY).expect_err("-inf must be rejected");
+        let err = config::OutputScale::new(f32::NEG_INFINITY).expect_err("-inf must be rejected");
         assert!(format!("{err}").contains("output.scale"));
     }
 
@@ -171,8 +170,7 @@ chain = ["passthrough"]
 
     #[test]
     fn output_scale_rejects_below_min() {
-        let err =
-            config::OutputScale::new(1e-30).expect_err("sub-min scale must be rejected");
+        let err = config::OutputScale::new(1e-30).expect_err("sub-min scale must be rejected");
         let msg = format!("{err}");
         assert!(msg.contains("0.05"), "min bound must be reported: {msg}");
     }
@@ -181,7 +179,10 @@ chain = ["passthrough"]
     fn output_scale_rejects_upscale() {
         let err = config::OutputScale::new(1.5).expect_err("upscale must be rejected");
         let msg = format!("{err}");
-        assert!(msg.contains("upscaling"), "hint must mention upscaling: {msg}");
+        assert!(
+            msg.contains("upscaling"),
+            "hint must mention upscaling: {msg}"
+        );
     }
 
     #[test]

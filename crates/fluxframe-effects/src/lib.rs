@@ -16,6 +16,7 @@
 
 #![warn(missing_docs)]
 
+pub mod backend;
 #[cfg(feature = "ml")]
 pub mod background_blur;
 pub mod chain;

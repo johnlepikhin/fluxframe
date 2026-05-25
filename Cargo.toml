@@ -43,6 +43,25 @@ rayon = "1"
 # offers MMAP, which races against the consumer; see
 # <https://github.com/umlaeute/v4l2loopback/issues/191>).
 v4l = "0.14"
+# Safe cross-platform GPU API.  Stage 7 uses it to run the box-blur
+# stage on the Intel iGPU via Vulkan compute shaders.  Pinned to the
+# minor version because wgpu still ships breaking API changes between
+# minors (pre-1.0 semver semantics in practice — the project's own
+# release notes call them out explicitly).
+wgpu = "29.0"
+# Minimal blocking `block_on` for the few `Future`-returning calls in
+# `wgpu`'s safe API (adapter / device request).  Tiny zero-dep crate;
+# we never invoke a tokio/async-std executor anywhere else in the
+# tree, so this stays the entire async story.
+pollster = "0.4"
+# Intel-maintained Rust bindings for OpenVINO (Stage 8, experimental
+# CPU-plugin seam).  `runtime-linking` mirrors `ort`'s `load-dynamic`:
+# `libopenvino.so` is dlopened at process start via `LD_LIBRARY_PATH`
+# (pip install path documented in README).  `default-features =
+# false` excludes the build-time linker discovery that would
+# otherwise look for a system-wide OpenVINO install (which Guix does
+# not have).
+openvino = { version = "0.11", default-features = false, features = ["runtime-linking"] }
 
 [workspace.lints.rust]
 # `forbid` (not `deny`) so a stray `#[allow(unsafe_code)]` somewhere in

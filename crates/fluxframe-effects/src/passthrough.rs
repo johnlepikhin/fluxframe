@@ -75,6 +75,7 @@ mod tests {
             height: 4,
             format: PixelFormat::Rgb,
             fps: 30,
+            counters: None,
         };
         effect.prepare(&ctx).unwrap();
 

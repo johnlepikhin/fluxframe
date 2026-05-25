@@ -14,8 +14,23 @@ description = "Effect registry, effect chain runtime and built-in effects for Fl
 # so downstream binaries get the full effect catalogue without opt-in
 # friction; downstream crates that only need passthrough-style effects
 # can disable defaults to skip the `ort` dependency entirely.
-default = ["ml"]
+#
+# `wgpu` gates the Stage 7 GPU blur backend.  Same default-on
+# rationale as `ml`: the binary `fluxframe` ships with GPU
+# acceleration enabled out of the box.  Slim-builds disable it.
+#
+# `openvino` enables the OpenVINO inference backend.  Default-on
+# after Stage 8 step 5: the Guix Home `openvino-full` package wires
+# `ORT_DYLIB_PATH` + `OPENVINO_INSTALL_DIR` automatically, so the
+# binary picks NPU/GPU/CPU through OpenVINO's `AUTO:NPU,GPU,CPU`
+# meta-device with no operator action.  Falls back to ORT CPU if
+# the OpenVINO runtime is unreachable.  Disable with
+# `--no-default-features` for slim builds that don't ship the
+# OpenVINO stack.
+default = ["ml", "wgpu", "openvino"]
 ml = ["dep:ort"]
+wgpu = ["dep:wgpu", "dep:pollster"]
+openvino = ["dep:openvino"]
 
 [dependencies]
 fluxframe-core = { workspace = true }
@@ -28,6 +43,15 @@ ort = { workspace = true, optional = true }
 # from other processes that would otherwise serialise the single
 # effect-chain thread and visibly stall the pipeline.
 rayon = { workspace = true }
+# `wgpu` (Stage 7) powers the GPU box-blur backend.  Gated behind the
+# `wgpu` feature so a slim build (`--no-default-features`) drops the
+# entire Vulkan stack and ~50 transitive crates.
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+# `openvino` (Stage 8) — experimental Intel OpenVINO inference
+# backend.  Off by default; enable with `--features openvino` and
+# point `LD_LIBRARY_PATH` at a pip-installed OpenVINO runtime.
+openvino = { workspace = true, optional = true }
 
 [lints]
 workspace = true
@@ -46,3 +70,34 @@ required-features = ["ml"]
 name = "background_blur_e2e"
 path = "tests/background_blur_e2e.rs"
 required-features = ["ml"]
+
+# Stage 6 integration test: exercises the public backend abstraction
+# (sticky decorators + factory selection) through the crate's external
+# API only.  Gated on `ml` because the inference half of the scenario
+# uses `StickyInferenceFallback`, which is itself ml-gated.
+[[test]]
+name = "backend_fallback"
+path = "tests/backend_fallback.rs"
+required-features = ["ml"]
+
+# Stage 7 step 3 e2e: compares wgpu blur output with the CPU
+# reference.  Requires both `ml` (for the comparison harness that
+# also touches `CpuBlurBackend` via `processing::box_blur_rgb` —
+# imported through fluxframe-effects public re-exports) and `wgpu`
+# (the backend under test).  Individual tests inside are `#[ignore]`
+# because they need a working Vulkan adapter on the host.
+[[test]]
+name = "wgpu_blur_e2e"
+path = "tests/wgpu_blur_e2e.rs"
+required-features = ["ml", "wgpu"]
+
+# Stage 8 step 4 e2e: compares OpenVINO CPU plugin output against
+# ORT CPU EP on the SelfieSegmentation model.  Requires both `ml`
+# (for `OnnxEngine`, the reference) and `openvino` (the backend
+# under test).  `#[ignore]` because both runtimes must be reachable
+# (via Guix Home env or pip + LD_LIBRARY_PATH) and the model file
+# must be on disk at `<workspace>/models/selfie_segmentation.onnx`.
+[[test]]
+name = "openvino_inference_e2e"
+path = "tests/openvino_inference_e2e.rs"
+required-features = ["ml", "openvino"]

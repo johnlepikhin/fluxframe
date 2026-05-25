@@ -157,6 +157,8 @@ fn emit(
         frames_dropped_total = snap.counters.frames_dropped,
         fallback_total = snap.counters.fallback_count,
         effect_err_total = snap.counters.effect_error_count,
+        inference_runtime_fallback_gpu_to_cpu = snap.counters.inference_runtime_fallback_gpu_to_cpu,
+        blur_runtime_fallback_gpu_to_cpu = snap.counters.blur_runtime_fallback_gpu_to_cpu,
         inference_p50_us = snap.inference.percentile_us(0.5),
         inference_p95_us = snap.inference.percentile_us(0.95),
         processing_p50_us = snap.processing.percentile_us(0.5),
@@ -212,12 +214,9 @@ mod tests {
     fn reporter_joins_when_running_flag_drops() {
         let running = Arc::new(AtomicBool::new(true));
         let metrics = RuntimeMetrics::new();
-        let reporter = MetricsReporter::spawn(
-            metrics,
-            Duration::from_millis(40),
-            Arc::clone(&running),
-        )
-        .expect("spawn");
+        let reporter =
+            MetricsReporter::spawn(metrics, Duration::from_millis(40), Arc::clone(&running))
+                .expect("spawn");
         // Give the worker a chance to wake at least once.
         std::thread::sleep(Duration::from_millis(120));
         running.store(false, Ordering::Release);

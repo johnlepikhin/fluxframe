@@ -27,9 +27,7 @@
 
 use std::sync::Arc;
 
-use fluxframe_core::metrics::{
-    Counters, EffectTelemetry, LatencyHistogram, MetricsSnapshot,
-};
+use fluxframe_core::metrics::{Counters, EffectTelemetry, LatencyHistogram, MetricsSnapshot};
 
 /// Number of samples retained per per-stage histogram.  Sized for the
 /// periodic reporter cadence (≈5 s) and a 30 fps producer: 1024
@@ -63,7 +61,11 @@ pub(crate) struct RuntimeMetrics {
 impl RuntimeMetrics {
     /// Build a fresh bundle with empty histograms and zero counters.
     pub(crate) fn new() -> Self {
-        let hist = || Arc::new(LatencyHistogram::with_capacity(PER_STAGE_HISTOGRAM_CAPACITY));
+        let hist = || {
+            Arc::new(LatencyHistogram::with_capacity(
+                PER_STAGE_HISTOGRAM_CAPACITY,
+            ))
+        };
         Self {
             counters: Arc::new(Counters::new()),
             processing: hist(),
@@ -208,5 +210,4 @@ mod tests {
         // mark — no double-count, no underflow.
         assert_eq!(m.snapshot().counters.frames_dropped, 10);
     }
-
 }

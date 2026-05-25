@@ -67,22 +67,20 @@ pub fn detect_native_mode(
     device_path: &Path,
     prefer_fps: u32,
 ) -> Result<NativeMode, PipelineError> {
-    let device = Device::with_path(device_path).map_err(|e| {
-        PipelineError::InputDeviceUnavailable {
+    let device =
+        Device::with_path(device_path).map_err(|e| PipelineError::InputDeviceUnavailable {
             device: device_path.display().to_string(),
             reason: format!("v4l::Device::with_path failed: {e}"),
             hint: "ensure the device exists and is readable".into(),
-        }
-    })?;
-    let formats = Capture::enum_formats(&device).map_err(|e| {
-        PipelineError::InputDeviceUnavailable {
+        })?;
+    let formats =
+        Capture::enum_formats(&device).map_err(|e| PipelineError::InputDeviceUnavailable {
             device: device_path.display().to_string(),
             reason: format!("VIDIOC_ENUM_FMT failed: {e}"),
             hint: "check the device is readable and not held open by another process \
                    (e.g. cheese, chrome)"
                 .into(),
-        }
-    })?;
+        })?;
 
     let mut candidates: Vec<NativeMode> = Vec::new();
     for fmt in &formats {
@@ -111,9 +109,7 @@ pub fn detect_native_mode(
                 // exceed `prefer_fps`.  An empty list means the driver
                 // does not enumerate intervals — treat as "any fps OK"
                 // and assume `prefer_fps`.
-                let intervals = match Capture::enum_frameintervals(
-                    &device, fmt.fourcc, w, h,
-                ) {
+                let intervals = match Capture::enum_frameintervals(&device, fmt.fourcc, w, h) {
                     Ok(i) => i,
                     Err(e) => {
                         tracing::warn!(
@@ -156,13 +152,10 @@ pub fn detect_native_mode(
         });
     }
 
-    select_best(candidates, prefer_fps).ok_or_else(|| {
-        PipelineError::InputDeviceUnavailable {
-            device: device_path.display().to_string(),
-            reason: "no acceptable mode after policy filter (this is a bug)".into(),
-            hint: "report this — `select_best` should never return None on non-empty input"
-                .into(),
-        }
+    select_best(candidates, prefer_fps).ok_or_else(|| PipelineError::InputDeviceUnavailable {
+        device: device_path.display().to_string(),
+        reason: "no acceptable mode after policy filter (this is a bug)".into(),
+        hint: "report this — `select_best` should never return None on non-empty input".into(),
     })
 }
 

@@ -3,3 +3,6 @@ doc/ideas
 doc/plan
 mcp_debug.log
 .claude/
+models/
+fluxframe.toml
+.*.swp

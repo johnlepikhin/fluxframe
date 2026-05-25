@@ -73,6 +73,7 @@ fn background_blur_processes_a_frame() {
         height,
         format: PixelFormat::Rgb,
         fps: 30,
+        counters: None,
     };
     effect
         .prepare(&ctx)

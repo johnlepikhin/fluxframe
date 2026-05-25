@@ -47,6 +47,15 @@ pub struct Counters {
     frames_dropped: AtomicU64,
     fallback_count: AtomicU64,
     effect_error_count: AtomicU64,
+    // Stage 6 (backend abstraction): one-way sticky transitions from a
+    // GPU/accelerator backend to the CPU secondary, recorded by the
+    // sticky-fallback decorators in `fluxframe-effects::backend`.
+    // Scalar — no labels — because today there is a single `from` source
+    // (any future accelerator) and a single `to` sink (CPU). When a
+    // second `from` variant appears (e.g. NPU vs iGPU), revisit the
+    // counter shape rather than encoding the source as a string.
+    inference_runtime_fallback_gpu_to_cpu: AtomicU64,
+    blur_runtime_fallback_gpu_to_cpu: AtomicU64,
 }
 
 impl Counters {
@@ -59,6 +68,8 @@ impl Counters {
             frames_dropped: AtomicU64::new(0),
             fallback_count: AtomicU64::new(0),
             effect_error_count: AtomicU64::new(0),
+            inference_runtime_fallback_gpu_to_cpu: AtomicU64::new(0),
+            blur_runtime_fallback_gpu_to_cpu: AtomicU64::new(0),
         }
     }
 
@@ -97,6 +108,27 @@ impl Counters {
         self.effect_error_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment `inference_runtime_fallback_gpu_to_cpu` by one.
+    ///
+    /// Called by the inference sticky-fallback decorator the first
+    /// (and only) time a GPU-side inference engine errors out and the
+    /// effect transitions to the CPU secondary for the remainder of the
+    /// session.
+    #[inline]
+    pub fn inc_inference_runtime_fallback_gpu_to_cpu(&self) {
+        self.inference_runtime_fallback_gpu_to_cpu
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `blur_runtime_fallback_gpu_to_cpu` by one.  Counterpart
+    /// of [`Counters::inc_inference_runtime_fallback_gpu_to_cpu`] for the
+    /// blur backend.
+    #[inline]
+    pub fn inc_blur_runtime_fallback_gpu_to_cpu(&self) {
+        self.blur_runtime_fallback_gpu_to_cpu
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot the counter values.  Each load is independent — there
     /// is no cross-counter atomicity guarantee.
     #[must_use]
@@ -107,6 +139,12 @@ impl Counters {
             frames_dropped: self.frames_dropped.load(Ordering::Relaxed),
             fallback_count: self.fallback_count.load(Ordering::Relaxed),
             effect_error_count: self.effect_error_count.load(Ordering::Relaxed),
+            inference_runtime_fallback_gpu_to_cpu: self
+                .inference_runtime_fallback_gpu_to_cpu
+                .load(Ordering::Relaxed),
+            blur_runtime_fallback_gpu_to_cpu: self
+                .blur_runtime_fallback_gpu_to_cpu
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -131,6 +169,10 @@ pub struct CounterValues {
     pub fallback_count: u64,
     /// See [`Counters::effect_error_count`].
     pub effect_error_count: u64,
+    /// See [`Counters::inc_inference_runtime_fallback_gpu_to_cpu`].
+    pub inference_runtime_fallback_gpu_to_cpu: u64,
+    /// See [`Counters::inc_blur_runtime_fallback_gpu_to_cpu`].
+    pub blur_runtime_fallback_gpu_to_cpu: u64,
 }
 
 /// Bounded ring of latency samples in microseconds.
@@ -399,6 +441,8 @@ mod tests {
         assert_eq!(snap.frames_dropped, 0);
         assert_eq!(snap.fallback_count, 0);
         assert_eq!(snap.effect_error_count, 0);
+        assert_eq!(snap.inference_runtime_fallback_gpu_to_cpu, 0);
+        assert_eq!(snap.blur_runtime_fallback_gpu_to_cpu, 0);
     }
 
     #[test]
@@ -417,12 +461,17 @@ mod tests {
         for _ in 0..2 {
             c.inc_effect_error();
         }
+        c.inc_inference_runtime_fallback_gpu_to_cpu();
+        c.inc_blur_runtime_fallback_gpu_to_cpu();
+        c.inc_blur_runtime_fallback_gpu_to_cpu();
         let snap = c.snapshot();
         assert_eq!(snap.frames_in, 5);
         assert_eq!(snap.frames_out, 3);
         assert_eq!(snap.frames_dropped, 1);
         assert_eq!(snap.fallback_count, 7);
         assert_eq!(snap.effect_error_count, 2);
+        assert_eq!(snap.inference_runtime_fallback_gpu_to_cpu, 1);
+        assert_eq!(snap.blur_runtime_fallback_gpu_to_cpu, 2);
     }
 
     #[test]

@@ -676,12 +676,8 @@ fn build_v4l2_direct_chain(
     // Pin the wire format fully — fdsink doesn't negotiate v4l2
     // caps, so we must guarantee upstream produces buffers in the
     // exact format the kernel was told to expect via VIDIOC_S_FMT.
-    let capsfilter = build_format_capsfilter(
-        "output_sink_caps",
-        pixel_format,
-        Some(width),
-        Some(height),
-    )?;
+    let capsfilter =
+        build_format_capsfilter("output_sink_caps", pixel_format, Some(width), Some(height))?;
 
     Ok(SinkChainResult {
         pre_sink: vec![sink_queue, capsfilter],

@@ -239,7 +239,10 @@ impl OutputConfig {
     #[must_use]
     pub fn effective_dimensions(&self, input_w: u32, input_h: u32) -> (u32, u32) {
         let scale = self.scale.value();
-        (scale_dimension(input_w, scale), scale_dimension(input_h, scale))
+        (
+            scale_dimension(input_w, scale),
+            scale_dimension(input_h, scale),
+        )
     }
 }
 
