@@ -14,11 +14,12 @@ pub mod context;
 pub mod error;
 pub mod frame;
 pub mod metrics;
+pub mod plane;
 pub mod traits;
 
 pub use config::{
     BackendKind, EffectsConfig, FluxConfig, InputConfig, LoggingConfig, OutputConfig, OutputScale,
-    RealtimeConfig,
+    PipelineSection, RealtimeConfig,
 };
 pub use context::{FrameContext, ProcessingContext, RuntimeState};
 pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineError};
@@ -26,6 +27,7 @@ pub use frame::{FrameBuffer, FrameMeta, PixelFormat, Timestamp, VideoFrame};
 pub use metrics::{
     CounterValues, Counters, EffectTelemetry, LatencyHistogram, LatencySnapshot, MetricsSnapshot,
 };
+pub use plane::{FramePlane, MaskEffect, MaskPlane, PlaneEffect};
 pub use traits::{
     InferenceEngine, InferenceInput, InferenceOutput, ModelInfo, RawEffectParams, VideoEffect,
     VideoSink, VideoSource,

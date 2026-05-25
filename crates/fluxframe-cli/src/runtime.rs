@@ -125,11 +125,13 @@ fn register_token(slot: LatestFrameSlot) -> (TokenGuard, Arc<AtomicBool>) {
     (TokenGuard { token }, flag)
 }
 
-/// Build a registry pre-populated with the effects available in Stage 1+.
+/// Build a registry pre-populated with the standalone effects that
+/// can appear in `[effects].chain`.
 ///
-/// `background_blur` is gated behind the `fluxframe-effects/ml` feature
-/// (enabled by default); a build with `default-features = false` ships
-/// only the dependency-free effects.
+/// The composite effect ([`fluxframe_effects::CompositeEffect`]) is
+/// NOT in this registry — it is built directly from the `[mask]` /
+/// `[background]` / `[foreground]` sections in `commands::run` and
+/// prepended to the chain after the registry-driven part.
 #[must_use]
 pub(crate) fn default_registry() -> EffectRegistry {
     let mut registry = EffectRegistry::new();
@@ -137,13 +139,6 @@ pub(crate) fn default_registry() -> EffectRegistry {
         PassthroughEffect::NAME,
         Box::new(|| -> Box<dyn fluxframe_core::traits::VideoEffect> {
             Box::new(PassthroughEffect::new())
-        }),
-    );
-    #[cfg(feature = "ml")]
-    registry.register(
-        fluxframe_effects::BackgroundBlurEffect::NAME,
-        Box::new(|| -> Box<dyn fluxframe_core::traits::VideoEffect> {
-            Box::new(fluxframe_effects::BackgroundBlurEffect::new())
         }),
     );
     registry

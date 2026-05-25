@@ -42,13 +42,25 @@ impl EffectChain {
         self.effects.iter().map(|e| e.name()).collect()
     }
 
+    /// Consume the chain and return its underlying boxed effects.
+    ///
+    /// Useful for callers that need to merge a registry-built chain
+    /// with externally-constructed effects (e.g. the CLI prepending a
+    /// composite effect to the user-configured chain) without rebuilding
+    /// each effect through the registry a second time.
+    #[must_use]
+    pub fn into_effects(self) -> Vec<Box<dyn VideoEffect>> {
+        self.effects
+    }
+
     /// Run `configure` on every effect, passing the matching per-effect
     /// TOML table from `per_effect_params` (or an empty table when the
     /// effect has no entry).  Must be called before [`Self::prepare_all`];
-    /// effects that require configuration (e.g. `background_blur` needs a
-    /// `model`) surface a structured `EffectError::InvalidConfig` here
-    /// rather than the more cryptic "prepare called before configure" from
-    /// downstream lifecycle stages.
+    /// effects that require configuration surface a structured
+    /// `EffectError::InvalidConfig` here rather than the more cryptic
+    /// "prepare called before configure" from downstream lifecycle stages.
+    /// (Note: `CompositeEffect` is pre-configured by its builder, not via
+    /// `configure_all`.)
     ///
     /// # Errors
     ///

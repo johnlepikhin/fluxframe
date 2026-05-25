@@ -1,9 +1,9 @@
 //! Blur backend trait + CPU implementation.
 //!
-//! [`BlurBackend`] is the seam through which `BackgroundBlurEffect`
-//! delegates the box-blur stage of its compositing pipeline.  A future
-//! GPU-side implementation slots in by implementing the same trait —
-//! the effect itself stays unchanged.
+//! [`BlurBackend`] is the seam through which `BlurPlaneEffect` (in the
+//! composite pipeline's background chain) delegates the box-blur stage.
+//! A future GPU-side implementation slots in by implementing the same
+//! trait — the effect itself stays unchanged.
 //!
 //! Scratch ownership rule: each backend owns whatever scratch buffers
 //! it needs (allocated in [`BlurBackend::prepare`] and reused across
@@ -112,10 +112,10 @@ impl CpuBlurBackend {
 }
 
 /// Build the canonical "backend name" component for error messages so
-/// the message reads consistently with the rest of `background_blur`
-/// (which reports the effect name as the carrier).  The trait does
-/// not know which effect it's running inside, so we tag the source
-/// generically.
+/// the message reads consistently with the rest of the composite
+/// pipeline (which reports the effect name as the carrier).  The
+/// trait does not know which effect it's running inside, so we tag
+/// the source generically.
 const COMPONENT: &str = "blur backend (cpu)";
 
 impl BlurBackend for CpuBlurBackend {

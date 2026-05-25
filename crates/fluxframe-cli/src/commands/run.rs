@@ -2,7 +2,9 @@
 //! shared runtime supervisor (`testsrc` and V4L2 are both supported as
 //! of Stage 2).
 
+use fluxframe_core::traits::VideoEffect;
 use fluxframe_core::{FluxError, normalise_effect_name};
+use fluxframe_effects::EffectChain;
 use tracing::info;
 
 use crate::cli::RunArgs;
@@ -43,23 +45,62 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
         "merged configuration"
     );
 
-    let chain_names: Vec<String> = if cfg.effects.chain.is_empty() {
-        return Err(FluxError::Config {
-            reason: "effect chain is empty".into(),
-            hint: Some("pass --effect passthrough or set [effects].chain in the config".into()),
-        });
-    } else {
-        cfg.effects
-            .chain
-            .iter()
-            .map(|n| normalise_effect_name(n))
-            .collect()
-    };
+    let chain_names: Vec<String> = cfg
+        .effects
+        .chain
+        .iter()
+        .map(|n| normalise_effect_name(n))
+        .collect();
 
-    let registry = default_registry();
-    let chain = registry
-        .build_chain(&chain_names)
-        .map_err(FluxError::from)?;
+    // Build the composite effect from the [mask]/[background]/[foreground]
+    // sections (Stage 9). When present, it is prepended to whatever
+    // `effects.chain` requested so additional filters can run after the
+    // segmented composite.
+    let mut effects: Vec<Box<dyn VideoEffect>> = Vec::new();
+    #[cfg(feature = "ml")]
+    if let Some(mask_section) = cfg.mask.as_ref() {
+        use fluxframe_effects::composite::CompositeBuilder;
+        use fluxframe_effects::{mask_effects, plane_effects};
+        let mask_registry = mask_effects::default_registry();
+        let plane_registry = plane_effects::default_registry();
+        let composite = CompositeBuilder::new(&mask_registry, &plane_registry)
+            .build(
+                mask_section,
+                cfg.background.as_ref(),
+                cfg.foreground.as_ref(),
+            )
+            .map_err(FluxError::from)?;
+        effects.push(Box::new(composite));
+    }
+    #[cfg(not(feature = "ml"))]
+    if cfg.mask.is_some() {
+        return Err(FluxError::Config {
+            reason: "[mask] section present but the binary was built without the `ml` feature; \
+                     rebuild with `--features fluxframe-effects/ml` or remove the [mask] section"
+                .into(),
+            hint: None,
+        });
+    }
+
+    if !chain_names.is_empty() {
+        let registry = default_registry();
+        let standalone = registry
+            .build_chain(&chain_names)
+            .map_err(FluxError::from)?;
+        effects.extend(standalone.into_effects());
+    }
+
+    if effects.is_empty() {
+        return Err(FluxError::Config {
+            reason: "effect chain is empty (no [mask] section and no [effects].chain)".into(),
+            hint: Some(
+                "either configure [mask]/[background] for the composite pipeline or list at \
+                 least one effect under [effects].chain (e.g. passthrough)"
+                    .into(),
+            ),
+        });
+    }
+    let chain = EffectChain::new(effects);
 
     // Dispatch via `classify_input` so the testsrc-vs-V4L2 triage lives in
     // exactly one place (shared with `commands::check`).  Adding a variant

@@ -7,7 +7,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use fluxframe_core::{FluxConfig, FluxError, normalise_effect_name};
+use fluxframe_core::{FluxConfig, FluxError, PipelineSection, normalise_effect_name};
 
 /// Subset of CLI-overridable values shared between `run` and `benchmark`.
 #[derive(Debug, Default, Clone)]
@@ -24,10 +24,11 @@ pub struct CliOverrides {
     pub height: Option<u32>,
     /// Override frame rate in frames per second.
     pub fps: Option<u32>,
-    /// Override the ONNX model path for ML-backed effects.  Currently
-    /// only consumed by `background_blur`; injected into the merged
-    /// config's `[effects.background_blur].model` key so the effect's
-    /// `configure()` step sees it.
+    /// Override the ONNX model path used by the segmentation stage of
+    /// the composite pipeline. Injected into the merged config's
+    /// `[mask].model` field so the builder picks it up. When the file
+    /// config has no `[mask]` section yet, a minimal one is synthesised
+    /// so the override still takes effect.
     pub model: Option<PathBuf>,
 }
 
@@ -118,28 +119,21 @@ pub fn apply(mut cfg: FluxConfig, overrides: &CliOverrides) -> FluxConfig {
     if let Some(effect) = &overrides.effect {
         cfg.effects.chain = vec![normalise_effect_name(effect)];
     }
-    // `--model PATH` is funnelled into `[effects.background_blur].model`
-    // so the effect's `configure()` picks it up via the existing TOML
-    // pipeline.  We only mutate the per-effect table when the chain
-    // actually contains `background_blur` — otherwise the override
-    // would silently leak into an unrelated effect's config.
+    // `--model PATH` re-targets the segmentation model used by the
+    // composite pipeline. It writes through to `[mask].model`; if the
+    // file config has no `[mask]` section we synthesise a minimal one
+    // so the override is not silently dropped. The composite builder
+    // still requires the operator to supply the rest of the pipeline
+    // (chain, background/foreground sections); `--model` only swaps
+    // the model path.
     if let Some(model_path) = &overrides.model {
-        let needs_model = cfg
-            .effects
-            .chain
-            .iter()
-            .any(|n| normalise_effect_name(n) == "background_blur");
-        if needs_model {
-            let entry = cfg
-                .effects
-                .per_effect
-                .entry("background_blur".to_string())
-                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-            if let toml::Value::Table(map) = entry {
-                map.insert(
-                    "model".into(),
-                    toml::Value::String(model_path.display().to_string()),
-                );
+        match cfg.mask.as_mut() {
+            Some(section) => section.model = Some(model_path.clone()),
+            None => {
+                cfg.mask = Some(PipelineSection {
+                    model: Some(model_path.clone()),
+                    ..PipelineSection::default()
+                });
             }
         }
     }
@@ -208,58 +202,19 @@ chain = ["color_adjust", "overlay"]
     }
 
     #[test]
-    fn cli_model_populates_background_blur_config() {
-        let mut cfg = FluxConfig::default();
-        cfg.effects.chain.push("background_blur".to_string());
-        let overrides = CliOverrides {
-            model: Some(PathBuf::from("/tmp/seg.onnx")),
-            ..Default::default()
-        };
-        let merged = apply(cfg, &overrides);
-        let bb = merged
-            .effects
-            .per_effect
-            .get("background_blur")
-            .expect("background_blur table was injected");
-        let map = bb.as_table().expect("injected entry is a TOML table");
-        assert_eq!(
-            map.get("model")
-                .and_then(toml::Value::as_str)
-                .expect("model key is a string"),
-            "/tmp/seg.onnx",
-        );
-    }
-
-    #[test]
-    fn cli_model_is_ignored_when_chain_lacks_background_blur() {
-        // Sanity check the guard: --model on a passthrough-only chain
-        // must NOT leak into the per-effect map for an unrelated effect.
-        let mut cfg = FluxConfig::default();
-        cfg.effects.chain.push("passthrough".to_string());
-        let overrides = CliOverrides {
-            model: Some(PathBuf::from("/tmp/seg.onnx")),
-            ..Default::default()
-        };
-        let merged = apply(cfg, &overrides);
-        assert!(
-            !merged.effects.per_effect.contains_key("background_blur"),
-            "model override must not invent a background_blur entry",
-        );
-    }
-
-    #[test]
-    fn cli_model_merges_with_existing_background_blur_table() {
-        // The user's config file may already define some
-        // background_blur knobs; the CLI override should only set the
-        // `model` key, not clobber the rest.
+    fn cli_model_overrides_existing_mask_model() {
+        // Pre-existing `[mask]` section: `--model` must replace the
+        // model path while preserving the rest of the section
+        // (chain, sub-tables, fallback_threshold, …).
         let file_cfg = FluxConfig::from_toml_str(
             r#"
-[effects]
-chain = ["background_blur"]
+[mask]
+model = "/etc/wrong.onnx"
+chain = ["threshold"]
+fallback_threshold = 5
 
-[effects.background_blur]
-blur_radius = 11
-mask_threshold = 0.7
+[mask.threshold]
+level = 0.6
 "#,
         )
         .expect("toml parses");
@@ -272,29 +227,61 @@ mask_threshold = 0.7
             },
         );
 
-        let bb = merged
-            .effects
+        let mask = merged.mask.expect("mask section survives");
+        assert_eq!(
+            mask.model.as_deref(),
+            Some(std::path::Path::new("/tmp/seg.onnx")),
+            "--model replaced the previous model path",
+        );
+        assert_eq!(
+            mask.chain,
+            vec!["threshold".to_string()],
+            "chain is preserved",
+        );
+        assert_eq!(
+            mask.fallback_threshold,
+            Some(5),
+            "fallback_threshold is preserved",
+        );
+        let threshold = mask
             .per_effect
-            .get("background_blur")
-            .expect("background_blur table preserved")
-            .as_table()
-            .expect("entry is a table");
-        assert_eq!(
-            bb.get("model").and_then(toml::Value::as_str).unwrap(),
-            "/tmp/seg.onnx",
-        );
-        assert_eq!(
-            bb.get("blur_radius").and_then(toml::Value::as_integer),
-            Some(11),
-            "pre-existing knobs survive the override",
-        );
+            .get("threshold")
+            .and_then(toml::Value::as_table)
+            .expect("threshold sub-table preserved");
         assert!(
-            (bb.get("mask_threshold")
+            (threshold
+                .get("level")
                 .and_then(toml::Value::as_float)
                 .unwrap()
-                - 0.7)
+                - 0.6)
                 .abs()
-                < 1e-6
+                < 1e-6,
+            "threshold knobs survive the override",
+        );
+    }
+
+    #[test]
+    fn cli_model_synthesises_mask_section_when_absent() {
+        // Without a file-level `[mask]` section the CLI override
+        // creates a minimal one so the model path is not silently
+        // dropped. The synthesised section is otherwise empty — the
+        // operator still owns the chain/background/foreground wiring.
+        let cfg = FluxConfig::default();
+        let overrides = CliOverrides {
+            model: Some(PathBuf::from("/tmp/seg.onnx")),
+            ..Default::default()
+        };
+        let merged = apply(cfg, &overrides);
+        let mask = merged
+            .mask
+            .expect("mask section synthesised by --model override");
+        assert_eq!(
+            mask.model.as_deref(),
+            Some(std::path::Path::new("/tmp/seg.onnx")),
+        );
+        assert!(
+            mask.chain.is_empty(),
+            "synthesised section has empty chain (operator must populate)",
         );
     }
 }

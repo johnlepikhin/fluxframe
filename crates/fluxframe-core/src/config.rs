@@ -5,6 +5,7 @@
 //! at the documented 1280x720@30 reference resolution.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -402,6 +403,44 @@ pub struct EffectsConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Section: mask / background / foreground (composite pipeline)
+// ---------------------------------------------------------------------------
+
+/// One sub-pipeline section of the composite effect.
+///
+/// Used for `[mask]`, `[background]`, and `[foreground]` top-level
+/// TOML sections. Each section holds a `chain` of effect names plus
+/// one sub-table per effect with its parameters; the mask section
+/// additionally carries the segmentation model path.
+///
+/// `deny_unknown_fields` is intentionally NOT applied — the flattened
+/// `per_effect` map collects every key that is not one of the
+/// reserved control fields. The composite builder rejects unknown
+/// effect names against the active registry.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PipelineSection {
+    /// Ordered list of effect names to apply within this sub-pipeline.
+    #[serde(default)]
+    pub chain: Vec<String>,
+    /// ONNX model path. Only consumed for the `[mask]` section;
+    /// ignored on background/foreground.
+    #[serde(default)]
+    pub model: Option<PathBuf>,
+    /// Optional sidecar `<model>.toml`. Mask section only.
+    #[serde(default)]
+    pub model_config: Option<PathBuf>,
+    /// Consecutive-failure tolerance for the segmentation engine.
+    /// Mask section only.
+    #[serde(default)]
+    pub fallback_threshold: Option<u32>,
+    /// Per-effect parameter tables, keyed by effect name. The
+    /// composite builder hands each table to the corresponding
+    /// effect's `configure`.
+    #[serde(flatten, default)]
+    pub per_effect: BTreeMap<String, toml::Value>,
+}
+
+// ---------------------------------------------------------------------------
 // Section: logging
 // ---------------------------------------------------------------------------
 
@@ -442,6 +481,19 @@ pub struct FluxConfig {
     /// `[effects]` section.
     #[serde(default)]
     pub effects: EffectsConfig,
+    /// `[mask]` section. Presence activates the composite pipeline:
+    /// segmentation → mask chain → background/foreground chains →
+    /// alpha composite.
+    #[serde(default)]
+    pub mask: Option<PipelineSection>,
+    /// `[background]` section. Active only when `[mask]` is set; an
+    /// absent section means "passthrough" (background equals the
+    /// original frame).
+    #[serde(default)]
+    pub background: Option<PipelineSection>,
+    /// `[foreground]` section. Same semantics as `[background]`.
+    #[serde(default)]
+    pub foreground: Option<PipelineSection>,
     /// `[logging]` section.
     #[serde(default)]
     pub logging: LoggingConfig,

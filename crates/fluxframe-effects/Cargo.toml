@@ -66,11 +66,6 @@ name = "onnx_inference_e2e"
 path = "tests/onnx_inference_e2e.rs"
 required-features = ["ml"]
 
-[[test]]
-name = "background_blur_e2e"
-path = "tests/background_blur_e2e.rs"
-required-features = ["ml"]
-
 # Stage 6 integration test: exercises the public backend abstraction
 # (sticky decorators + factory selection) through the crate's external
 # API only.  Gated on `ml` because the inference half of the scenario

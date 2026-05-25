@@ -8,7 +8,9 @@
 //! * [`load_sidecar_or_placeholder`] — shared helper for loading the
 //!   `<model>.toml` sidecar with a conservative 1x1 fallback.
 //!
-//! Stage 4 (`background_blur`) is the first consumer.  The trait is
+//! The composite pipeline (see [`crate::composite::CompositeEffect`])
+//! is the consumer — its segmentation stage owns an
+//! [`fluxframe_core::traits::InferenceEngine`].  The trait is
 //! intentionally GStreamer-free; effects depend on
 //! [`fluxframe_core::traits::InferenceEngine`] only, not on this module.
 
