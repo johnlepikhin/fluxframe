@@ -3,10 +3,12 @@
 
 mod blur;
 mod color_fill;
+mod passthrough;
 mod registry;
 
 pub use blur::BlurPlaneEffect;
 pub use color_fill::ColorFillEffect;
+pub use passthrough::PassthroughPlaneEffect;
 pub use registry::{PlaneEffectFactory, PlaneEffectRegistry, default_registry};
 
 use fluxframe_core::EffectError;

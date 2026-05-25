@@ -11,6 +11,7 @@
 mod dilate;
 mod feather;
 mod invert;
+mod passthrough;
 mod registry;
 mod smooth_temporal;
 mod threshold;
@@ -18,6 +19,7 @@ mod threshold;
 pub use dilate::DilateMaskEffect;
 pub use feather::FeatherMaskEffect;
 pub use invert::InvertMaskEffect;
+pub use passthrough::PassthroughMaskEffect;
 pub use registry::{MaskEffectFactory, MaskEffectRegistry, default_registry};
 pub use smooth_temporal::SmoothTemporalMaskEffect;
 pub use threshold::ThresholdMaskEffect;

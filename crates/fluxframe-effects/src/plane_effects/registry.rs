@@ -98,8 +98,12 @@ impl PlaneEffectRegistry {
 /// Build a registry pre-populated with the built-in plane effects.
 #[must_use]
 pub fn default_registry() -> PlaneEffectRegistry {
-    use crate::plane_effects::{BlurPlaneEffect, ColorFillEffect};
+    use crate::plane_effects::{BlurPlaneEffect, ColorFillEffect, PassthroughPlaneEffect};
     let mut registry = PlaneEffectRegistry::new();
+    registry.register(
+        PassthroughPlaneEffect::NAME,
+        Box::new(|| -> Box<dyn PlaneEffect> { Box::new(PassthroughPlaneEffect::new()) }),
+    );
     registry.register(
         BlurPlaneEffect::NAME,
         Box::new(|| -> Box<dyn PlaneEffect> { Box::new(BlurPlaneEffect::new()) }),

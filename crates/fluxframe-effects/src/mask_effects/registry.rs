@@ -102,10 +102,14 @@ impl MaskEffectRegistry {
 #[must_use]
 pub fn default_registry() -> MaskEffectRegistry {
     use crate::mask_effects::{
-        DilateMaskEffect, FeatherMaskEffect, InvertMaskEffect, SmoothTemporalMaskEffect,
-        ThresholdMaskEffect,
+        DilateMaskEffect, FeatherMaskEffect, InvertMaskEffect, PassthroughMaskEffect,
+        SmoothTemporalMaskEffect, ThresholdMaskEffect,
     };
     let mut registry = MaskEffectRegistry::new();
+    registry.register(
+        PassthroughMaskEffect::NAME,
+        Box::new(|| -> Box<dyn MaskEffect> { Box::new(PassthroughMaskEffect::new()) }),
+    );
     registry.register(
         ThresholdMaskEffect::NAME,
         Box::new(|| -> Box<dyn MaskEffect> { Box::new(ThresholdMaskEffect::new()) }),
