@@ -102,13 +102,17 @@ impl MaskEffectRegistry {
 #[must_use]
 pub fn default_registry() -> MaskEffectRegistry {
     use crate::mask_effects::{
-        DilateMaskEffect, FeatherMaskEffect, InvertMaskEffect, PassthroughMaskEffect,
-        SmoothTemporalMaskEffect, ThresholdMaskEffect,
+        DilateMaskEffect, FeatherMaskEffect, InvertMaskEffect, LargestBlobMaskEffect,
+        PassthroughMaskEffect, SmoothTemporalMaskEffect, ThresholdMaskEffect,
     };
     let mut registry = MaskEffectRegistry::new();
     registry.register(
         PassthroughMaskEffect::NAME,
         Box::new(|| -> Box<dyn MaskEffect> { Box::new(PassthroughMaskEffect::new()) }),
+    );
+    registry.register(
+        LargestBlobMaskEffect::NAME,
+        Box::new(|| -> Box<dyn MaskEffect> { Box::new(LargestBlobMaskEffect::new()) }),
     );
     registry.register(
         ThresholdMaskEffect::NAME,
@@ -146,6 +150,8 @@ mod tests {
         assert!(names.contains(&"feather"));
         assert!(names.contains(&"smooth_temporal"));
         assert!(names.contains(&"invert"));
+        assert!(names.contains(&"largest_blob"));
+        assert!(names.contains(&"passthrough"));
     }
 
     #[test]

@@ -11,6 +11,7 @@
 mod dilate;
 mod feather;
 mod invert;
+mod largest_blob;
 mod passthrough;
 mod registry;
 mod smooth_temporal;
@@ -19,6 +20,7 @@ mod threshold;
 pub use dilate::DilateMaskEffect;
 pub use feather::FeatherMaskEffect;
 pub use invert::InvertMaskEffect;
+pub use largest_blob::LargestBlobMaskEffect;
 pub use passthrough::PassthroughMaskEffect;
 pub use registry::{MaskEffectFactory, MaskEffectRegistry, default_registry};
 pub use smooth_temporal::SmoothTemporalMaskEffect;
