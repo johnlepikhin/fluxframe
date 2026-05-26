@@ -120,6 +120,12 @@ impl InputPipeline {
 
         let videoconvert = make_element("videoconvert", "input_videoconvert")?;
         let videoscale = make_element("videoscale", "input_videoscale")?;
+        // Preserve aspect ratio when the camera's native resolution
+        // differs from the operator's `[input] width/height`. Without
+        // this, scaling 640×480 (4:3) to 1280×720 (16:9) silently
+        // stretches the image. `add-borders=true` pads with black
+        // bars instead.
+        videoscale.set_property("add-borders", true);
         // `videorate` enforces `params.fps` BEFORE the effect chain sees
         // frames.  Without it, testsrc happily generates at its own rate
         // and v4l2 cameras ignore `framerate` hints in capsfilter — both

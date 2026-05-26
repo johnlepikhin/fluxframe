@@ -18,8 +18,8 @@ pub mod plane;
 pub mod traits;
 
 pub use config::{
-    BackendKind, EffectsConfig, FluxConfig, InputConfig, LoggingConfig, OutputConfig, OutputScale,
-    PipelineSection, RealtimeConfig,
+    AutoInputConfig, BackendKind, EffectsConfig, FluxConfig, InputConfig, InputDevice,
+    LoggingConfig, OutputConfig, OutputScale, PipelineSection, RealtimeConfig,
 };
 pub use context::{FrameContext, ProcessingContext, RuntimeState};
 pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineError};
@@ -72,7 +72,10 @@ chain = ["passthrough"]
         )
         .expect("minimal toml parses");
 
-        assert_eq!(cfg.input.device, "/dev/video1");
+        assert_eq!(
+            cfg.input.device,
+            InputDevice::Path(std::path::PathBuf::from("/dev/video1"))
+        );
         assert_eq!(cfg.input.width, 1280, "missing width falls back to default");
         assert_eq!(
             cfg.input.format,
@@ -281,6 +284,87 @@ foo = "bar"
         assert!(
             msg.contains("foo"),
             "error must mention the unknown field, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn input_device_serde_deserialises_auto_testsrc_path() {
+        // `"auto"` (any case) → InputDevice::Auto
+        let cfg = FluxConfig::from_toml_str(
+            r#"
+[input]
+device = "auto"
+"#,
+        )
+        .expect("auto parses");
+        assert_eq!(cfg.input.device, InputDevice::Auto);
+
+        let cfg = FluxConfig::from_toml_str(
+            r#"
+[input]
+device = "AUTO"
+"#,
+        )
+        .expect("AUTO parses case-insensitively");
+        assert_eq!(cfg.input.device, InputDevice::Auto);
+
+        // `"testsrc"` → InputDevice::Testsrc
+        let cfg = FluxConfig::from_toml_str(
+            r#"
+[input]
+device = "testsrc"
+"#,
+        )
+        .expect("testsrc parses");
+        assert_eq!(cfg.input.device, InputDevice::Testsrc);
+
+        // anything else → InputDevice::Path
+        let cfg = FluxConfig::from_toml_str(
+            r#"
+[input]
+device = "/dev/video0"
+"#,
+        )
+        .expect("explicit path parses");
+        assert_eq!(
+            cfg.input.device,
+            InputDevice::Path(std::path::PathBuf::from("/dev/video0"))
+        );
+
+        // Display roundtrip: Auto/Testsrc/Path render as their TOML form.
+        assert_eq!(InputDevice::Auto.to_string(), "auto");
+        assert_eq!(InputDevice::Testsrc.to_string(), "testsrc");
+        assert_eq!(
+            InputDevice::Path(std::path::PathBuf::from("/dev/video0")).to_string(),
+            "/dev/video0"
+        );
+    }
+
+    #[test]
+    fn auto_input_defaults_are_sensible() {
+        let auto = AutoInputConfig::default();
+        assert!(auto.poll_interval_secs >= 1);
+        assert!(auto.exclude_devices.is_empty());
+    }
+
+    #[test]
+    fn config_parses_input_auto_section() {
+        let cfg = FluxConfig::from_toml_str(
+            r#"
+[input]
+device = "auto"
+
+[input.auto]
+poll_interval_secs = 5
+exclude_devices = ["/dev/video20"]
+"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.input.device, InputDevice::Auto);
+        assert_eq!(cfg.input.auto.poll_interval_secs, 5);
+        assert_eq!(
+            cfg.input.auto.exclude_devices,
+            vec![std::path::PathBuf::from("/dev/video20")]
         );
     }
 

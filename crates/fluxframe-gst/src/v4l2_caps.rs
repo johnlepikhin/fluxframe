@@ -21,11 +21,39 @@
 //!
 //! If no matching mode exists the function returns an error explaining
 //! what the camera does advertise.
+//!
+//! # Device enumeration helpers
+//!
+//! This module also exposes [`enumerate_capture_devices`] (with the
+//! testable [`enumerate_capture_devices_in`] variant) and
+//! [`pick_input_device`].  They classify devices via `VIDIOC_QUERYCAP`
+//! ioctl — the authoritative kernel-side capability flags.
+//!
+//! ## Why two enumerators coexist (with [`crate::v4l2`])
+//!
+//! [`crate::v4l2::enumerate_devices`] reads `/sys/class/video4linux`
+//! and classifies devices by `modalias` + name substring heuristics.
+//! It is cheap (no `open` per device) and used where coarse
+//! input/virtual/unknown classification is enough — `list` / `check`
+//! UI scenarios where a camera lacking the word "camera" in its name
+//! would land in `Unknown` and the operator picks anyway.
+//!
+//! The helpers here `open()` the device and ask the kernel via
+//! `VIDIOC_QUERYCAP` — strictly more authoritative.  A driver that
+//! does NOT contain "camera"/"webcam" in its name (some industrial
+//! cams, IP cam shims) shows up as `Unknown` to the sysfs classifier
+//! but is correctly detected as a capture device here.  Used in the
+//! hot path where we MUST pick a real camera (auto-select in `run`).
+//!
+//! Drift mitigation: both treat `v4l2loopback` as non-input —
+//! sysfs classifier via `modalias`, capability classifier via
+//! `VIDEO_OUTPUT` flag (which loopback always advertises).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fluxframe_core::error::PipelineError;
 use fluxframe_core::frame::PixelFormat;
+use v4l::capability::Flags as CapFlags;
 use v4l::video::Capture;
 use v4l::{Device, FourCC};
 
@@ -254,6 +282,135 @@ fn choose_better_fps(a: u32, b: u32, prefer: u32) -> u32 {
     }
 }
 
+/// Enumerate `/dev/video*` nodes and return those that look like
+/// real capture cameras (have `V4L2_CAP_VIDEO_CAPTURE`, do NOT have
+/// `V4L2_CAP_VIDEO_OUTPUT`).
+///
+/// Skips:
+/// * Non-existent paths (the directory is scanned only — no globbing).
+/// * Devices that cannot be opened (permissions, busy) — they are
+///   re-tried on the next call.
+/// * Devices that advertise `VIDEO_OUTPUT` capability (the v4l2loopback
+///   pseudo-camera we publish into ends up here — preventing a
+///   feedback loop).
+///
+/// Order: lexicographic by path so `pick_input_device` is deterministic.
+/// Best-effort and non-failing: a sysfs/devfs hiccup returns an empty
+/// list rather than an error, matching the "never hard-fail in `auto`
+/// mode" rule.
+///
+/// Each candidate is opened EXACTLY ONCE per enumeration tick.
+/// [`pick_input_device`] does NOT re-probe — it filters the already-
+/// vetted list.
+#[must_use]
+pub fn enumerate_capture_devices() -> Vec<PathBuf> {
+    enumerate_capture_devices_in(Path::new("/dev"))
+}
+
+/// Testable form of [`enumerate_capture_devices`].
+///
+/// `dev_root` is the directory holding the `videoN` character-device
+/// nodes (production: `/dev`).  Exposed so unit tests can drive a
+/// synthetic layout (note: meaningful behaviour still requires real
+/// V4L2 devices because the capability probe goes through the kernel —
+/// the seam is here for the future when we mock the open path).
+#[must_use]
+pub fn enumerate_capture_devices_in(dev_root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dev_root) else {
+        tracing::debug!(?dev_root, "dev root unreadable; returning empty list");
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let s = name.to_str()?;
+            if !is_video_node_name(s) {
+                return None;
+            }
+            Some(e.path())
+        })
+        .filter(|p| probe_capture_device(p))
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// Returns `true` when `name` matches `videoN` where N is one or more
+/// ASCII digits.  Used to filter `/dev` entries that look like V4L2
+/// device nodes (rejects `videoX-aux`, `video-codec`, `vide0`, etc.).
+fn is_video_node_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("video") else {
+        return false;
+    };
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Probe `path` and return `true` iff it is a real capture-capable
+/// V4L2 device that is NOT also an output device.
+///
+/// Logs at `debug` level for every skipped candidate so the operator
+/// can diagnose "auto-select found nothing" without strace.
+fn probe_capture_device(path: &Path) -> bool {
+    let device = match Device::with_path(path) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!(path = %path.display(), error = %e, "device probe failed");
+            return false;
+        }
+    };
+    let caps = match device.query_caps() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(path = %path.display(), error = %e, "device probe failed");
+            return false;
+        }
+    };
+    let flags = caps.capabilities;
+    if !flags.contains(CapFlags::VIDEO_CAPTURE) {
+        tracing::debug!(
+            path = %path.display(),
+            "missing VIDEO_CAPTURE capability",
+        );
+        return false;
+    }
+    if flags.contains(CapFlags::VIDEO_OUTPUT) {
+        tracing::debug!(
+            path = %path.display(),
+            "has VIDEO_OUTPUT capability — likely v4l2loopback writer side",
+        );
+        return false;
+    }
+    true
+}
+
+/// Pick the first `candidate` that is not present in `exclude`.
+///
+/// Pure function — performs NO filesystem or device I/O.  The contract
+/// is that `candidates` was already open-probed (via
+/// [`enumerate_capture_devices`] or its `_in` variant) so the only
+/// remaining task here is to filter out caller-supplied exclusions
+/// (typically: the output `v4l2loopback` device).
+///
+/// Returns `None` when every candidate is excluded — the caller is
+/// expected to retry later (a fresh enumeration may surface a new
+/// camera).  Emits a `tracing::debug!` for each excluded candidate so
+/// the operator can see "all candidates excluded, returned None".
+#[must_use]
+pub fn pick_input_device(candidates: &[PathBuf], exclude: &[PathBuf]) -> Option<PathBuf> {
+    for candidate in candidates {
+        if exclude.iter().any(|x| x == candidate) {
+            tracing::debug!(
+                path = %candidate.display(),
+                "candidate excluded by caller",
+            );
+            continue;
+        }
+        return Some(candidate.clone());
+    }
+    None
+}
+
 fn fourcc_to_pixel_format(fcc: FourCC) -> Option<PixelFormat> {
     match &fcc.repr {
         b"YUYV" => Some(PixelFormat::Yuy2),
@@ -371,5 +528,63 @@ mod tests {
     #[test]
     fn select_best_returns_none_on_empty() {
         assert_eq!(select_best(Vec::new(), 30), None);
+    }
+
+    #[test]
+    fn is_video_node_name_accepts_canonical_forms() {
+        for (name, expected) in [
+            ("video0", true),
+            ("video10", true),
+            ("video", false),   // no digits
+            ("video0a", false), // trailing non-digit
+            ("video-codec", false),
+            ("videoX-aux", false),
+            ("vide0", false), // typo
+            ("foo", false),
+        ] {
+            assert_eq!(
+                is_video_node_name(name),
+                expected,
+                "is_video_node_name({name:?}) wrong",
+            );
+        }
+    }
+
+    #[test]
+    fn pick_returns_first_non_excluded() {
+        let candidates = vec![
+            PathBuf::from("/dev/video0"),
+            PathBuf::from("/dev/video1"),
+            PathBuf::from("/dev/video2"),
+        ];
+        let exclude = vec![PathBuf::from("/dev/video0")];
+        assert_eq!(
+            pick_input_device(&candidates, &exclude),
+            Some(PathBuf::from("/dev/video1")),
+        );
+    }
+
+    #[test]
+    fn pick_returns_none_when_all_excluded() {
+        let candidates = vec![PathBuf::from("/dev/video0"), PathBuf::from("/dev/video1")];
+        let exclude = candidates.clone();
+        assert_eq!(pick_input_device(&candidates, &exclude), None);
+    }
+
+    #[test]
+    fn pick_returns_none_on_empty_candidates() {
+        let candidates: Vec<PathBuf> = Vec::new();
+        let exclude = vec![PathBuf::from("/dev/video0")];
+        assert_eq!(pick_input_device(&candidates, &exclude), None);
+    }
+
+    #[test]
+    fn pick_handles_exclude_not_in_candidates() {
+        let candidates = vec![PathBuf::from("/dev/video0"), PathBuf::from("/dev/video1")];
+        let exclude = vec![PathBuf::from("/dev/video99")];
+        assert_eq!(
+            pick_input_device(&candidates, &exclude),
+            Some(PathBuf::from("/dev/video0")),
+        );
     }
 }

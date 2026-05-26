@@ -5,6 +5,7 @@
 //! at the documented 1280x720@30 reference resolution.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -69,6 +70,12 @@ pub const MAX_OUTPUT_SCALE: f32 = 1.0;
 /// only to catch typos like `metrics_interval_secs = 50000` that
 /// would effectively silence the reporter.
 pub const MAX_METRICS_INTERVAL_SECS: u32 = 3600;
+
+/// Upper bound on `input.auto.poll_interval_secs` accepted by
+/// [`FluxConfig::validate`].  Larger settings effectively wedge the
+/// auto-pick loop (a 1 h cap is well past any reasonable operator
+/// value — the cap exists only to catch typos).
+pub const MAX_POLL_INTERVAL_SECS: u32 = 3600;
 
 // ---------------------------------------------------------------------------
 // Backend selection
@@ -140,6 +147,68 @@ mod pixel_format_serde {
 }
 
 // ---------------------------------------------------------------------------
+// InputDevice <-> TOML string adapter
+// ---------------------------------------------------------------------------
+
+/// Typed input-device selector used in [`InputConfig::device`].
+///
+/// Parsed from the `input.device` TOML string via a thin serde adapter:
+///
+/// * `"auto"` (case-insensitive) → [`InputDevice::Auto`] — let the
+///   supervisor pick the first available V4L2 capture device at
+///   startup, polling per `[input.auto]`.
+/// * `"testsrc"` → [`InputDevice::Testsrc`] — synthetic test source
+///   used for development and CI.
+/// * anything else → [`InputDevice::Path`] holding the literal path
+///   (e.g. `/dev/video0`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputDevice {
+    /// Auto-pick the first available V4L2 capture device at startup;
+    /// `[input.auto]` polling knobs apply.
+    Auto,
+    /// Synthetic test source.
+    Testsrc,
+    /// Explicit device path (e.g. `/dev/video0`).
+    Path(PathBuf),
+}
+
+impl fmt::Display for InputDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InputDevice::Auto => f.write_str("auto"),
+            InputDevice::Testsrc => f.write_str("testsrc"),
+            InputDevice::Path(p) => write!(f, "{}", p.display()),
+        }
+    }
+}
+
+/// Serde adapter for [`InputDevice`] — string in/out, matching the
+/// existing TOML shape (`device = "auto" | "testsrc" | "/dev/videoN"`).
+///
+/// Kept local to `config.rs` for the same reason as
+/// [`pixel_format_serde`]: the tag vocabulary belongs to the config
+/// layer, not to the type itself.
+mod input_device_serde {
+    use super::InputDevice;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::path::PathBuf;
+
+    pub(super) fn serialize<S: Serializer>(value: &InputDevice, ser: S) -> Result<S::Ok, S::Error> {
+        // Reuse Display so the string form is one source of truth.
+        ser.collect_str(value)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<InputDevice, D::Error> {
+        let raw = String::deserialize(de)?;
+        Ok(match raw.to_ascii_lowercase().as_str() {
+            "auto" => InputDevice::Auto,
+            "testsrc" => InputDevice::Testsrc,
+            _ => InputDevice::Path(PathBuf::from(raw)),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Section: input
 // ---------------------------------------------------------------------------
 
@@ -150,9 +219,17 @@ pub struct InputConfig {
     /// Capture backend selection.
     #[serde(default)]
     pub backend: BackendKind,
-    /// Device path or backend-specific identifier (e.g. `/dev/video0`).
-    #[serde(default = "default_input_device")]
-    pub device: String,
+    /// Capture-device selector — see [`InputDevice`] for the parsed
+    /// form. The TOML string `"auto"` (case-insensitive) maps to
+    /// [`InputDevice::Auto`] and activates the `[input.auto]` polling
+    /// loop; `"testsrc"` selects the synthetic source; anything else
+    /// is taken as a literal device path (e.g. `/dev/video0`).
+    #[serde(
+        default = "default_input_device",
+        serialize_with = "input_device_serde::serialize",
+        deserialize_with = "input_device_serde::deserialize"
+    )]
+    pub device: InputDevice,
     /// Requested capture width in pixels.
     #[serde(default = "default_width")]
     pub width: u32,
@@ -169,6 +246,10 @@ pub struct InputConfig {
         deserialize_with = "pixel_format_serde::deserialize"
     )]
     pub format: PixelFormat,
+    /// Knobs for `device = "auto"` mode. Ignored when `device` is an
+    /// explicit path or backend name.
+    #[serde(default)]
+    pub auto: AutoInputConfig,
 }
 
 impl Default for InputConfig {
@@ -180,8 +261,41 @@ impl Default for InputConfig {
             height: default_height(),
             fps: default_fps(),
             format: default_input_format(),
+            auto: AutoInputConfig::default(),
         }
     }
+}
+
+/// `[input.auto]` — runtime parameters for auto-picking the input
+/// V4L2 device. All fields have defaults so an empty / missing
+/// `[input.auto]` table behaves like a sensible default. The
+/// operator opts out simply by setting `input.device` to anything
+/// other than `"auto"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoInputConfig {
+    /// Polling cadence in seconds while waiting for any V4L2 capture
+    /// device to appear. Validated by [`FluxConfig::validate`] to be
+    /// in `1..=MAX_POLL_INTERVAL_SECS`.
+    #[serde(default = "default_auto_poll_interval_secs")]
+    pub poll_interval_secs: u32,
+    /// Extra device paths to skip when scanning, on top of the
+    /// supervisor's automatic exclusion of the output device.
+    #[serde(default)]
+    pub exclude_devices: Vec<PathBuf>,
+}
+
+impl Default for AutoInputConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_secs: default_auto_poll_interval_secs(),
+            exclude_devices: Vec::new(),
+        }
+    }
+}
+
+fn default_auto_poll_interval_secs() -> u32 {
+    2
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +670,18 @@ impl FluxConfig {
             )));
         }
 
+        // Auto-pick poll cadence: `0` would busy-loop on the device
+        // scanner; absurdly large values silently disable the polling
+        // loop the operator opted into.
+        if self.input.auto.poll_interval_secs == 0
+            || self.input.auto.poll_interval_secs > MAX_POLL_INTERVAL_SECS
+        {
+            return Err(config_err(format!(
+                "input.auto.poll_interval_secs must be in 1..={MAX_POLL_INTERVAL_SECS}, got {}",
+                self.input.auto.poll_interval_secs
+            )));
+        }
+
         for key in self.effects.per_effect.keys() {
             if RESERVED_EFFECTS_KEYS.contains(&key.as_str()) {
                 return Err(crate::error::FluxError::Config {
@@ -606,8 +732,8 @@ fn check_fps(section: &str, fps: u32) -> Result<(), crate::error::FluxError> {
 // Default helpers (thin wrappers over module constants for serde `default = `)
 // ---------------------------------------------------------------------------
 
-fn default_input_device() -> String {
-    DEFAULT_INPUT_DEVICE.to_string()
+fn default_input_device() -> InputDevice {
+    InputDevice::Path(PathBuf::from(DEFAULT_INPUT_DEVICE))
 }
 fn default_output_device() -> String {
     DEFAULT_OUTPUT_DEVICE.to_string()

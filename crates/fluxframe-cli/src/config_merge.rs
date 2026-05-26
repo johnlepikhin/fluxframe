@@ -7,7 +7,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use fluxframe_core::{FluxConfig, FluxError, PipelineSection, normalise_effect_name};
+use fluxframe_core::{FluxConfig, FluxError, InputDevice, PipelineSection, normalise_effect_name};
 
 /// Subset of CLI-overridable values shared between `run` and `benchmark`.
 #[derive(Debug, Default, Clone)]
@@ -30,6 +30,21 @@ pub struct CliOverrides {
     /// config has no `[mask]` section yet, a minimal one is synthesised
     /// so the override still takes effect.
     pub model: Option<PathBuf>,
+}
+
+/// Parse a CLI string into a typed [`InputDevice`].  Mirrors the TOML
+/// adapter in `fluxframe_core::config`: `"auto"` and `"testsrc"` are
+/// case-insensitive sentinels, anything else is taken as a literal
+/// device path.  Kept inline here so the CLI override path applies the
+/// same vocabulary as the file loader without going through serde.
+fn parse_input_device(s: &str) -> InputDevice {
+    if s.eq_ignore_ascii_case("auto") {
+        InputDevice::Auto
+    } else if s.eq_ignore_ascii_case("testsrc") {
+        InputDevice::Testsrc
+    } else {
+        InputDevice::Path(PathBuf::from(s))
+    }
 }
 
 /// Hard upper bound on the on-disk size of a config file.
@@ -98,7 +113,7 @@ pub fn load(path: Option<&Path>) -> Result<FluxConfig, FluxError> {
 #[must_use]
 pub fn apply(mut cfg: FluxConfig, overrides: &CliOverrides) -> FluxConfig {
     if let Some(input) = &overrides.input {
-        cfg.input.device.clone_from(input);
+        cfg.input.device = parse_input_device(input);
     }
     if let Some(output) = &overrides.output {
         cfg.output.device.clone_from(output);
@@ -166,7 +181,10 @@ fps = 15
             },
         );
 
-        assert_eq!(merged.input.device, "/dev/video9");
+        assert_eq!(
+            merged.input.device,
+            InputDevice::Path(PathBuf::from("/dev/video9"))
+        );
         assert_eq!(merged.input.width, 1920);
         assert_eq!(merged.input.height, 480, "non-overridden field stays");
         assert_eq!(merged.input.fps, 15);
@@ -191,6 +209,36 @@ chain = ["color_adjust", "overlay"]
         );
 
         assert_eq!(merged.effects.chain, vec!["background_blur".to_string()]);
+    }
+
+    #[test]
+    fn cli_input_override_parses_auto_and_testsrc_sentinels() {
+        for (raw, expected) in [
+            ("auto", InputDevice::Auto),
+            ("AUTO", InputDevice::Auto),
+            ("testsrc", InputDevice::Testsrc),
+            ("TestSrc", InputDevice::Testsrc),
+        ] {
+            let merged = apply(
+                FluxConfig::default(),
+                &CliOverrides {
+                    input: Some(raw.to_string()),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(merged.input.device, expected, "raw={raw}");
+        }
+        let merged = apply(
+            FluxConfig::default(),
+            &CliOverrides {
+                input: Some("/dev/video7".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            merged.input.device,
+            InputDevice::Path(PathBuf::from("/dev/video7"))
+        );
     }
 
     #[test]

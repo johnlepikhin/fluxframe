@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::PipelineError;
-use fluxframe_core::{FluxConfig, FluxError};
+use fluxframe_core::{FluxConfig, FluxError, InputDevice};
 use fluxframe_effects::{EffectChain, EffectRegistry, PassthroughEffect};
 use fluxframe_gst::input::{InputParams, InputPipeline};
 use fluxframe_gst::output::{OutputParams, OutputPipeline, OutputSink};
@@ -44,8 +44,55 @@ const DROPPED_SYNC_INTERVAL: u64 = 30;
 /// already torn down does not keep its slot alive.
 static REGISTERED_TOKENS: OnceLock<Mutex<Vec<Weak<RunToken>>>> = OnceLock::new();
 
+/// Process-wide shutdown flag.  Set to `true` by the Ctrl-C handler;
+/// drained by [`is_shutdown_requested`] / [`wait_for_shutdown`] so
+/// non-pipeline polling loops (e.g. the `device = "auto"` wait state)
+/// can break out promptly.  Distinct from per-run `RunToken::flag`
+/// because the auto wait loop lives OUTSIDE any active run.
+///
+/// Uses [`Ordering::Relaxed`] because this flag carries a single bit
+/// with no companion data — the polling loops only need eventual
+/// visibility, not happens-before with any other variable. Per-run
+/// `RunToken::flag` keeps Acquire/Release because it is read alongside
+/// `slot.close()` and must order frame-slot tear-down.
+///
+/// TODO(post-MVP): unify SHUTDOWN_REQUESTED into the tokens_registry by
+/// adding an idle/global token, so the auto wait loop and the run loop
+/// share one shutdown surface. The current two-tier split is honest
+/// (each loop only reads what it owns) but doubles the bookkeeping.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 fn tokens_registry() -> &'static Mutex<Vec<Weak<RunToken>>> {
     REGISTERED_TOKENS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Returns `true` if Ctrl-C has been received since process start.
+#[must_use]
+pub(crate) fn is_shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::Relaxed)
+}
+
+/// Sleep for `total` or until shutdown is requested, whichever comes
+/// first.  Returns `true` if the sleep was cut short by a shutdown
+/// request.  Polls every ~100 ms so a Ctrl-C during a long wait is
+/// reflected promptly.
+pub(crate) fn wait_for_shutdown(total: Duration) -> bool {
+    let deadline = Instant::now() + total;
+    while Instant::now() < deadline {
+        if is_shutdown_requested() {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+    is_shutdown_requested()
+}
+
+/// Make sure the process-wide Ctrl-C handler is installed.  Idempotent
+/// — call from anywhere that needs the handler before opening a slot
+/// (currently: per-run setup and the `device = "auto"` wait loop).
+pub(crate) fn ensure_ctrlc_handler() {
+    install_ctrlc_once();
 }
 
 /// Per-run shutdown state.  Held inside an [`Arc`] so the signal handler
@@ -68,6 +115,7 @@ fn install_ctrlc_once() {
     INSTALLED.get_or_init(|| {
         let result = ctrlc::set_handler(|| {
             info!("Ctrl-C received - broadcasting shutdown");
+            SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
             let mut reg = tokens_registry()
                 .lock()
                 .expect("tokens registry poisoned");
@@ -146,14 +194,16 @@ pub(crate) fn default_registry() -> EffectRegistry {
 
 /// Parsed input source resolved from a [`FluxConfig`].
 ///
-/// Routing rules (see Stage 2 plan, §"Input side"):
+/// Routing rules:
 ///
-/// * `BackendKind::Testsrc` or `device == "testsrc"` → [`Self::Testsrc`].
-/// * `BackendKind::V4l2`, or `BackendKind::Auto` + `/dev/...` path →
-///   [`Self::V4l2`].  The `Auto` path-prefix heuristic is the only way a
-///   user can mean "real camera" without overriding the backend.
-/// * everything else → [`Self::Unsupported`], so the caller surfaces a
-///   structured §27 error instead of silently falling back to a default.
+/// * [`InputDevice::Testsrc`] → [`Self::Testsrc`].
+/// * [`InputDevice::Path`]    → [`Self::V4l2`] (path is *not*
+///   canonicalised here — that happens inside
+///   [`fluxframe_gst::input::InputPipeline::build_v4l2`]).
+/// * [`InputDevice::Auto`]    → [`Self::Unsupported`]; `commands::run`
+///   intercepts `Auto` and dispatches to the polling loop before this
+///   function is called, so reaching `classify_input` with `Auto` is a
+///   bug in the caller.
 ///
 /// Adding a variant turns every CLI match site into a compile error,
 /// which is what we want at the `pub(crate)` boundary; `#[non_exhaustive]`
@@ -170,15 +220,20 @@ pub(crate) enum InputSpec {
 }
 
 /// Classify the input section of `cfg` into an [`InputSpec`].
+///
+/// [`InputDevice::Auto`] should never reach this function: the
+/// `commands::run` entry point intercepts it and routes the run through
+/// the polling loop (`run_auto`) which substitutes the picked path back
+/// into `cfg.input.device` before calling here. Returning
+/// `InputSpec::Unsupported` is the safe escape hatch.
 #[must_use]
 pub(crate) fn classify_input(cfg: &FluxConfig) -> InputSpec {
-    use fluxframe_core::config::BackendKind;
-    let device = &cfg.input.device;
-    match (cfg.input.backend, device.as_str()) {
-        (BackendKind::Testsrc, _) | (_, "testsrc") => InputSpec::Testsrc,
-        (BackendKind::V4l2, _) => InputSpec::V4l2(PathBuf::from(device)),
-        (BackendKind::Auto, d) if d.starts_with("/dev/") => InputSpec::V4l2(PathBuf::from(d)),
-        (_, other) => InputSpec::Unsupported(other.to_string()),
+    match &cfg.input.device {
+        InputDevice::Testsrc => InputSpec::Testsrc,
+        InputDevice::Path(p) => InputSpec::V4l2(p.clone()),
+        InputDevice::Auto => InputSpec::Unsupported(
+            "auto (should have been handled in commands::run before classify_input)".into(),
+        ),
     }
 }
 
@@ -261,15 +316,36 @@ pub(crate) fn run_testsrc_chain(cfg: &FluxConfig, chain: EffectChain) -> Result<
 /// pre-open check fails), effect chain preparation, or runtime failures.
 #[tracing::instrument(skip_all, fields(device = %cfg.input.device, sink = ?cfg.output.device))]
 pub(crate) fn run_v4l2_chain(cfg: &FluxConfig, chain: EffectChain) -> Result<(), FluxError> {
-    // Auto-detect the camera's native mode so the input pipeline never
-    // has to scale.  A capture pipeline that silently anisotropically
-    // stretches the camera output (1280×720 forced on a 640×480-native
-    // camera) produces a "2× wider" image at consumers because the
-    // v4l2loopback transport strips pixel-aspect-ratio metadata.
-    // Operator's `[input] width/height/fps/format` become hints; the
-    // chosen mode is logged so the operator sees what the camera
-    // actually delivers.
-    let device_path = PathBuf::from(&cfg.input.device);
+    // Detect the camera's native fps so the operator's `[input] fps`
+    // hint becomes an upper bound, not a hard requirement: requesting
+    // 30 fps from a 15 fps camera silently capped to 15 is friendlier
+    // than failing the pipeline.
+    //
+    // Width/height are NOT overridden — operator's `[input]
+    // width/height` is the source of truth and propagates through to
+    // the output dimensions (which v4l2loopback then exposes to
+    // consumers).  Doing it the other way (cfg follows camera) made
+    // the output size change every time the camera changed, which
+    // broke the v4l2loopback `VIDIOC_S_FMT` negotiation on switch
+    // and made the consumer-visible resolution non-deterministic.
+    // `videoscale` in the input pipeline pads with `add-borders=true`
+    // so the aspect ratio is preserved across the resize.
+    let device_path = match &cfg.input.device {
+        InputDevice::Path(p) => p.clone(),
+        // run_v4l2_chain is only reachable from the V4l2 branch of
+        // classify_input, which extracts a path. Auto / Testsrc would
+        // never get here, but surface a structured error rather than
+        // panic if someone wires this up incorrectly later.
+        other => {
+            return Err(FluxError::Config {
+                reason: format!(
+                    "run_v4l2_chain invoked with non-path input device '{other}' (this is a CLI \
+                     dispatch bug)",
+                ),
+                hint: None,
+            });
+        }
+    };
     // The `v4l::Device` opened inside `detect_native_mode` is dropped
     // at end-of-call (before the closure below opens the device via
     // `v4l2src`).  Do not lift this call into the closure or a struct
@@ -288,15 +364,9 @@ pub(crate) fn run_v4l2_chain(cfg: &FluxConfig, chain: EffectChain) -> Result<(),
         "auto-detected v4l2 camera native mode"
     );
 
-    // Override dims + fps with the detected native mode so videoscale
-    // is never asked to anisotropically stretch the camera output.
-    // KEEP operator's `format` — the input pipeline's videoconvert
-    // handles `detected.format → cfg.input.format` (effects like
-    // background_blur currently require RGB, regardless of what the
-    // camera natively delivers).
+    // Only fps is taken from the camera; width/height stay at the
+    // operator-configured values.
     let mut resolved = cfg.clone();
-    resolved.input.width = detected.width;
-    resolved.input.height = detected.height;
     resolved.input.fps = detected.fps;
 
     let device_path_for_builder = device_path.clone();
@@ -719,7 +789,6 @@ fn output_sink_label(sink: &OutputSink) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluxframe_core::config::BackendKind;
 
     fn base_cfg() -> FluxConfig {
         // Default Test configuration: start from `FluxConfig::default()`.
@@ -728,30 +797,36 @@ mod tests {
     }
 
     #[test]
-    fn classify_input_recognises_backend_enum_for_testsrc() {
+    fn classify_input_recognises_testsrc() {
         let mut cfg = base_cfg();
-        cfg.input.backend = BackendKind::Testsrc;
-        cfg.input.device = "anything".into();
-        assert_eq!(classify_input(&cfg), InputSpec::Testsrc);
-    }
-
-    #[test]
-    fn classify_input_recognises_device_string_for_testsrc() {
-        let mut cfg = base_cfg();
-        cfg.input.backend = BackendKind::V4l2;
-        cfg.input.device = "testsrc".into();
+        cfg.input.device = InputDevice::Testsrc;
         assert_eq!(classify_input(&cfg), InputSpec::Testsrc);
     }
 
     #[test]
     fn classify_input_classifies_real_device_as_v4l2() {
         let mut cfg = base_cfg();
-        cfg.input.backend = BackendKind::V4l2;
-        cfg.input.device = "/dev/video0".into();
+        cfg.input.device = InputDevice::Path(PathBuf::from("/dev/video0"));
         assert_eq!(
             classify_input(&cfg),
             InputSpec::V4l2(PathBuf::from("/dev/video0"))
         );
+    }
+
+    #[test]
+    fn classify_input_marks_auto_as_unsupported_escape_hatch() {
+        // `Auto` must be intercepted by `commands::run` before reaching
+        // `classify_input`; returning `Unsupported` is the deliberate
+        // safe escape so a dispatch bug surfaces as a §27 error rather
+        // than a panic.
+        let mut cfg = base_cfg();
+        cfg.input.device = InputDevice::Auto;
+        match classify_input(&cfg) {
+            InputSpec::Unsupported(s) => {
+                assert!(s.contains("auto"), "diagnostic should mention auto: {s}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[test]
@@ -818,43 +893,12 @@ mod tests {
     }
 
     #[test]
-    fn classify_input_recognises_v4l2_backend() {
+    fn classify_input_path_returns_v4l2_with_path() {
         let mut cfg = base_cfg();
-        cfg.input.backend = BackendKind::V4l2;
-        cfg.input.device = "/dev/video0".into();
-        assert_eq!(
-            classify_input(&cfg),
-            InputSpec::V4l2(PathBuf::from("/dev/video0"))
-        );
-    }
-
-    #[test]
-    fn classify_input_recognises_dev_path_under_auto() {
-        let mut cfg = base_cfg();
-        cfg.input.backend = BackendKind::Auto;
-        cfg.input.device = "/dev/video2".into();
+        cfg.input.device = InputDevice::Path(PathBuf::from("/dev/video2"));
         assert_eq!(
             classify_input(&cfg),
             InputSpec::V4l2(PathBuf::from("/dev/video2"))
-        );
-    }
-
-    #[test]
-    fn classify_input_routes_testsrc_under_auto() {
-        let mut cfg = base_cfg();
-        cfg.input.backend = BackendKind::Auto;
-        cfg.input.device = "testsrc".into();
-        assert_eq!(classify_input(&cfg), InputSpec::Testsrc);
-    }
-
-    #[test]
-    fn classify_input_marks_unsupported_under_auto() {
-        let mut cfg = base_cfg();
-        cfg.input.backend = BackendKind::Auto;
-        cfg.input.device = "http://example.com/stream".into();
-        assert_eq!(
-            classify_input(&cfg),
-            InputSpec::Unsupported("http://example.com/stream".to_string())
         );
     }
 

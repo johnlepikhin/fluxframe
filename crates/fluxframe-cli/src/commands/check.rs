@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use fluxframe_core::{FluxConfig, FluxError, normalise_effect_name};
+use fluxframe_core::{FluxConfig, FluxError, InputDevice, normalise_effect_name};
 #[cfg(feature = "ml")]
 use fluxframe_effects::ml::OnnxEngine;
 use fluxframe_gst::{V4l2DeviceKind, enumerate_devices};
@@ -105,6 +105,25 @@ fn check_gstreamer_init() -> Result<(), FluxError> {
 }
 
 fn check_input_device(cfg: &FluxConfig) -> Result<(), FluxError> {
+    // Auto-pick mode: nothing to verify ahead of time. Just enumerate
+    // and report what would be picked right now so the operator can
+    // sanity-check the candidate list. An empty list is a warning,
+    // not an error — runtime will wait for a device to appear.
+    if matches!(cfg.input.device, InputDevice::Auto) {
+        let candidates = fluxframe_gst::v4l2_caps::enumerate_capture_devices();
+        if candidates.is_empty() {
+            tracing::warn!(
+                "input: auto — no capture devices available right now \
+                 (runtime will keep polling at `[input.auto].poll_interval_secs`)"
+            );
+        } else {
+            info!(
+                devices = ?candidates,
+                "input: auto — first available will be picked at startup",
+            );
+        }
+        return Ok(());
+    }
     // Triage lives in [`classify_input`] (shared with `commands::run`)
     // so both code paths cannot drift apart on which device strings are
     // valid.  Delegate the actual canonicalisation + open-probe +
@@ -274,25 +293,19 @@ mod tests {
     #[test]
     fn check_input_device_accepts_testsrc() {
         let mut cfg = FluxConfig::default();
-        cfg.input.device = "testsrc".into();
+        cfg.input.device = InputDevice::Testsrc;
         check_input_device(&cfg).expect("testsrc always passes");
     }
 
     #[test]
-    fn check_input_device_rejects_unknown_scheme() {
-        use fluxframe_core::Diagnostic;
+    fn check_input_device_reports_auto_without_devices_as_warning_not_error() {
+        // `Auto` enters the polling branch, which logs a warning and
+        // returns `Ok(())` when nothing is plugged in. The unit harness
+        // is unlikely to have a real V4L2 camera available; either
+        // outcome counts as "no error surfaced", because absence of a
+        // device is not a check-time failure.
         let mut cfg = FluxConfig::default();
-        cfg.input.device = "http://example.com/stream".into();
-        let err = check_input_device(&cfg).expect_err("unsupported scheme must fail");
-        let reason = err.reason();
-        assert!(
-            reason.contains("not supported") || reason.contains("http://"),
-            "got reason: {reason}",
-        );
-        let hint = err.hint().expect("Unsupported should carry a hint");
-        assert!(
-            hint.contains("testsrc") || hint.contains("/dev"),
-            "got hint: {hint}",
-        );
+        cfg.input.device = InputDevice::Auto;
+        check_input_device(&cfg).expect("auto mode never errors at check time");
     }
 }

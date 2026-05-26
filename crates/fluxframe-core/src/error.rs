@@ -281,6 +281,42 @@ impl FluxError {
     pub fn is_aggregated(&self) -> bool {
         matches!(self, FluxError::Aggregated { .. })
     }
+
+    /// Returns `true` if this error is likely to clear up on retry (e.g.
+    /// device unplugged, IO flake) and `false` if it is a permanent
+    /// failure (e.g. malformed config, missing GStreamer plugin) that
+    /// must propagate to the operator.
+    ///
+    /// Used by the `device = "auto"` polling loop to decide whether to
+    /// retry or surface immediately. Default for unknown variants is
+    /// `true` (prefer retry) — be deliberate about adding `false` cases.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        match self {
+            // Permanent failures — operator must edit code/config or
+            // fix the build before retrying. Listed explicitly; every
+            // other variant falls through to the default `true` arm.
+            //
+            //   * MissingElement      — install/build problem.
+            //   * Config / ConfigParse — TOML or merged config invalid.
+            //   * Effect::InvalidConfig — per-effect TOML rejected at
+            //     configure time, e.g. `background_blur` without `model`.
+            FluxError::Pipeline(PipelineError::MissingElement { .. })
+            | FluxError::Config { .. }
+            | FluxError::ConfigParse { .. }
+            | FluxError::Effect(EffectError::InvalidConfig { .. }) => false,
+
+            // Aggregates inherit their primary error's classification.
+            FluxError::Aggregated { primary, .. } => primary.is_transient(),
+
+            // Default: prefer retry. Covers device hot-unplug, IO
+            // flakes, runtime / state-change failures, effect prepare /
+            // process / inference failures, and any future
+            // #[non_exhaustive] variant added in another crate. Hard
+            // errors get explicitly demoted in the `false` arm above.
+            _ => true,
+        }
+    }
 }
 
 /// User-facing diagnostic rendering surface for §27 "Error / Reason / Hint".
@@ -328,5 +364,78 @@ impl Diagnostic for FluxError {
             | FluxError::Inference(InferenceError::BackendUnavailable { hint, .. }) => Some(hint),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_transient_treats_input_device_unavailable_as_retryable() {
+        let err = FluxError::Pipeline(PipelineError::InputDeviceUnavailable {
+            device: "/dev/video0".into(),
+            reason: "ENODEV".into(),
+            hint: "plug it back in".into(),
+        });
+        assert!(err.is_transient(), "device hot-unplug must be retryable");
+    }
+
+    #[test]
+    fn is_transient_treats_missing_element_as_permanent() {
+        let err = FluxError::Pipeline(PipelineError::MissingElement {
+            element: "v4l2src".into(),
+            hint: "install gstreamer1.0-plugins-good".into(),
+        });
+        assert!(
+            !err.is_transient(),
+            "missing plugin is a permanent build/install bug"
+        );
+    }
+
+    #[test]
+    fn is_transient_treats_config_errors_as_permanent() {
+        let err = FluxError::Config {
+            reason: "bad value".into(),
+            hint: None,
+        };
+        assert!(
+            !err.is_transient(),
+            "config errors require operator intervention"
+        );
+    }
+
+    #[test]
+    fn is_transient_treats_io_errors_as_retryable() {
+        let err = FluxError::io(
+            std::path::PathBuf::from("/tmp/nonexistent"),
+            std::io::Error::new(std::io::ErrorKind::NotFound, "boom"),
+        );
+        assert!(err.is_transient(), "IO flakes get one more try");
+    }
+
+    #[test]
+    fn is_transient_treats_effect_invalid_config_as_permanent() {
+        let err = FluxError::Effect(EffectError::InvalidConfig {
+            name: "blur".into(),
+            reason: "negative radius".into(),
+            hint: None,
+        });
+        assert!(
+            !err.is_transient(),
+            "effect config errors are permanent until edited"
+        );
+    }
+
+    #[test]
+    fn is_transient_treats_effect_process_failed_as_retryable() {
+        let err = FluxError::Effect(EffectError::ProcessFailed {
+            name: "blur".into(),
+            reason: "transient alloc fail".into(),
+        });
+        assert!(
+            err.is_transient(),
+            "per-frame process failures can clear up"
+        );
     }
 }
