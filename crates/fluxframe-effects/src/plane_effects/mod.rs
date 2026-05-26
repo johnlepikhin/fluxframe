@@ -4,11 +4,13 @@
 mod blur;
 mod color_fill;
 mod passthrough;
+mod pixelate;
 mod registry;
 
 pub use blur::BlurPlaneEffect;
 pub use color_fill::ColorFillEffect;
 pub use passthrough::PassthroughPlaneEffect;
+pub use pixelate::PixelateEffect;
 pub use registry::{PlaneEffectFactory, PlaneEffectRegistry, default_registry};
 
 use fluxframe_core::EffectError;
