@@ -7,29 +7,25 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use fluxframe_core::{FluxConfig, FluxError, InputDevice, PipelineSection, normalise_effect_name};
+use fluxframe_core::{FluxConfig, FluxError, InputDevice};
 
 /// Subset of CLI-overridable values shared between `run` and `benchmark`.
+///
+/// Preset-specific knobs (`--preset NAME`, per-effect parameters,
+/// model paths) live in the TOML config now — the CLI only steers
+/// device routing and capture dimensions.
 #[derive(Debug, Default, Clone)]
 pub struct CliOverrides {
     /// Override input device path or logical name.
     pub input: Option<String>,
     /// Override output device path or logical name.
     pub output: Option<String>,
-    /// Override the effect chain with a single effect (kebab-case name).
-    pub effect: Option<String>,
     /// Override frame width in pixels.
     pub width: Option<u32>,
     /// Override frame height in pixels.
     pub height: Option<u32>,
     /// Override frame rate in frames per second.
     pub fps: Option<u32>,
-    /// Override the ONNX model path used by the segmentation stage of
-    /// the composite pipeline. Injected into the merged config's
-    /// `[mask].model` field so the builder picks it up. When the file
-    /// config has no `[mask]` section yet, a minimal one is synthesised
-    /// so the override still takes effect.
-    pub model: Option<PathBuf>,
 }
 
 /// Parse a CLI string into a typed [`InputDevice`].  Mirrors the TOML
@@ -102,9 +98,11 @@ pub fn load(path: Option<&Path>) -> Result<FluxConfig, FluxError> {
     }
 }
 
-/// Apply CLI overrides on top of a `FluxConfig`.  Effects supplied via
-/// `--effect` replace the entire chain (matching §11.1/11.2 usage) and
-/// are normalised from kebab-case to snake_case for registry lookup.
+/// Apply CLI overrides on top of a `FluxConfig`.
+///
+/// Effects, models, and preset selection are NOT routed through this
+/// merger — the preset is named via `--preset` and resolved against
+/// `cfg.presets` directly in `commands::run`.
 ///
 /// # Errors
 ///
@@ -130,27 +128,6 @@ pub fn apply(mut cfg: FluxConfig, overrides: &CliOverrides) -> FluxConfig {
     }
     if let Some(fps) = overrides.fps {
         cfg.input.fps = fps;
-    }
-    if let Some(effect) = &overrides.effect {
-        cfg.effects.chain = vec![normalise_effect_name(effect)];
-    }
-    // `--model PATH` re-targets the segmentation model used by the
-    // composite pipeline. It writes through to `[mask].model`; if the
-    // file config has no `[mask]` section we synthesise a minimal one
-    // so the override is not silently dropped. The composite builder
-    // still requires the operator to supply the rest of the pipeline
-    // (chain, background/foreground sections); `--model` only swaps
-    // the model path.
-    if let Some(model_path) = &overrides.model {
-        match cfg.mask.as_mut() {
-            Some(section) => section.model = Some(model_path.clone()),
-            None => {
-                cfg.mask = Some(PipelineSection {
-                    model: Some(model_path.clone()),
-                    ..PipelineSection::default()
-                });
-            }
-        }
     }
     cfg
 }
@@ -191,27 +168,6 @@ fps = 15
     }
 
     #[test]
-    fn cli_effect_replaces_chain_and_normalises_name() {
-        let file_cfg = FluxConfig::from_toml_str(
-            r#"
-[effects]
-chain = ["color_adjust", "overlay"]
-"#,
-        )
-        .expect("toml parses");
-
-        let merged = apply(
-            file_cfg,
-            &CliOverrides {
-                effect: Some("background-blur".into()),
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(merged.effects.chain, vec!["background_blur".to_string()]);
-    }
-
-    #[test]
     fn cli_input_override_parses_auto_and_testsrc_sentinels() {
         for (raw, expected) in [
             ("auto", InputDevice::Auto),
@@ -247,89 +203,5 @@ chain = ["color_adjust", "overlay"]
         assert_eq!(cfg.input.width, 1280);
         assert_eq!(cfg.input.height, 720);
         assert_eq!(cfg.input.fps, 30);
-    }
-
-    #[test]
-    fn cli_model_overrides_existing_mask_model() {
-        // Pre-existing `[mask]` section: `--model` must replace the
-        // model path while preserving the rest of the section
-        // (chain, sub-tables, fallback_threshold, …).
-        let file_cfg = FluxConfig::from_toml_str(
-            r#"
-[mask]
-model = "/etc/wrong.onnx"
-chain = ["threshold"]
-fallback_threshold = 5
-
-[mask.threshold]
-level = 0.6
-"#,
-        )
-        .expect("toml parses");
-
-        let merged = apply(
-            file_cfg,
-            &CliOverrides {
-                model: Some(PathBuf::from("/tmp/seg.onnx")),
-                ..Default::default()
-            },
-        );
-
-        let mask = merged.mask.expect("mask section survives");
-        assert_eq!(
-            mask.model.as_deref(),
-            Some(std::path::Path::new("/tmp/seg.onnx")),
-            "--model replaced the previous model path",
-        );
-        assert_eq!(
-            mask.chain,
-            vec!["threshold".to_string()],
-            "chain is preserved",
-        );
-        assert_eq!(
-            mask.fallback_threshold,
-            Some(5),
-            "fallback_threshold is preserved",
-        );
-        let threshold = mask
-            .per_effect
-            .get("threshold")
-            .and_then(toml::Value::as_table)
-            .expect("threshold sub-table preserved");
-        assert!(
-            (threshold
-                .get("level")
-                .and_then(toml::Value::as_float)
-                .unwrap()
-                - 0.6)
-                .abs()
-                < 1e-6,
-            "threshold knobs survive the override",
-        );
-    }
-
-    #[test]
-    fn cli_model_synthesises_mask_section_when_absent() {
-        // Without a file-level `[mask]` section the CLI override
-        // creates a minimal one so the model path is not silently
-        // dropped. The synthesised section is otherwise empty — the
-        // operator still owns the chain/background/foreground wiring.
-        let cfg = FluxConfig::default();
-        let overrides = CliOverrides {
-            model: Some(PathBuf::from("/tmp/seg.onnx")),
-            ..Default::default()
-        };
-        let merged = apply(cfg, &overrides);
-        let mask = merged
-            .mask
-            .expect("mask section synthesised by --model override");
-        assert_eq!(
-            mask.model.as_deref(),
-            Some(std::path::Path::new("/tmp/seg.onnx")),
-        );
-        assert!(
-            mask.chain.is_empty(),
-            "synthesised section has empty chain (operator must populate)",
-        );
     }
 }

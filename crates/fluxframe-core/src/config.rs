@@ -496,36 +496,16 @@ impl Default for RealtimeConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Section: effects
-// ---------------------------------------------------------------------------
-
-/// Effect chain plus per-effect parameter tables.
-///
-/// Per-effect tables are kept as `toml::Value` to avoid baking a closed
-/// schema into core; each effect parses its own slice in `configure`.
-///
-/// `deny_unknown_fields` is intentionally NOT applied here — the flattened
-/// `per_effect` map collects every non-`chain` key.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct EffectsConfig {
-    /// Ordered list of effect names to apply (snake_case internal form).
-    #[serde(default)]
-    pub chain: Vec<String>,
-    /// Per-effect parameter tables, keyed by effect name.
-    #[serde(flatten, default)]
-    pub per_effect: BTreeMap<String, toml::Value>,
-}
-
-// ---------------------------------------------------------------------------
-// Section: mask / background / foreground (composite pipeline)
+// Section: pipeline sub-section (composite building block)
 // ---------------------------------------------------------------------------
 
 /// One sub-pipeline section of the composite effect.
 ///
-/// Used for `[mask]`, `[background]`, and `[foreground]` top-level
-/// TOML sections. Each section holds a `chain` of effect names plus
-/// one sub-table per effect with its parameters; the mask section
-/// additionally carries the segmentation model path.
+/// Used for the `mask`, `background`, and `foreground` sub-sections
+/// of a named preset (`[presets.NAME.mask]`, …). Each section holds a
+/// `chain` of effect names plus one sub-table per effect with its
+/// parameters; the mask section additionally carries the segmentation
+/// model path.
 ///
 /// `deny_unknown_fields` is intentionally NOT applied — the flattened
 /// `per_effect` map collects every key that is not one of the
@@ -552,6 +532,41 @@ pub struct PipelineSection {
     /// effect's `configure`.
     #[serde(flatten, default)]
     pub per_effect: BTreeMap<String, toml::Value>,
+}
+
+// ---------------------------------------------------------------------------
+// Section: presets (named composite pipelines)
+// ---------------------------------------------------------------------------
+
+/// One named composite pipeline. Each preset describes up to three
+/// sub-pipelines (`mask`, `background`, `foreground`), all optional.
+///
+/// Selection rules (resolved by the CLI, not by serde):
+///
+/// * `mask` absent — no composite is built; the frame passes through
+///   the pipeline unchanged.
+/// * `mask` present, `background`/`foreground` absent — the
+///   corresponding plane chain is empty (the un-composited plane is
+///   used as-is in the alpha composite).
+///
+/// `deny_unknown_fields` keeps typos in the section name surfaced
+/// loudly. The inner [`PipelineSection`] cannot use it because of
+/// `#[serde(flatten)]` on `per_effect`, but the wrapper has no flatten.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Preset {
+    /// Mask sub-pipeline: segmentation model plus the chain of
+    /// `MaskEffect`s post-processing the confidence mask.
+    #[serde(default)]
+    pub mask: Option<PipelineSection>,
+    /// Background plane sub-pipeline (applied to the background half
+    /// of the alpha composite).
+    #[serde(default)]
+    pub background: Option<PipelineSection>,
+    /// Foreground plane sub-pipeline (applied to the foreground half
+    /// of the alpha composite).
+    #[serde(default)]
+    pub foreground: Option<PipelineSection>,
 }
 
 // ---------------------------------------------------------------------------
@@ -592,22 +607,13 @@ pub struct FluxConfig {
     /// `[realtime]` section.
     #[serde(default)]
     pub realtime: RealtimeConfig,
-    /// `[effects]` section.
+    /// Named composite pipelines. The CLI selects one by name via
+    /// `--preset NAME`; falling back to the preset named `"default"`
+    /// when no flag is given. Empty map is valid at parse time but
+    /// causes a runtime error at preset-resolution if `--preset` is
+    /// invoked (or if no `default` exists for the implicit selection).
     #[serde(default)]
-    pub effects: EffectsConfig,
-    /// `[mask]` section. Presence activates the composite pipeline:
-    /// segmentation → mask chain → background/foreground chains →
-    /// alpha composite.
-    #[serde(default)]
-    pub mask: Option<PipelineSection>,
-    /// `[background]` section. Active only when `[mask]` is set; an
-    /// absent section means "passthrough" (background equals the
-    /// original frame).
-    #[serde(default)]
-    pub background: Option<PipelineSection>,
-    /// `[foreground]` section. Same semantics as `[background]`.
-    #[serde(default)]
-    pub foreground: Option<PipelineSection>,
+    pub presets: BTreeMap<String, Preset>,
     /// `[logging]` section.
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -635,10 +641,6 @@ impl FluxConfig {
     /// declared upper/lower bound (zero dimensions, oversized resolution,
     /// excessive fps, unbounded inflight queue, out-of-range latency).
     pub fn validate(&self) -> Result<(), crate::error::FluxError> {
-        // §13 `chain` is a reserved key for the chain list, not an effect name.
-        // serde's `flatten` cannot enforce this — do it explicitly.
-        const RESERVED_EFFECTS_KEYS: &[&str] = &["chain"];
-
         check_dimensions("input", self.input.width, self.input.height)?;
         check_fps("input", self.input.fps)?;
         // `OutputConfig.scale: OutputScale` is validated at construction
@@ -682,16 +684,6 @@ impl FluxConfig {
             )));
         }
 
-        for key in self.effects.per_effect.keys() {
-            if RESERVED_EFFECTS_KEYS.contains(&key.as_str()) {
-                return Err(crate::error::FluxError::Config {
-                    reason: format!(
-                        "effects.{key} is reserved and cannot be used as an effect name"
-                    ),
-                    hint: Some("rename the effect or use a different key".into()),
-                });
-            }
-        }
         Ok(())
     }
 }

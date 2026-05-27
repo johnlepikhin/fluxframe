@@ -19,7 +19,7 @@ use crate::cli::BenchmarkArgs;
 /// Returns [`FluxError`] when the model file or its sidecar config
 /// cannot be loaded, or when inference fails.
 pub fn run(args: BenchmarkArgs) -> Result<(), FluxError> {
-    let Some(model_path) = args.common.model else {
+    let Some(model_path) = args.model else {
         return Err(FluxError::Config {
             reason: "Stage 3 benchmark requires --model <path>".into(),
             hint: Some("pass --model ./models/<name>.onnx with a sibling .toml config".into()),

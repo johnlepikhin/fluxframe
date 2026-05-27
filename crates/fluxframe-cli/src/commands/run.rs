@@ -13,15 +13,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use fluxframe_core::traits::VideoEffect;
-use fluxframe_core::{FluxConfig, FluxError, InputDevice, normalise_effect_name};
-use fluxframe_effects::EffectChain;
+use fluxframe_core::{FluxConfig, FluxError, InputDevice};
 use tracing::{info, warn};
 
 use crate::cli::RunArgs;
 use crate::config_merge::{CliOverrides, apply, load};
+use crate::preset;
 use crate::runtime::{
-    InputSpec, OutputSpec, classify_input, classify_output, default_registry, ensure_ctrlc_handler,
+    InputSpec, OutputSpec, classify_input, classify_output, ensure_ctrlc_handler,
     is_shutdown_requested, run_testsrc_chain, run_v4l2_chain, wait_for_shutdown,
 };
 
@@ -30,37 +29,43 @@ use crate::runtime::{
 /// # Errors
 ///
 /// Returns a [`FluxError`] when the config file cannot be loaded, the
-/// merged configuration fails validation, the effect chain cannot be
-/// built, or the runtime pipeline fails with an error the auto loop
-/// cannot recover from.
+/// merged configuration fails validation, the requested preset cannot
+/// be resolved or built, or the runtime pipeline fails with an error
+/// the auto loop cannot recover from.
 pub fn run(args: RunArgs) -> Result<(), FluxError> {
     let overrides = CliOverrides {
         input: args.common.input,
         output: args.common.output,
-        effect: args.common.effect,
         width: args.width,
         height: args.height,
         fps: args.fps,
-        model: args.common.model,
     };
 
     let cfg = load(args.common.config.as_deref())?;
     let cfg = apply(cfg, &overrides);
     cfg.validate()?;
 
+    // Resolve the preset once up-front so a misnamed preset fails fast
+    // (before we touch any GStreamer state) and the auto input loop
+    // does not re-enter a doomed configuration on each
+    // device-appearance event. We store the name as `String` so the
+    // borrow does not span the per-iteration `cfg.clone()` in
+    // `run_auto`.
+    let (resolved_name, _preset) = preset::resolve(&cfg, args.preset.as_deref())?;
+    let preset_name = resolved_name.to_string();
     info!(
         input = %cfg.input.device,
         output = %cfg.output.device,
         width = cfg.input.width,
         height = cfg.input.height,
         fps = cfg.input.fps,
-        chain = ?cfg.effects.chain,
+        preset = %preset_name,
         "merged configuration"
     );
 
     match &cfg.input.device {
-        InputDevice::Auto => run_auto(&cfg),
-        _ => run_once(&cfg),
+        InputDevice::Auto => run_auto(&cfg, &preset_name),
+        _ => run_once(&cfg, &preset_name),
     }
 }
 
@@ -74,7 +79,7 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
 /// The wait loop deduplicates log lines so a long stretch with no
 /// candidate device or a recurring transient failure does not flood
 /// the operator's journal (1800 lines / hour at the default 2 s poll).
-fn run_auto(cfg: &FluxConfig) -> Result<(), FluxError> {
+fn run_auto(cfg: &FluxConfig, preset_name: &str) -> Result<(), FluxError> {
     ensure_ctrlc_handler();
     let interval = Duration::from_secs(u64::from(cfg.input.auto.poll_interval_secs.max(1)));
     let exclude = compute_excludes(cfg);
@@ -103,7 +108,7 @@ fn run_auto(cfg: &FluxConfig) -> Result<(), FluxError> {
             info!(device = %path.display(), "auto-input picked");
             let mut resolved = cfg.clone();
             resolved.input.device = InputDevice::Path(path.clone());
-            match run_once(&resolved) {
+            match run_once(&resolved, preset_name) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     if !e.is_transient() {
@@ -137,65 +142,17 @@ fn run_auto(cfg: &FluxConfig) -> Result<(), FluxError> {
     }
 }
 
-/// Build the effect chain from `cfg` and dispatch it to the appropriate
-/// per-backend runtime entry point. One execution; does not poll or retry.
-fn run_once(cfg: &FluxConfig) -> Result<(), FluxError> {
-    let chain_names: Vec<String> = cfg
-        .effects
-        .chain
-        .iter()
-        .map(|n| normalise_effect_name(n))
-        .collect();
-
-    // Build the composite effect from the [mask]/[background]/[foreground]
-    // sections (Stage 9). When present, it is prepended to whatever
-    // `effects.chain` requested so additional filters can run after the
-    // segmented composite.
-    let mut effects: Vec<Box<dyn VideoEffect>> = Vec::new();
-    #[cfg(feature = "ml")]
-    if let Some(mask_section) = cfg.mask.as_ref() {
-        use fluxframe_effects::composite::CompositeBuilder;
-        use fluxframe_effects::{mask_effects, plane_effects};
-        let mask_registry = mask_effects::default_registry();
-        let plane_registry = plane_effects::default_registry();
-        let composite = CompositeBuilder::new(&mask_registry, &plane_registry)
-            .build(
-                mask_section,
-                cfg.background.as_ref(),
-                cfg.foreground.as_ref(),
-            )
-            .map_err(FluxError::from)?;
-        effects.push(Box::new(composite));
-    }
-    #[cfg(not(feature = "ml"))]
-    if cfg.mask.is_some() {
-        return Err(FluxError::Config {
-            reason: "[mask] section present but the binary was built without the `ml` feature; \
-                     rebuild with `--features fluxframe-effects/ml` or remove the [mask] section"
-                .into(),
-            hint: None,
-        });
-    }
-
-    if !chain_names.is_empty() {
-        let registry = default_registry();
-        let standalone = registry
-            .build_chain(&chain_names)
-            .map_err(FluxError::from)?;
-        effects.extend(standalone.into_effects());
-    }
-
-    if effects.is_empty() {
-        return Err(FluxError::Config {
-            reason: "effect chain is empty (no [mask] section and no [effects].chain)".into(),
-            hint: Some(
-                "either configure [mask]/[background] for the composite pipeline or list at \
-                 least one effect under [effects].chain (e.g. passthrough)"
-                    .into(),
-            ),
-        });
-    }
-    let chain = EffectChain::new(effects);
+/// Build the effect chain from the named preset and dispatch it to the
+/// appropriate per-backend runtime entry point. One execution; does
+/// not poll or retry.
+///
+/// Re-resolving the preset on each iteration of `run_auto` keeps the
+/// lifetime contract simple (no `&Preset` borrow spanning the
+/// per-iteration `cfg.clone()`) and the lookup is O(log n) over the
+/// presets map — negligible compared to GStreamer pipeline setup.
+fn run_once(cfg: &FluxConfig, preset_name: &str) -> Result<(), FluxError> {
+    let (name, preset) = preset::resolve(cfg, Some(preset_name))?;
+    let chain = preset::build_chain(name, preset)?;
 
     // Dispatch via `classify_input` so the testsrc-vs-V4L2 triage lives in
     // exactly one place (shared with `commands::check`).  Adding a variant

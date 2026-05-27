@@ -6,13 +6,15 @@ The first production effect is `background_blur`. The architecture is deliberate
 
 ## Status
 
-**Stage 3 — ONNX inference layer in place.** Pipeline runs synthetic
-video (testsrc) or V4L2 capture → effect chain (passthrough) → fakesink,
-v4l2loopback or autovideosink. `fluxframe list` / `fluxframe check`
-verify devices and the effect chain. ONNX Runtime is wired through
-`fluxframe-effects::ml::OnnxEngine`; `fluxframe check --model <path>`
-and `fluxframe benchmark --model <path>` exercise the inference layer.
-The first production effect (`background_blur`) lands in Stage 4.
+**Stage 10 — named-preset config in place.** Pipeline runs synthetic
+video (testsrc) or V4L2 capture → segmented composite (mask + background +
+foreground sub-pipelines) → fakesink, v4l2loopback or autovideosink.
+`fluxframe list` / `fluxframe check` verify devices and the selected
+preset's pipeline. ONNX Runtime is wired through
+`fluxframe-effects::ml::OnnxEngine`; `fluxframe benchmark --model <path>`
+exercises the inference layer in isolation. Composite effects (mask
+post-processing + per-plane filters such as `blur`, `color_fill`,
+`pixelate`) are configured per preset.
 
 ## Build
 
@@ -77,9 +79,72 @@ For other distributions, install `libonnxruntime` (apt: `libonnxruntime-dev`,
 homebrew: `onnxruntime`) and point the variable at the resulting
 `libonnxruntime.so` (or `.dylib` on macOS).
 
-Once set, `fluxframe check --model ./models/<name>.onnx` reports model
-load status, and `fluxframe benchmark --model <path> --duration 5`
-runs an inference-only latency benchmark.
+Once set, `fluxframe check --config fluxframe.toml` reports model
+load status (the model path comes from the selected preset's
+`[presets.NAME.mask] model = "..."` field), and
+`fluxframe benchmark --model <path> --duration 5` runs an
+inference-only latency benchmark.
+
+## Named presets
+
+The composite pipeline is described under `[presets.NAME]` sections in
+the TOML config. Each preset bundles up to three sub-pipelines (all
+optional):
+
+* `[presets.NAME.mask]` — segmentation model plus the chain of
+  mask-effects (`smooth_temporal`, `threshold`, `dilate`, `feather`,
+  `largest_blob`, `invert`, `passthrough`).
+* `[presets.NAME.background]` — plane-effects applied to the
+  background half before alpha-composite (`blur`, `color_fill`,
+  `pixelate`, `passthrough`).
+* `[presets.NAME.foreground]` — same registry as `background`,
+  applied to the foreground half.
+
+Select a preset at runtime with `--preset NAME`. When the flag is
+omitted, the CLI looks up `presets.default` and exits with a
+structured error if it is missing.
+
+```toml
+[presets.blur.mask]
+model = "./models/selfie_segmentation.onnx"
+chain = ["smooth_temporal", "threshold", "feather"]
+
+[presets.blur.mask.threshold]
+level = 0.5
+
+[presets.blur.mask.feather]
+radius = 4
+
+[presets.blur.background]
+chain = ["blur"]
+
+[presets.blur.background.blur]
+radius = 20
+
+[presets.green-screen.mask]
+model = "./models/selfie_segmentation.onnx"
+chain = ["threshold", "dilate"]
+
+[presets.green-screen.background]
+chain = ["color_fill"]
+
+[presets.green-screen.background.color_fill]
+rgb = [0, 255, 0]
+
+# Preset without any sub-section = plain passthrough (no composite).
+[presets.raw]
+```
+
+```bash
+# Run with the blur preset:
+cargo run --release -- run --config fluxframe.toml --preset blur
+
+# Default preset (implicit):
+cargo run --release -- run --config fluxframe.toml
+```
+
+Note: `fluxframe benchmark --model PATH` runs inference-only against the
+supplied model and does not consult presets.
 
 ## Pre-commit
 
@@ -125,9 +190,13 @@ add only the `ml` feature).
 | 1. Passthrough on testsrc | done |
 | 2. Real V4L2 I/O (`list`, `check`, v4l2loopback) | done |
 | 3. Inference layer (`InferenceEngine`, ONNX) | done |
-| 4. `background_blur` effect | planned |
-| 5. Realtime hardening (latency, drop, fallback) | planned |
-| 6. Documentation + release candidate | planned |
+| 4. `background_blur` effect | done |
+| 5. Realtime hardening (latency, drop, fallback) | done |
+| 6. Sticky inference fallback decorator | done |
+| 7. GPU blur backend seam (`wgpu`) | done |
+| 8. OpenVINO inference backend (CPU/NPU) | done |
+| 9. Composite pipeline (mask + bg + fg sub-chains) | done |
+| 10. Named presets in config | done |
 
 ## License
 

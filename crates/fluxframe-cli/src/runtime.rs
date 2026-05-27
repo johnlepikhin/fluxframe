@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::PipelineError;
 use fluxframe_core::{FluxConfig, FluxError, InputDevice};
-use fluxframe_effects::{EffectChain, EffectRegistry, PassthroughEffect};
+use fluxframe_effects::EffectChain;
 use fluxframe_gst::input::{InputParams, InputPipeline};
 use fluxframe_gst::output::{OutputParams, OutputPipeline, OutputSink};
 use fluxframe_gst::{BusEvent, BusListener, BusSource, LatestFrameSlot, WatchedPipeline};
@@ -171,25 +171,6 @@ fn register_token(slot: LatestFrameSlot) -> (TokenGuard, Arc<AtomicBool>) {
         .expect("tokens registry poisoned")
         .push(weak);
     (TokenGuard { token }, flag)
-}
-
-/// Build a registry pre-populated with the standalone effects that
-/// can appear in `[effects].chain`.
-///
-/// The composite effect ([`fluxframe_effects::CompositeEffect`]) is
-/// NOT in this registry — it is built directly from the `[mask]` /
-/// `[background]` / `[foreground]` sections in `commands::run` and
-/// prepended to the chain after the registry-driven part.
-#[must_use]
-pub(crate) fn default_registry() -> EffectRegistry {
-    let mut registry = EffectRegistry::new();
-    registry.register(
-        PassthroughEffect::NAME,
-        Box::new(|| -> Box<dyn fluxframe_core::traits::VideoEffect> {
-            Box::new(PassthroughEffect::new())
-        }),
-    );
-    registry
 }
 
 /// Parsed input source resolved from a [`FluxConfig`].
@@ -398,12 +379,10 @@ where
 
     let (input, output, mut processing_ctx, sink_label) = build_pipelines(cfg, input_builder)?;
     processing_ctx.counters = Some(Arc::clone(&metrics.counters));
-    // Configure must precede prepare: effects parse their per-effect TOML
-    // table here, surface `InvalidConfig` for missing fields (e.g.
-    // `background_blur` requires `model`) before resource acquisition.
-    chain
-        .configure_all(&cfg.effects.per_effect)
-        .map_err(FluxError::from)?;
+    // Per-effect TOML configuration happens inside the composite
+    // builder (preset path) and at construction for [`PassthroughEffect`],
+    // so the runtime only needs to drive `prepare_all` here. The chain
+    // never sees standalone effects with unconfigured state.
     chain
         .prepare_all(&processing_ctx)
         .map_err(FluxError::from)?;

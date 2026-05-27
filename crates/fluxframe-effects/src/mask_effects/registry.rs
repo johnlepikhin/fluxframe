@@ -1,9 +1,9 @@
-//! Name-keyed registry for [`MaskEffect`] factories.
+//! Name-keyed registry for [`MaskEffect`] factories. Twin of
+//! [`crate::plane_effects::PlaneEffectRegistry`] on the mask-plane side.
 //!
-//! Mirrors the structure of [`crate::registry::EffectRegistry`] but
-//! operates on [`MaskEffect`] trait objects. Kept as a separate type
-//! rather than generic-over-trait so call sites stay self-documenting
-//! and the public API does not leak associated types.
+//! Kept as a separate type rather than generic-over-trait so call sites
+//! stay self-documenting and the public API does not leak associated
+//! types.
 
 use std::collections::BTreeMap;
 

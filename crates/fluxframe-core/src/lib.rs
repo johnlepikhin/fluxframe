@@ -18,8 +18,8 @@ pub mod plane;
 pub mod traits;
 
 pub use config::{
-    AutoInputConfig, BackendKind, EffectsConfig, FluxConfig, InputConfig, InputDevice,
-    LoggingConfig, OutputConfig, OutputScale, PipelineSection, RealtimeConfig,
+    AutoInputConfig, BackendKind, FluxConfig, InputConfig, InputDevice, LoggingConfig,
+    OutputConfig, OutputScale, PipelineSection, Preset, RealtimeConfig,
 };
 pub use context::{FrameContext, ProcessingContext, RuntimeState};
 pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineError};
@@ -33,31 +33,9 @@ pub use traits::{
     VideoSink, VideoSource,
 };
 
-/// Normalise an effect name from CLI form (`background-blur`) to internal
-/// registry form (`background_blur`).
-///
-/// This is the single point of truth for the kebab↔snake mapping required
-/// by §14 of the spec, so CLI parsing and config validation never disagree.
-#[must_use]
-pub fn normalise_effect_name(name: &str) -> String {
-    name.replace('-', "_")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn kebab_to_snake_effect_name() {
-        assert_eq!(normalise_effect_name("background-blur"), "background_blur");
-        assert_eq!(normalise_effect_name("passthrough"), "passthrough");
-        assert_eq!(normalise_effect_name("auto-crop"), "auto_crop");
-        assert_eq!(
-            normalise_effect_name("already_snake"),
-            "already_snake",
-            "snake input must be preserved"
-        );
-    }
 
     #[test]
     fn config_parses_minimal_toml() {
@@ -65,9 +43,6 @@ mod tests {
             r#"
 [input]
 device = "/dev/video1"
-
-[effects]
-chain = ["passthrough"]
 "#,
         )
         .expect("minimal toml parses");
@@ -82,7 +57,10 @@ chain = ["passthrough"]
             PixelFormat::Rgb,
             "missing format falls back to RGB"
         );
-        assert_eq!(cfg.effects.chain, vec!["passthrough".to_string()]);
+        assert!(
+            cfg.presets.is_empty(),
+            "no [presets.*] in minimal toml → empty map"
+        );
     }
 
     #[test]
@@ -378,6 +356,133 @@ format = "YUY2"
         )
         .expect("YUY2 format parses");
         assert_eq!(cfg.input.format, PixelFormat::Yuy2);
+    }
+
+    #[test]
+    fn presets_parse_empty_map_when_section_absent() {
+        // No `[presets.*]` in the TOML — the map is empty (a runtime
+        // error at preset-resolution, not a parse error).
+        let cfg = FluxConfig::from_toml_str(
+            r#"
+[input]
+device = "/dev/video1"
+"#,
+        )
+        .expect("parses without presets");
+        assert!(
+            cfg.presets.is_empty(),
+            "missing [presets] table → empty map"
+        );
+    }
+
+    #[test]
+    fn presets_parse_named_subtables() {
+        let cfg = FluxConfig::from_toml_str(
+            r#"
+[presets.default]
+
+[presets.default.mask]
+model = "./models/selfie_segmentation.onnx"
+chain = ["threshold", "feather"]
+fallback_threshold = 3
+
+[presets.default.mask.threshold]
+level = 0.5
+
+[presets.default.background]
+chain = ["blur"]
+
+[presets.default.background.blur]
+radius = 20
+
+[presets.default.foreground]
+chain = ["passthrough"]
+"#,
+        )
+        .expect("named preset parses");
+
+        let preset = cfg.presets.get("default").expect("default preset present");
+        let mask = preset.mask.as_ref().expect("mask sub-section present");
+        assert_eq!(
+            mask.model.as_deref(),
+            Some(std::path::Path::new("./models/selfie_segmentation.onnx"))
+        );
+        assert_eq!(
+            mask.chain,
+            vec!["threshold".to_string(), "feather".to_string()]
+        );
+        assert_eq!(mask.fallback_threshold, Some(3));
+        let threshold = mask
+            .per_effect
+            .get("threshold")
+            .and_then(toml::Value::as_table)
+            .expect("threshold sub-table present");
+        let level = threshold
+            .get("level")
+            .and_then(toml::Value::as_float)
+            .expect("level field present");
+        assert!((level - 0.5).abs() < 1e-6);
+
+        let bg = preset.background.as_ref().expect("background present");
+        assert_eq!(bg.chain, vec!["blur".to_string()]);
+
+        let fg = preset.foreground.as_ref().expect("foreground present");
+        assert_eq!(fg.chain, vec!["passthrough".to_string()]);
+    }
+
+    #[test]
+    fn presets_parse_multiple_named_entries() {
+        let cfg = FluxConfig::from_toml_str(
+            r#"
+[presets.blur]
+[presets.blur.background]
+chain = ["blur"]
+
+[presets.green]
+[presets.green.background]
+chain = ["color_fill"]
+[presets.green.background.color_fill]
+rgb = [0, 255, 0]
+"#,
+        )
+        .expect("two presets parse");
+        assert_eq!(cfg.presets.len(), 2);
+        assert!(cfg.presets.contains_key("blur"));
+        assert!(cfg.presets.contains_key("green"));
+    }
+
+    #[test]
+    fn preset_empty_subsections_are_all_none() {
+        // A preset with no `mask`/`background`/`foreground` keys at
+        // all — useful as the "raw passthrough" preset.
+        let cfg = FluxConfig::from_toml_str(
+            r"
+[presets.raw]
+",
+        )
+        .expect("empty preset parses");
+        let preset = cfg.presets.get("raw").expect("raw preset present");
+        assert!(preset.mask.is_none());
+        assert!(preset.background.is_none());
+        assert!(preset.foreground.is_none());
+    }
+
+    #[test]
+    fn preset_rejects_unknown_top_level_field() {
+        // `deny_unknown_fields` on `Preset` keeps typos like
+        // `forground` (sic) from being silently ignored.
+        let err = FluxConfig::from_toml_str(
+            r#"
+[presets.broken]
+forground = "typo"
+"#,
+        )
+        .expect_err("typo in preset section must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("forground") || msg.contains("unknown"),
+            "diagnostic must point at the typo, got: {msg}"
+        );
     }
 
     #[test]

@@ -29,10 +29,8 @@ pub mod ml;
 pub mod passthrough;
 pub mod plane_effects;
 pub mod processing;
-pub mod registry;
 
 pub use chain::EffectChain;
 #[cfg(feature = "ml")]
 pub use composite::CompositeEffect;
 pub use passthrough::PassthroughEffect;
-pub use registry::{EffectFactory, EffectRegistry};

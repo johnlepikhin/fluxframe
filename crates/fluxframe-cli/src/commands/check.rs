@@ -1,21 +1,20 @@
-//! `fluxframe check` — verify GStreamer init, devices and effect chain.
-//!
-//! Stage 2 implementation: pre-flight checks before `fluxframe run` so
-//! users see structured §27 Error/Hint diagnostics instead of opaque
-//! GStreamer failures.  Required-elements introspection lands in
-//! Stage 5 (needs a helper in `fluxframe-gst`).
+//! `fluxframe check` — verify GStreamer init, devices and the selected
+//! preset's pipeline before `fluxframe run` so users see structured §27
+//! Error/Hint diagnostics instead of opaque GStreamer failures.
 
 use std::path::Path;
 
-use fluxframe_core::{FluxConfig, FluxError, InputDevice, normalise_effect_name};
+use fluxframe_core::{FluxConfig, FluxError, InputDevice, PipelineSection, Preset};
 #[cfg(feature = "ml")]
 use fluxframe_effects::ml::OnnxEngine;
+use fluxframe_effects::{mask_effects, plane_effects};
 use fluxframe_gst::{V4l2DeviceKind, enumerate_devices};
 use tracing::{info, warn};
 
 use crate::cli::CheckArgs;
 use crate::config_merge::{CliOverrides, apply, load};
-use crate::runtime::{InputSpec, OutputSpec, classify_input, classify_output, default_registry};
+use crate::preset;
+use crate::runtime::{InputSpec, OutputSpec, classify_input, classify_output};
 
 /// Entry point for `fluxframe check`.
 ///
@@ -27,14 +26,9 @@ pub fn run(args: CheckArgs) -> Result<(), FluxError> {
     let overrides = CliOverrides {
         input: args.common.input,
         output: args.common.output,
-        effect: args.common.effect,
         width: None,
         height: None,
         fps: None,
-        // Clone because the same `args.common.model` is consulted again
-        // below for the dedicated `check_model_file` pass; moving the
-        // PathBuf here would invalidate that borrow.
-        model: args.common.model.clone(),
     };
     let cfg = load(args.common.config.as_deref())?;
     let cfg = apply(cfg, &overrides);
@@ -51,25 +45,8 @@ pub fn run(args: CheckArgs) -> Result<(), FluxError> {
     if let Err(e) = check_output_device(&cfg) {
         failures.push(e);
     }
-    if let Err(e) = check_effect_chain(&cfg) {
+    if let Err(e) = check_preset(&cfg, args.preset.as_deref()) {
         failures.push(e);
-    }
-    #[cfg(feature = "ml")]
-    if let Some(model) = args.common.model.as_deref() {
-        if let Err(e) = check_model_file(model) {
-            failures.push(e);
-        }
-    }
-    // Without the `ml` feature the `--model` flag is still accepted (it
-    // is still merged into the per-effect config in case a downstream
-    // build re-enables `ml`), but the ONNX-loading pre-flight is a
-    // no-op because `fluxframe_effects::ml` is not compiled in.
-    #[cfg(not(feature = "ml"))]
-    if args.common.model.is_some() {
-        warn!(
-            "--model provided but this build was compiled without the \
-             `ml` feature; skipping ONNX pre-flight check",
-        );
     }
 
     if failures.is_empty() {
@@ -220,26 +197,110 @@ fn warn_if_not_loopback(canonical: &Path) {
     }
 }
 
-fn check_effect_chain(cfg: &FluxConfig) -> Result<(), FluxError> {
-    if cfg.effects.chain.is_empty() {
-        return Err(FluxError::Config {
-            reason: "effect chain is empty".into(),
-            hint: Some("set --effect <name> or fill [effects].chain in the config".into()),
-        });
+/// Validate the preset selected on the command line (or the implicit
+/// [`preset::DEFAULT_PRESET_NAME`] preset).
+///
+/// Checks performed:
+///   1. The named preset exists ([`preset::resolve`]).
+///   2. Every effect name in `mask.chain` is registered in the mask
+///      registry.
+///   3. Every effect name in `background.chain` / `foreground.chain`
+///      is registered in the plane registry.
+///   4. The preset can be turned into an [`EffectChain`]
+///      ([`preset::build_chain`]) — this surfaces the same
+///      feature-gated and bg-without-mask errors that `run` would
+///      raise, so `check` and `run` cannot disagree.
+///   5. (`ml` feature only) The model path referenced by the mask
+///      section exists on disk and loads as an ONNX model.
+///
+/// [`EffectChain`]: fluxframe_effects::EffectChain
+fn check_preset(cfg: &FluxConfig, requested: Option<&str>) -> Result<(), FluxError> {
+    let (name, preset) = preset::resolve(cfg, requested)?;
+
+    // Registry-level effect-name validation lives here (and only here)
+    // because `preset::build_chain` already surfaces these as
+    // `EffectError::UnknownEffect` via the composite builder when a
+    // `[mask]` section is present — but `check` should also reject
+    // unknown names in `[background]`/`[foreground]` chains when no
+    // mask is configured (in which case those sections are config
+    // bugs that `build_chain` rejects, but the operator deserves the
+    // sharper "unknown effect" message first).
+    check_preset_sections(name, preset)?;
+
+    // Surface the same Ok/Err that `run` would see when constructing
+    // its chain.  Catches: mask-without-ml, bg/fg-without-mask, and
+    // composite-builder failures (per-effect TOML, model missing).
+    let _ = preset::build_chain(name, preset)?;
+
+    #[cfg(feature = "ml")]
+    if let Some(mask) = preset.mask.as_ref() {
+        if let Some(model) = mask.model.as_deref() {
+            check_model_file(model)?;
+        }
     }
-    let registry = default_registry();
-    for name in &cfg.effects.chain {
-        let normalised = normalise_effect_name(name);
-        if !registry.contains(&normalised) {
+
+    info!(preset = %name, "preset: ok");
+    Ok(())
+}
+
+/// Validate each effect name appearing in the preset's sub-chains is
+/// known to the corresponding registry.
+fn check_preset_sections(preset_name: &str, preset: &Preset) -> Result<(), FluxError> {
+    let mask_registry = mask_effects::default_registry();
+    let plane_registry = plane_effects::default_registry();
+
+    if let Some(mask) = preset.mask.as_ref() {
+        check_mask_chain(preset_name, mask, &mask_registry)?;
+    }
+    if let Some(bg) = preset.background.as_ref() {
+        check_plane_chain(preset_name, "background", bg, &plane_registry)?;
+    }
+    if let Some(fg) = preset.foreground.as_ref() {
+        check_plane_chain(preset_name, "foreground", fg, &plane_registry)?;
+    }
+    Ok(())
+}
+
+fn check_mask_chain(
+    preset_name: &str,
+    mask: &PipelineSection,
+    registry: &mask_effects::MaskEffectRegistry,
+) -> Result<(), FluxError> {
+    for name in &mask.chain {
+        if !registry.contains(name) {
             return Err(FluxError::Config {
-                reason: format!("effect '{name}' is not registered (normalised to '{normalised}')"),
-                hint: Some(
-                    "available effects: passthrough (Stage 1) — more land in Stage 4".into(),
+                reason: format!(
+                    "preset '{preset_name}': mask chain references unknown effect '{name}'"
                 ),
+                hint: Some(format!(
+                    "available mask effects: {}",
+                    registry.names().join(", "),
+                )),
             });
         }
     }
-    info!(chain = ?cfg.effects.chain, "effect chain: ok");
+    Ok(())
+}
+
+fn check_plane_chain(
+    preset_name: &str,
+    section: &str,
+    plane: &PipelineSection,
+    registry: &plane_effects::PlaneEffectRegistry,
+) -> Result<(), FluxError> {
+    for name in &plane.chain {
+        if !registry.contains(name) {
+            return Err(FluxError::Config {
+                reason: format!(
+                    "preset '{preset_name}': {section} chain references unknown effect '{name}'"
+                ),
+                hint: Some(format!(
+                    "available plane effects: {}",
+                    registry.names().join(", "),
+                )),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -248,7 +309,11 @@ fn check_model_file(path: &Path) -> Result<(), FluxError> {
     if !path.exists() {
         return Err(FluxError::Config {
             reason: format!("model file not found: {}", path.display()),
-            hint: Some("pass --model <path> pointing at a valid ONNX model".into()),
+            hint: Some(
+                "set the `model = \"...\"` field in the preset's [mask] section \
+                 to a valid ONNX path"
+                    .into(),
+            ),
         });
     }
     let config = fluxframe_effects::ml::load_sidecar_or_placeholder(path)?;
@@ -264,30 +329,94 @@ fn check_model_file(path: &Path) -> Result<(), FluxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxframe_core::Preset;
 
-    #[test]
-    fn check_effect_chain_empty_fails() {
-        let mut cfg = FluxConfig::default();
-        cfg.effects.chain.clear();
-        let err = check_effect_chain(&cfg).expect_err("empty chain must fail");
-        let msg = format!("{err}");
-        assert!(msg.contains("empty"), "got: {msg}");
+    fn cfg_with(toml: &str) -> FluxConfig {
+        FluxConfig::from_toml_str(toml).expect("toml parses")
     }
 
     #[test]
-    fn check_effect_chain_unknown_fails() {
-        let mut cfg = FluxConfig::default();
-        cfg.effects.chain = vec!["bogus-effect-name".into()];
-        let err = check_effect_chain(&cfg).expect_err("unknown effect must fail");
+    fn check_preset_fails_when_no_default_and_no_flag() {
+        let cfg = cfg_with("[presets.custom]\n");
+        let err = check_preset(&cfg, None).expect_err("missing default → error");
         let msg = format!("{err}");
-        assert!(msg.contains("bogus"), "got: {msg}");
+        assert!(msg.contains("default"), "got: {msg}");
     }
 
     #[test]
-    fn check_effect_chain_passthrough_ok() {
-        let mut cfg = FluxConfig::default();
-        cfg.effects.chain = vec!["passthrough".into()];
-        check_effect_chain(&cfg).expect("passthrough is registered");
+    fn check_preset_fails_when_named_missing() {
+        let cfg = cfg_with("[presets.default]\n");
+        let err = check_preset(&cfg, Some("nope")).expect_err("missing requested → error");
+        let msg = format!("{err}");
+        assert!(msg.contains("'nope'"), "got: {msg}");
+    }
+
+    #[test]
+    fn check_preset_default_with_empty_sections_passes() {
+        let cfg = cfg_with("[presets.default]\n");
+        check_preset(&cfg, None).expect("empty default preset is valid");
+    }
+
+    #[test]
+    fn check_preset_rejects_unknown_mask_effect() {
+        let cfg = cfg_with(
+            r#"
+[presets.default]
+
+[presets.default.mask]
+model = "/tmp/nonexistent.onnx"
+chain = ["nonexistent_mask_effect"]
+"#,
+        );
+        // We intentionally do not test the model-file branch here —
+        // the chain validation runs before the model existence check,
+        // so the unknown-effect error is what surfaces first.
+        let err = check_preset_sections(
+            "default",
+            cfg.presets.get("default").expect("preset present"),
+        )
+        .expect_err("unknown mask effect must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("nonexistent_mask_effect"), "got: {msg}");
+    }
+
+    #[test]
+    fn check_preset_rejects_unknown_plane_effect() {
+        let cfg = cfg_with(
+            r#"
+[presets.default]
+
+[presets.default.background]
+chain = ["nonexistent_plane_effect"]
+"#,
+        );
+        let err = check_preset_sections(
+            "default",
+            cfg.presets.get("default").expect("preset present"),
+        )
+        .expect_err("unknown plane effect must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("nonexistent_plane_effect"), "got: {msg}");
+    }
+
+    #[test]
+    fn check_preset_accepts_known_effects() {
+        let cfg = cfg_with(
+            r#"
+[presets.default]
+
+[presets.default.background]
+chain = ["blur"]
+
+[presets.default.foreground]
+chain = ["passthrough"]
+"#,
+        );
+        check_preset_sections(
+            "default",
+            cfg.presets.get("default").expect("preset present"),
+        )
+        .expect("blur+passthrough are registered");
     }
 
     #[test]
@@ -307,5 +436,13 @@ mod tests {
         let mut cfg = FluxConfig::default();
         cfg.input.device = InputDevice::Auto;
         check_input_device(&cfg).expect("auto mode never errors at check time");
+    }
+
+    #[test]
+    fn check_preset_sections_with_default_preset_is_noop() {
+        // An empty Preset (no mask/bg/fg) trivially passes — there are
+        // no chains to validate.
+        let preset = Preset::default();
+        check_preset_sections("empty", &preset).expect("empty preset has no chains to validate");
     }
 }

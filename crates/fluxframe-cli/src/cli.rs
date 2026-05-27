@@ -67,12 +67,6 @@ pub struct CommonRunArgs {
     /// Override output device.
     #[arg(long, value_name = "PATH_OR_NAME")]
     pub output: Option<String>,
-    /// Effect to apply (kebab-case, e.g. `background-blur`).
-    #[arg(long, value_name = "NAME")]
-    pub effect: Option<String>,
-    /// Model file to load.
-    #[arg(long, value_name = "PATH")]
-    pub model: Option<PathBuf>,
 }
 
 /// Arguments accepted by `fluxframe check`.
@@ -81,6 +75,10 @@ pub struct CheckArgs {
     /// Arguments shared with `run`/`benchmark`.
     #[command(flatten)]
     pub common: CommonRunArgs,
+    /// Name of the preset to validate. Defaults to `"default"` when
+    /// omitted (mirrors the `run` resolver).
+    #[arg(long, value_name = "NAME")]
+    pub preset: Option<String>,
 }
 
 /// Arguments accepted by `fluxframe run`.
@@ -101,6 +99,10 @@ pub struct RunArgs {
     /// always equals input fps — no `--output-fps` exists.
     #[arg(long, value_name = "RATE")]
     pub fps: Option<u32>,
+    /// Name of the preset to use from the config's `[presets.*]`
+    /// section. When omitted, the resolver looks up `"default"`.
+    #[arg(long, value_name = "NAME")]
+    pub preset: Option<String>,
 }
 
 /// Arguments accepted by `fluxframe benchmark`.
@@ -112,4 +114,8 @@ pub struct BenchmarkArgs {
     /// Benchmark duration in seconds.
     #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_BENCHMARK_SECONDS)]
     pub duration: u32,
+    /// ONNX model to benchmark. Benchmark runs inference-only against
+    /// this file; no preset is consulted.
+    #[arg(long, value_name = "PATH")]
+    pub model: Option<PathBuf>,
 }
