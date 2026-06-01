@@ -153,7 +153,7 @@ fn build_passthrough_chain(name: &str) -> EffectChain {
 #[cfg(feature = "ml")]
 fn build_composite_chain(name: &str, preset: &Preset) -> Result<EffectChain, FluxError> {
     use fluxframe_effects::composite::CompositeBuilder;
-    use fluxframe_effects::{mask_effects, plane_effects};
+    use fluxframe_effects::{mask_effects, plane_effects, post_effects};
 
     // Unwrap is safe: `build_chain` only calls this branch after the
     // `preset.mask.is_some()` check.
@@ -163,11 +163,13 @@ fn build_composite_chain(name: &str, preset: &Preset) -> Result<EffectChain, Flu
         .expect("build_composite_chain called without a [mask] section");
     let mask_registry = mask_effects::default_registry();
     let plane_registry = plane_effects::default_registry();
-    let composite = CompositeBuilder::new(&mask_registry, &plane_registry)
+    let post_registry = post_effects::default_registry();
+    let composite = CompositeBuilder::new(&mask_registry, &plane_registry, &post_registry)
         .build(
             mask_section,
             preset.background.as_ref(),
             preset.foreground.as_ref(),
+            preset.post.as_ref(),
         )
         .map_err(FluxError::from)?;
     info!(

@@ -13,12 +13,12 @@ name = "fluxframe"
 path = "src/main.rs"
 
 [features]
-# Forward the `ml` feature from `fluxframe-effects` so the CLI's own
-# `--no-default-features` build still has a way to opt back in without
-# editing this manifest.  Enabled by default so a stock
-# `cargo build -p fluxframe-cli` keeps the full effect catalogue.
-default = ["ml"]
+# Forward features from `fluxframe-effects` so the CLI binary
+# default-builds the full effect catalogue. Slim builds opt out per
+# feature, mirroring the layering in `fluxframe-effects` itself.
+default = ["ml", "image-fill"]
 ml = ["fluxframe-effects/ml"]
+image-fill = ["fluxframe-effects/image-fill"]
 
 [dependencies]
 fluxframe-core = { workspace = true }

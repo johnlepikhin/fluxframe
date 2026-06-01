@@ -27,10 +27,16 @@ description = "Effect registry, effect chain runtime and built-in effects for Fl
 # the OpenVINO runtime is unreachable.  Disable with
 # `--no-default-features` for slim builds that don't ship the
 # OpenVINO stack.
-default = ["ml", "wgpu", "openvino"]
+default = ["ml", "wgpu", "openvino", "image-fill"]
 ml = ["dep:ort"]
 wgpu = ["dep:wgpu", "dep:pollster"]
 openvino = ["dep:openvino"]
+# `image-fill` gates the `ImageFillEffect` plane effect and its
+# helpers in `processing::fit`.  The optional `image` decoder lives
+# behind this knob so a slim build (`--no-default-features`) drops
+# the ~150 KB PNG/JPEG pipeline entirely.  Default-on so the standard
+# binary keeps the full preset vocabulary.
+image-fill = ["dep:image"]
 
 [dependencies]
 fluxframe-core = { workspace = true }
@@ -52,6 +58,18 @@ pollster = { workspace = true, optional = true }
 # backend.  Off by default; enable with `--features openvino` and
 # point `LD_LIBRARY_PATH` at a pip-installed OpenVINO runtime.
 openvino = { workspace = true, optional = true }
+# `image` (Stage 11) — PNG/JPEG decoder for the `image_fill` plane
+# effect.  Feature-gated behind `image-fill` (default-on) so a slim
+# build (`--no-default-features`) drops the decoder entirely.
+# `default-features = false` at the workspace dep level keeps only
+# `jpeg` + `png` codecs in the transitive footprint (~150 KB).
+image = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `tempfile` is used by the `image_fill` tests to round-trip a tiny
+# synthetic PNG/JPEG through the decoder without polluting the repo
+# with fixture binaries.
+tempfile = "3"
 
 [lints]
 workspace = true

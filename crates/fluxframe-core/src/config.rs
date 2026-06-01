@@ -567,6 +567,13 @@ pub struct Preset {
     /// of the alpha composite).
     #[serde(default)]
     pub foreground: Option<PipelineSection>,
+    /// Post-composite sub-pipeline of mask-aware frame-level effects.
+    /// Runs inside `CompositeEffect` immediately after
+    /// `alpha_composite_rgb_in_place`. Requires `mask` to be present
+    /// — otherwise validation fails (the post chain has nothing to
+    /// look at).
+    #[serde(default)]
+    pub post: Option<PipelineSection>,
 }
 
 // ---------------------------------------------------------------------------

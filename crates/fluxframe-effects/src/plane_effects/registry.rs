@@ -98,8 +98,11 @@ impl PlaneEffectRegistry {
 /// Build a registry pre-populated with the built-in plane effects.
 #[must_use]
 pub fn default_registry() -> PlaneEffectRegistry {
+    #[cfg(feature = "image-fill")]
+    use crate::plane_effects::ImageFillEffect;
     use crate::plane_effects::{
-        BlurPlaneEffect, ColorFillEffect, PassthroughPlaneEffect, PixelateEffect,
+        BlurPlaneEffect, ColorFillEffect, ExposureCorrectEffect, PassthroughPlaneEffect,
+        PixelateEffect, SharpenEffect, VignetteEffect,
     };
     let mut registry = PlaneEffectRegistry::new();
     registry.register(
@@ -118,6 +121,23 @@ pub fn default_registry() -> PlaneEffectRegistry {
         PixelateEffect::NAME,
         Box::new(|| -> Box<dyn PlaneEffect> { Box::new(PixelateEffect::new()) }),
     );
+    registry.register(
+        SharpenEffect::NAME,
+        Box::new(|| -> Box<dyn PlaneEffect> { Box::new(SharpenEffect::new()) }),
+    );
+    registry.register(
+        VignetteEffect::NAME,
+        Box::new(|| -> Box<dyn PlaneEffect> { Box::new(VignetteEffect::new()) }),
+    );
+    registry.register(
+        ExposureCorrectEffect::NAME,
+        Box::new(|| -> Box<dyn PlaneEffect> { Box::new(ExposureCorrectEffect::new()) }),
+    );
+    #[cfg(feature = "image-fill")]
+    registry.register(
+        ImageFillEffect::NAME,
+        Box::new(|| -> Box<dyn PlaneEffect> { Box::new(ImageFillEffect::new()) }),
+    );
     registry
 }
 
@@ -133,6 +153,11 @@ mod tests {
         assert!(names.contains(&"color_fill"));
         assert!(names.contains(&"passthrough"));
         assert!(names.contains(&"pixelate"));
+        assert!(names.contains(&"sharpen"));
+        assert!(names.contains(&"vignette"));
+        assert!(names.contains(&"exposure_correct"));
+        #[cfg(feature = "image-fill")]
+        assert!(names.contains(&"image_fill"));
     }
 
     #[test]

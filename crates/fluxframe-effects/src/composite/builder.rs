@@ -21,6 +21,7 @@ use crate::composite::effect::CompositeEffect;
 use crate::composite::segmentation::{SegmentationBase, SegmentationConfig};
 use crate::mask_effects::MaskEffectRegistry;
 use crate::plane_effects::PlaneEffectRegistry;
+use crate::post_effects::PostEffectRegistry;
 
 /// Default consecutive-failure threshold before the segmentation
 /// engine flips to its fallback strategy. Mirrors the value exported
@@ -37,14 +38,19 @@ const DEFAULT_FALLBACK_THRESHOLD: u32 = 3;
 pub struct CompositeBuilder<'a> {
     mask: &'a MaskEffectRegistry,
     plane: &'a PlaneEffectRegistry,
+    post: &'a PostEffectRegistry,
 }
 
 impl<'a> CompositeBuilder<'a> {
     /// Construct from the registries that supply the effect
     /// implementations.
     #[must_use]
-    pub fn new(mask: &'a MaskEffectRegistry, plane: &'a PlaneEffectRegistry) -> Self {
-        Self { mask, plane }
+    pub fn new(
+        mask: &'a MaskEffectRegistry,
+        plane: &'a PlaneEffectRegistry,
+        post: &'a PostEffectRegistry,
+    ) -> Self {
+        Self { mask, plane, post }
     }
 
     /// Assemble the composite effect.
@@ -54,7 +60,9 @@ impl<'a> CompositeBuilder<'a> {
     /// is empty — for the background that means "use the original
     /// frame as the background" (no per-pixel transform applied
     /// before the alpha composite), and for the foreground it means
-    /// the original frame stays as the foreground.
+    /// the original frame stays as the foreground. `post` is the
+    /// mask-aware post-composite chain (`auto_frame`, …); `None`
+    /// means an empty chain.
     ///
     /// # Errors
     ///
@@ -66,6 +74,7 @@ impl<'a> CompositeBuilder<'a> {
         mask: &PipelineSection,
         background: Option<&PipelineSection>,
         foreground: Option<&PipelineSection>,
+        post: Option<&PipelineSection>,
     ) -> Result<CompositeEffect, EffectError> {
         let segmentation = build_segmentation(mask)?;
         let mask_chain = build_mask_chain(self.mask, mask)?;
@@ -77,11 +86,16 @@ impl<'a> CompositeBuilder<'a> {
             Some(section) => build_plane_chain(self.plane, section, "foreground")?,
             None => Vec::new(),
         };
+        let post_chain = match post {
+            Some(section) => build_post_chain(self.post, section)?,
+            None => Vec::new(),
+        };
         Ok(CompositeEffect::new(
             segmentation,
             mask_chain,
             bg_chain,
             fg_chain,
+            post_chain,
         ))
     }
 }
@@ -145,6 +159,22 @@ fn build_plane_chain(
     Ok(chain)
 }
 
+fn build_post_chain(
+    registry: &PostEffectRegistry,
+    section: &PipelineSection,
+) -> Result<Vec<Box<dyn fluxframe_core::plane::PostEffect>>, EffectError> {
+    reject_unknown_table_keys(&section.per_effect, &section.chain, "post")?;
+    let mut chain = registry.build_chain(&section.chain)?;
+    for (effect, name) in chain.iter_mut().zip(section.chain.iter()) {
+        if let Some(params) = section.per_effect.get(name).cloned() {
+            effect.configure(params)?;
+        } else {
+            effect.configure(toml::Value::Table(toml::map::Map::new()))?;
+        }
+    }
+    Ok(chain)
+}
+
 /// Every key in `per_effect` must either be in `chain` or be one of
 /// the reserved control fields. Catches operator typos like
 /// `[mask.threhold]` (missing s) at startup instead of letting the
@@ -191,6 +221,7 @@ mod tests {
     use super::*;
     use crate::mask_effects::default_registry as default_mask_registry;
     use crate::plane_effects::default_registry as default_plane_registry;
+    use crate::post_effects::default_registry as default_post_registry;
     use fluxframe_core::traits::VideoEffect;
 
     fn parse(section_toml: &str) -> PipelineSection {
@@ -291,8 +322,11 @@ rgb = [0, 120, 215]
         );
         let mask_reg = default_mask_registry();
         let plane_reg = default_plane_registry();
-        let builder = CompositeBuilder::new(&mask_reg, &plane_reg);
-        let composite = builder.build(&mask, Some(&background), None).expect("ok");
+        let post_reg = default_post_registry();
+        let builder = CompositeBuilder::new(&mask_reg, &plane_reg, &post_reg);
+        let composite = builder
+            .build(&mask, Some(&background), None, None)
+            .expect("ok");
         // `composite.name()` is the stable identifier — confirm the
         // constructor wired through.
         assert_eq!(composite.name(), CompositeEffect::NAME);

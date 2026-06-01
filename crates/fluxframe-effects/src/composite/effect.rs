@@ -11,7 +11,7 @@
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
 use fluxframe_core::frame::{PixelFormat, VideoFrame};
-use fluxframe_core::plane::{FramePlane, MaskEffect, MaskPlane, PlaneEffect};
+use fluxframe_core::plane::{FramePlane, MaskEffect, MaskPlane, PlaneEffect, PostEffect};
 use fluxframe_core::traits::{RawEffectParams, VideoEffect};
 use tracing::trace;
 
@@ -51,6 +51,9 @@ pub struct CompositeEffect {
     mask_chain: Vec<Box<dyn MaskEffect>>,
     bg_chain: Vec<Box<dyn PlaneEffect>>,
     fg_chain: Vec<Box<dyn PlaneEffect>>,
+    /// Post-composite mask-aware chain. Each effect sees the already-
+    /// blended frame plus a read-only view of the upscaled mask.
+    post_chain: Vec<Box<dyn PostEffect>>,
     /// Mask at frame resolution after the implicit bilinear upscale.
     mask_full: Vec<f32>,
     /// Frame-sized scratch holding the background plane through the
@@ -72,12 +75,14 @@ impl CompositeEffect {
         mask_chain: Vec<Box<dyn MaskEffect>>,
         bg_chain: Vec<Box<dyn PlaneEffect>>,
         fg_chain: Vec<Box<dyn PlaneEffect>>,
+        post_chain: Vec<Box<dyn PostEffect>>,
     ) -> Self {
         Self {
             segmentation,
             mask_chain,
             bg_chain,
             fg_chain,
+            post_chain,
             mask_full: Vec::new(),
             bg_plane: Vec::new(),
             frame_w: 0,
@@ -114,6 +119,9 @@ impl VideoEffect for CompositeEffect {
             effect.prepare(context)?;
         }
         for effect in &mut self.fg_chain {
+            effect.prepare(context)?;
+        }
+        for effect in &mut self.post_chain {
             effect.prepare(context)?;
         }
 
@@ -216,9 +224,29 @@ impl VideoEffect for CompositeEffect {
             alpha_composite_rgb_in_place(frame_bytes, &self.bg_plane, &self.mask_full);
         });
 
+        // 9. Post chain. Each post-effect mutates the composed frame
+        //    while reading the upscaled mask. Split-borrow so the
+        //    mask buffer can be passed as `&MaskPlane` without
+        //    clashing with `&mut self.post_chain`.
+        let (post_result, post_us) = timed(|| -> Result<(), EffectError> {
+            let mut composed = FramePlane::new(frame_bytes, self.frame_w, self.frame_h);
+            let mask_plane = MaskPlane::new(&mut self.mask_full, self.frame_w, self.frame_h);
+            for effect in &mut self.post_chain {
+                effect.process(&mut composed, &mask_plane, ctx)?;
+            }
+            Ok(())
+        });
+        post_result?;
+
         trace!(
             frame_seq = frame.meta.sequence,
-            seg_us, mask_us, fg_us, bg_us, compose_us, "composite per-stage timings",
+            seg_us,
+            mask_us,
+            fg_us,
+            bg_us,
+            compose_us,
+            post_us,
+            "composite per-stage timings",
         );
         Ok(())
     }

@@ -96,9 +96,17 @@ optional):
   `largest_blob`, `invert`, `passthrough`).
 * `[presets.NAME.background]` — plane-effects applied to the
   background half before alpha-composite (`blur`, `color_fill`,
-  `pixelate`, `passthrough`).
+  `pixelate`, `passthrough`, `sharpen`, `vignette`, `exposure_correct`,
+  `image_fill`).
 * `[presets.NAME.foreground]` — same registry as `background`,
-  applied to the foreground half.
+  applied to the foreground half. Typical foreground use cases are
+  `sharpen` (crisper face on cheap webcams) and `exposure_correct`
+  (lift dark faces in backlit scenes).
+* `[presets.NAME.post]` — mask-aware frame-level chain run after the
+  alpha-composite step. Effects here see the already-blended frame
+  plus a read-only view of the upscaled mask. Available post-effects:
+  `passthrough`, `auto_frame` (smart-crop + recenter around the
+  detected person). Requires `[mask]` to be set.
 
 Select a preset at runtime with `--preset NAME`. When the flag is
 omitted, the CLI looks up `presets.default` and exits with a
@@ -135,12 +143,59 @@ rgb = [0, 255, 0]
 [presets.raw]
 ```
 
+A "work-call" preset combining the typical fixes for cheap webcams —
+exposure correction + light sharpening on the speaker, branded
+background photo with a soft vignette behind:
+
+```toml
+[presets.work.mask]
+model = "./models/selfie_segmentation.onnx"
+chain = ["smooth_temporal", "threshold", "feather"]
+
+[presets.work.background]
+chain = ["image_fill", "vignette"]
+[presets.work.background.image_fill]
+path = "./assets/office-bg.jpg"
+fit = "cover"
+[presets.work.background.vignette]
+strength = 0.3
+
+[presets.work.foreground]
+chain = ["exposure_correct", "sharpen"]
+[presets.work.foreground.exposure_correct]
+target_brightness = 0.55
+[presets.work.foreground.sharpen]
+amount = 0.3
+```
+
 ```bash
 # Run with the blur preset:
 cargo run --release -- run --config fluxframe.toml --preset blur
 
 # Default preset (implicit):
 cargo run --release -- run --config fluxframe.toml
+```
+
+A preset using the post chain for auto-framing on top of the same
+stack:
+
+```toml
+[presets.framed.mask]
+model = "./models/selfie_segmentation.onnx"
+chain = ["smooth_temporal", "threshold", "feather"]
+
+[presets.framed.background]
+chain = ["blur"]
+[presets.framed.background.blur]
+radius = 20
+
+[presets.framed.post]
+chain = ["auto_frame"]
+[presets.framed.post.auto_frame]
+threshold = 0.5
+padding = 0.15
+smoothing = 0.85    # EMA inertia — higher = less jitter, slower response
+zoom_max = 1.6      # 1.0 disables, 1.6 = mild zoom for office scenes
 ```
 
 Note: `fluxframe benchmark --model PATH` runs inference-only against the

@@ -28,6 +28,8 @@ pub mod mask_effects;
 pub mod ml;
 pub mod passthrough;
 pub mod plane_effects;
+#[cfg(feature = "ml")]
+pub mod post_effects;
 pub mod processing;
 
 pub use chain::EffectChain;

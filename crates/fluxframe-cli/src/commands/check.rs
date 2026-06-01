@@ -8,6 +8,8 @@ use fluxframe_core::{FluxConfig, FluxError, InputDevice, PipelineSection, Preset
 #[cfg(feature = "ml")]
 use fluxframe_effects::ml::OnnxEngine;
 use fluxframe_effects::{mask_effects, plane_effects};
+#[cfg(feature = "ml")]
+use fluxframe_effects::post_effects;
 use fluxframe_gst::{V4l2DeviceKind, enumerate_devices};
 use tracing::{info, warn};
 
@@ -258,6 +260,29 @@ fn check_preset_sections(preset_name: &str, preset: &Preset) -> Result<(), FluxE
     if let Some(fg) = preset.foreground.as_ref() {
         check_plane_chain(preset_name, "foreground", fg, &plane_registry)?;
     }
+    if let Some(post) = preset.post.as_ref() {
+        // Post-effects are mask-aware — a preset that declares a
+        // `[post]` chain without a `[mask]` section is a config bug
+        // that the runtime would surface later with a less specific
+        // message. Catch it here.
+        if preset.mask.is_none() {
+            return Err(FluxError::Config {
+                reason: format!(
+                    "preset '{preset_name}' has a [post] chain but no [mask] section"
+                ),
+                hint: Some(
+                    "post-effects require a mask; either add a [mask] section or \
+                     remove the [post] chain"
+                        .into(),
+                ),
+            });
+        }
+        #[cfg(feature = "ml")]
+        {
+            let post_registry = post_effects::default_registry();
+            check_post_chain(preset_name, post, &post_registry)?;
+        }
+    }
     Ok(())
 }
 
@@ -296,6 +321,28 @@ fn check_plane_chain(
                 ),
                 hint: Some(format!(
                     "available plane effects: {}",
+                    registry.names().join(", "),
+                )),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ml")]
+fn check_post_chain(
+    preset_name: &str,
+    post: &PipelineSection,
+    registry: &post_effects::PostEffectRegistry,
+) -> Result<(), FluxError> {
+    for name in &post.chain {
+        if !registry.contains(name) {
+            return Err(FluxError::Config {
+                reason: format!(
+                    "preset '{preset_name}': post chain references unknown effect '{name}'"
+                ),
+                hint: Some(format!(
+                    "available post effects: {}",
                     registry.names().join(", "),
                 )),
             });

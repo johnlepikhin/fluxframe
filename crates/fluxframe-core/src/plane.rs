@@ -224,6 +224,73 @@ pub trait PlaneEffect: Send {
     }
 }
 
+/// Mask-aware frame-level effect, executed inside the composite
+/// pipeline AFTER the alpha-composite step.
+///
+/// Post-effects receive the already-blended [`FramePlane`] (mutable)
+/// plus a read-only view of the frame-resolution mask. The mask
+/// resolution matches the frame, so a post-effect can pair pixel
+/// coordinates one-to-one. Typical implementations crop/translate the
+/// frame based on the mask's bounding box (`auto_frame`), apply
+/// motion-stabilisation against the mask centroid, or paint
+/// mask-aware overlays.
+///
+/// Post-effects MUST NOT change the frame dimensions — the GStreamer
+/// sink negotiated a fixed size at startup. Cropping is implemented
+/// by upscaling the cropped region back to the original `(width,
+/// height)` (see `processing::resize_rgb_bilinear`).
+///
+/// Subsequent post-effects in the same chain see the result of
+/// preceding ones (same in-place mutation semantics as
+/// [`PlaneEffect`]). The mask itself is never mutated by the chain.
+///
+/// Lifecycle and threading mirror [`MaskEffect`] / [`PlaneEffect`].
+pub trait PostEffect: Send {
+    /// Stable identifier used by the registry and config (`snake_case`).
+    fn name(&self) -> &'static str;
+
+    /// Apply user-supplied configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EffectError::InvalidConfig`] on a malformed payload.
+    fn configure(&mut self, params: RawEffectParams) -> Result<(), EffectError>;
+
+    /// Allocate scratch and load resources at the negotiated
+    /// resolution. Post-effects always run at frame resolution — the
+    /// composite hands the original frame's `(width, height)` through
+    /// `context`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EffectError::PrepareFailed`] on resource acquisition
+    /// failure.
+    fn prepare(&mut self, context: &ProcessingContext) -> Result<(), EffectError>;
+
+    /// Transform `plane` in place using `mask` as read-only context.
+    /// Must not block on I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EffectError::ProcessFailed`] on a transient backend
+    /// failure or a dimension mismatch.
+    fn process(
+        &mut self,
+        plane: &mut FramePlane<'_>,
+        mask: &MaskPlane<'_>,
+        context: &mut FrameContext,
+    ) -> Result<(), EffectError>;
+
+    /// Release runtime resources. Default is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EffectError`] if teardown fails.
+    fn shutdown(&mut self) -> Result<(), EffectError> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

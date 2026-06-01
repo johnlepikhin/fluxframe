@@ -27,7 +27,7 @@ pub use frame::{FrameBuffer, FrameMeta, PixelFormat, Timestamp, VideoFrame};
 pub use metrics::{
     CounterValues, Counters, EffectTelemetry, LatencyHistogram, LatencySnapshot, MetricsSnapshot,
 };
-pub use plane::{FramePlane, MaskEffect, MaskPlane, PlaneEffect};
+pub use plane::{FramePlane, MaskEffect, MaskPlane, PlaneEffect, PostEffect};
 pub use traits::{
     InferenceEngine, InferenceInput, InferenceOutput, ModelInfo, RawEffectParams, VideoEffect,
     VideoSink, VideoSource,
