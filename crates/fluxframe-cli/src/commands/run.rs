@@ -64,8 +64,8 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
     );
 
     match &cfg.input.device {
-        InputDevice::Auto => run_auto(&cfg, &preset_name),
-        _ => run_once(&cfg, &preset_name),
+        InputDevice::Auto => run_auto(&cfg, &preset_name, args.common.config.as_deref()),
+        _ => run_once(&cfg, &preset_name, args.common.config.as_deref()),
     }
 }
 
@@ -79,7 +79,11 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
 /// The wait loop deduplicates log lines so a long stretch with no
 /// candidate device or a recurring transient failure does not flood
 /// the operator's journal (1800 lines / hour at the default 2 s poll).
-fn run_auto(cfg: &FluxConfig, preset_name: &str) -> Result<(), FluxError> {
+fn run_auto(
+    cfg: &FluxConfig,
+    preset_name: &str,
+    config_path: Option<&std::path::Path>,
+) -> Result<(), FluxError> {
     ensure_ctrlc_handler();
     let interval = Duration::from_secs(u64::from(cfg.input.auto.poll_interval_secs.max(1)));
     let exclude = compute_excludes(cfg);
@@ -108,7 +112,7 @@ fn run_auto(cfg: &FluxConfig, preset_name: &str) -> Result<(), FluxError> {
             info!(device = %path.display(), "auto-input picked");
             let mut resolved = cfg.clone();
             resolved.input.device = InputDevice::Path(path.clone());
-            match run_once(&resolved, preset_name) {
+            match run_once(&resolved, preset_name, config_path) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     if !e.is_transient() {
@@ -150,7 +154,11 @@ fn run_auto(cfg: &FluxConfig, preset_name: &str) -> Result<(), FluxError> {
 /// lifetime contract simple (no `&Preset` borrow spanning the
 /// per-iteration `cfg.clone()`) and the lookup is O(log n) over the
 /// presets map — negligible compared to GStreamer pipeline setup.
-fn run_once(cfg: &FluxConfig, preset_name: &str) -> Result<(), FluxError> {
+fn run_once(
+    cfg: &FluxConfig,
+    preset_name: &str,
+    config_path: Option<&std::path::Path>,
+) -> Result<(), FluxError> {
     let (name, preset) = preset::resolve(cfg, Some(preset_name))?;
     let chain = preset::build_chain(name, preset)?;
 
@@ -159,8 +167,8 @@ fn run_once(cfg: &FluxConfig, preset_name: &str) -> Result<(), FluxError> {
     // to `InputSpec` turns this into a compile error and prompts the
     // developer to teach the dispatch about it.
     match classify_input(cfg) {
-        InputSpec::Testsrc => run_testsrc_chain(cfg, chain),
-        InputSpec::V4l2(_) => run_v4l2_chain(cfg, chain),
+        InputSpec::Testsrc => run_testsrc_chain(cfg, name, config_path, chain),
+        InputSpec::V4l2(_) => run_v4l2_chain(cfg, name, config_path, chain),
         InputSpec::Unsupported(d) => Err(FluxError::Config {
             reason: format!("input '{d}' is not supported"),
             hint: Some("supported inputs: testsrc, /dev/video* (V4L2)".into()),

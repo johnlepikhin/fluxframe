@@ -378,4 +378,29 @@ mod tests {
             other => panic!("expected ProcessFailed, got {other:?}"),
         }
     }
+
+    #[test]
+    fn configure_after_prepare_is_safe() {
+        // Live-reconfig contract (Stage 13): `configure()` is re-callable
+        // after `prepare()`. Verify the next `process()` reflects the
+        // new `amount` without panicking.
+        let mut effect = SharpenEffect::new();
+        effect
+            .configure(toml::from_str("amount = 0.0").unwrap())
+            .expect("configure 1");
+        run(&mut effect, &mut [128u8; 4 * 4 * 3].to_vec(), 4, 4);
+
+        effect
+            .configure(toml::from_str("amount = 1.5").unwrap())
+            .expect("re-configure ok");
+        // Edge case: 4×1 contrast bump exercised in the existing
+        // `sharpening_increases_contrast_on_edge` test. Here we only
+        // verify the re-configure path does not panic and process()
+        // runs against the same prepared scratch.
+        let mut data = vec![100u8; 4 * 4 * 3];
+        let mut plane = FramePlane::new(&mut data, 4, 4);
+        let mut ctx = FrameContext::default();
+        effect.process(&mut plane, &mut ctx).expect("process ok");
+        assert!((effect.config.amount - 1.5).abs() < 1e-6);
+    }
 }

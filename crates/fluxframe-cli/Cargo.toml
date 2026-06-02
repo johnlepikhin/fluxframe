@@ -29,7 +29,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
+crossbeam-channel = { workspace = true }
 ctrlc = { workspace = true }
 # Rayon's global thread pool defaults to `available_parallelism()`,
 # which on many-core machines saturates every CPU during the parallel

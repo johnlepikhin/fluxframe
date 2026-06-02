@@ -577,6 +577,32 @@ pub struct Preset {
 }
 
 // ---------------------------------------------------------------------------
+// Section: control (live-reconfig socket)
+// ---------------------------------------------------------------------------
+
+/// Control-socket configuration (`[control]` table). Drives the UNIX
+/// socket used for live reconfiguration (Stage 13). Disabled by
+/// default — operators must opt in explicitly because the socket is a
+/// new (local-only) surface.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlConfig {
+    /// Enable the listener. Default `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Override the socket path. `None` (default) derives the path
+    /// from `$XDG_RUNTIME_DIR/fluxframe.sock`, falling back to
+    /// `/tmp/fluxframe.sock` when `$XDG_RUNTIME_DIR` is unset. Mode
+    /// `0600` is applied race-free (bind into a sibling temp path,
+    /// chmod, then atomic rename), so other local users on a shared
+    /// host cannot connect. Multi-user hosts that share `/tmp`
+    /// should set this explicitly — e.g.
+    /// `socket_path = "/run/user/$UID/fluxframe.sock"`.
+    #[serde(default)]
+    pub socket_path: Option<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
 // Section: logging
 // ---------------------------------------------------------------------------
 
@@ -624,6 +650,10 @@ pub struct FluxConfig {
     /// `[logging]` section.
     #[serde(default)]
     pub logging: LoggingConfig,
+    /// `[control]` section. Enables the UNIX-socket live-reconfig
+    /// surface (Stage 13). Disabled by default — opt-in feature.
+    #[serde(default)]
+    pub control: ControlConfig,
 }
 
 impl FluxConfig {

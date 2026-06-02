@@ -437,8 +437,9 @@ mod tests {
         // `Wgpu` override must surface as a hard error rather than
         // silently falling back to CPU.
         let overrides = BackendOverrides::default().with_blur(BlurBackendChoice::Wgpu);
-        let err =
-            build_blur_backend(overrides, None).expect_err("must hard-error without wgpu feature");
+        let Err(err) = build_blur_backend(overrides, None) else {
+            panic!("must hard-error without wgpu feature");
+        };
         let msg = format!("{err}").to_lowercase();
         assert!(msg.contains("wgpu") || msg.contains("feature"));
     }

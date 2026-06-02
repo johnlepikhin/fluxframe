@@ -172,13 +172,8 @@ fn composite_alpha_composites_foreground_over_background_fill() {
     bg_color.configure(params).expect("configure ok");
     let bg_chain: Vec<Box<dyn PlaneEffect>> = vec![Box::new(bg_color)];
 
-    let mut composite = CompositeEffect::new(
-        segmentation,
-        Vec::new(),
-        bg_chain,
-        Vec::new(),
-        Vec::new(),
-    );
+    let mut composite =
+        CompositeEffect::new(segmentation, Vec::new(), bg_chain, Vec::new(), Vec::new());
 
     // ProcessingContext at 2×2 RGB — matches the mock's mask resolution
     // so no resize is actually exercised on the mask side (the bilinear

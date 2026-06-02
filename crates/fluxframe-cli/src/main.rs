@@ -14,6 +14,7 @@ use tracing::error;
 mod cli;
 mod commands;
 mod config_merge;
+mod control;
 mod logging;
 mod metrics_reporter;
 mod preset;

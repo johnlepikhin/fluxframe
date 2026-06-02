@@ -201,6 +201,57 @@ zoom_max = 1.6      # 1.0 disables, 1.6 = mild zoom for office scenes
 Note: `fluxframe benchmark --model PATH` runs inference-only against the
 supplied model and does not consult presets.
 
+## Live reconfiguration via control socket (Stage 13)
+
+A running `fluxframe run` daemon can expose a UNIX socket for
+line-delimited JSON commands. Enable it in `fluxframe.toml`:
+
+```toml
+[control]
+enabled = true
+# socket_path = "/run/user/1000/fluxframe.sock"  # optional override
+```
+
+The default path is `$XDG_RUNTIME_DIR/fluxframe.sock` (mode `0600`).
+Talk to the daemon via `socat`, `nc -U`, or any UNIX-socket client:
+
+```bash
+echo '{"cmd":"list_presets"}'                | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
+echo '{"cmd":"current_preset"}'              | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
+echo '{"cmd":"set_preset","name":"blur"}'    | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
+echo '{"cmd":"set","path":"background.blur.radius","value":40}' \
+     | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
+echo '{"cmd":"set_chain","section":"background","chain":["blur","vignette"]}' \
+     | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
+echo '{"cmd":"get_config","path":"background.blur"}' \
+     | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
+echo '{"cmd":"reload"}'                      | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
+```
+
+Every response is one line of JSON shaped as
+`{"ok":"true","data":...}` or `{"ok":"false","error":"…","hint":"…"}`.
+
+Capabilities:
+
+* **`set_preset`** — switch among presets defined in the TOML. Full
+  composite rebuild; may take 100–500 ms when the segmentation model
+  changes.
+* **`set <path> <value>`** — tweak one field of one effect, where
+  `<path>` is `<section>.<effect>.<field>` (e.g.
+  `background.blur.radius`). Sub-millisecond — perfect for
+  slider-style tuning.
+* **`set_chain <section> [names...]`** — add or remove effects from a
+  sub-chain (`mask`, `background`, `foreground`, `post`).
+* **`reload`** — re-read the TOML file from disk and rebuild the
+  active preset. CLI overrides given at startup stay in effect.
+* **`get_config [path]`** — introspect the live preset, optionally at
+  a dot-path subtree.
+
+Constraints: no auth beyond fs perms; the `[input]`/`[output]`
+sections cannot be reconfigured live (would require a GStreamer
+pipeline restart). Runtime tweaks are ephemeral — they are NOT
+written back to `fluxframe.toml`.
+
 ## Pre-commit
 
 Install once:
@@ -252,6 +303,9 @@ add only the `ml` feature).
 | 8. OpenVINO inference backend (CPU/NPU) | done |
 | 9. Composite pipeline (mask + bg + fg sub-chains) | done |
 | 10. Named presets in config | done |
+| 11. Plane-effects suite (sharpen, vignette, exposure_correct, image_fill) | done |
+| 12. Post-composite mask-aware chain + `auto_frame` | done |
+| 13. Live reconfiguration via UNIX control socket | done |
 
 ## License
 

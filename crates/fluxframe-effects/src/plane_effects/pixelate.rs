@@ -308,4 +308,59 @@ mod tests {
             assert_eq!(chunk, [63, 63, 63]);
         }
     }
+
+    #[test]
+    fn configure_after_prepare_is_safe() {
+        // Live-reconfig contract (Stage 13): configure() may be re-called
+        // after prepare(). Verify the next process() reflects the new
+        // `block_size` (visible as a different averaging granularity).
+        let mut effect = PixelateEffect::new();
+        effect
+            .configure(toml::from_str("block_size = 2").unwrap())
+            .expect("configure 1");
+        let context = ProcessingContext {
+            width: 8,
+            height: 8,
+            format: fluxframe_core::PixelFormat::Rgb,
+            fps: 30,
+            counters: None,
+        };
+        effect.prepare(&context).expect("prepare");
+
+        // Seed: 4x4 plane with a per-pixel gradient. With block_size=2
+        // each 2x2 sub-block averages independently → 4 distinct colours
+        // after process. With block_size=4 the whole plane collapses to
+        // one colour.
+        let make_data = || -> Vec<u8> {
+            let mut v = Vec::with_capacity(4 * 4 * 3);
+            for i in 0..16u8 {
+                v.extend_from_slice(&[i * 16, i * 16, i * 16]);
+            }
+            v
+        };
+
+        let mut data = make_data();
+        run(&mut effect, &mut data, 4, 4);
+        // With block_size=2: at least the top-left block differs from
+        // the bottom-right block — sanity check the partition.
+        assert_ne!(&data[0..3], &data[(4 * 4 - 1) * 3..(4 * 4) * 3]);
+
+        // Re-configure with bigger block.
+        effect
+            .configure(toml::from_str("block_size = 4").unwrap())
+            .expect("re-configure ok");
+        assert_eq!(effect.block_size, 4);
+
+        let mut data = make_data();
+        run(&mut effect, &mut data, 4, 4);
+        // With block_size=4 the whole 4x4 plane collapses to one colour.
+        let first = data[0..3].to_vec();
+        for chunk in data.chunks_exact(3) {
+            assert_eq!(
+                chunk,
+                first.as_slice(),
+                "block_size=4 must paint one colour"
+            );
+        }
+    }
 }

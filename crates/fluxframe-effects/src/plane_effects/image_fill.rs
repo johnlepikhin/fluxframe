@@ -88,7 +88,8 @@ fn default_letterbox_rgb() -> [u8; 3] {
 pub struct ImageFillEffect {
     config: Option<ImageFillConfig>,
     /// Pre-resized RGB buffer matching the negotiated frame dimensions.
-    /// Built once in `prepare()`.
+    /// Built once in `prepare()`, lazily re-built in `process()` when
+    /// a live `configure()` changed `path`/`fit`/`letterbox_rgb`.
     resized: Vec<u8>,
     frame_w: u32,
     frame_h: u32,
@@ -96,6 +97,11 @@ pub struct ImageFillEffect {
     /// being called before `prepare()` so the error reason is honest
     /// instead of the misleading "plane MxN differs from prepared 0x0".
     prepared: bool,
+    /// Snapshot of `(path, fit, letterbox_rgb)` the current `resized`
+    /// buffer was generated against. When the live config drifts from
+    /// this snapshot, `process()` reloads + resizes lazily before
+    /// using the buffer.
+    loaded_for: Option<(PathBuf, FitMode, [u8; 3])>,
 }
 
 impl ImageFillEffect {
@@ -112,6 +118,7 @@ impl ImageFillEffect {
             frame_w: 0,
             frame_h: 0,
             prepared: false,
+            loaded_for: None,
         }
     }
 }
@@ -243,6 +250,7 @@ impl PlaneEffect for ImageFillEffect {
             context.width,
             context.height,
         )?;
+        self.loaded_for = Some((cfg.path.clone(), cfg.fit, cfg.letterbox_rgb));
         self.prepared = true;
         tracing::info!(
             effect = Self::NAME,
@@ -273,6 +281,31 @@ impl PlaneEffect for ImageFillEffect {
                     plane.width, plane.height, self.frame_w, self.frame_h
                 ),
             });
+        }
+        // Live `configure()` between prepare and process can change
+        // `path`/`fit`/`letterbox_rgb`. Reload lazily when the active
+        // config drifts from the snapshot the `resized` buffer was
+        // generated against.
+        if let Some(cfg) = self.config.as_ref() {
+            let current = (cfg.path.clone(), cfg.fit, cfg.letterbox_rgb);
+            let drifted = self
+                .loaded_for
+                .as_ref()
+                .is_none_or(|loaded| loaded != &current);
+            if drifted {
+                self.resized = load_and_resize(
+                    &cfg.path,
+                    cfg.fit,
+                    cfg.letterbox_rgb,
+                    self.frame_w,
+                    self.frame_h,
+                )
+                .map_err(|e| EffectError::ProcessFailed {
+                    name: Self::NAME.to_string(),
+                    reason: format!("live reload failed: {e}"),
+                })?;
+                self.loaded_for = Some(current);
+            }
         }
         if self.resized.len() != plane.data.len() {
             return Err(EffectError::ProcessFailed {
@@ -518,5 +551,49 @@ fit = "cover"
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn configure_after_prepare_reloads_image_lazily() {
+        // Live-reconfig contract: change `path` post-prepare; next
+        // `process()` must lazily reload + resize the new image.
+        let bg_a = make_png(2, 2, [200, 0, 0]); // pure red
+        let bg_b = make_png(2, 2, [0, 200, 0]); // pure green
+        let mut effect = ImageFillEffect::new();
+        effect
+            .configure(parse(&format!(
+                r#"
+path = {:?}
+fit = "stretch"
+"#,
+                bg_a.path()
+            )))
+            .unwrap();
+        effect.prepare(&ctx(4, 4)).expect("prepare");
+
+        // First process: red.
+        let mut data = vec![0u8; 4 * 4 * 3];
+        let mut plane = FramePlane::new(&mut data, 4, 4);
+        let mut fctx = FrameContext::default();
+        effect.process(&mut plane, &mut fctx).expect("process A");
+        assert_eq!(&data[0..3], &[200, 0, 0]);
+
+        // Live re-configure to point at the green image.
+        effect
+            .configure(parse(&format!(
+                r#"
+path = {:?}
+fit = "stretch"
+"#,
+                bg_b.path()
+            )))
+            .expect("reconfigure ok");
+
+        // Second process: green — lazy reload via `loaded_for` drift
+        // detection.
+        let mut data2 = vec![0u8; 4 * 4 * 3];
+        let mut plane2 = FramePlane::new(&mut data2, 4, 4);
+        effect.process(&mut plane2, &mut fctx).expect("process B");
+        assert_eq!(&data2[0..3], &[0, 200, 0]);
     }
 }

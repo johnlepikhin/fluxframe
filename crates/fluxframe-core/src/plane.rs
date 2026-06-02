@@ -21,6 +21,65 @@ use crate::context::{FrameContext, ProcessingContext};
 use crate::error::EffectError;
 use crate::traits::RawEffectParams;
 
+/// Identifier for one of the four sub-chains hosted by the composite
+/// effect.
+///
+/// Used in the control-socket dispatch path
+/// ([`crate::VideoEffect::reconfigure_named_effect`], `set` / `set_chain`
+/// commands) so the section name is parsed exactly once at the wire
+/// boundary, not re-parsed by every downstream consumer.
+///
+/// Serde format is `snake_case` to match the wire format used by the
+/// control socket and the TOML preset sub-tables (`mask` / `background`
+/// / `foreground` / `post`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubchainKind {
+    /// Mask post-processing chain (`MaskEffect`).
+    Mask,
+    /// Background plane chain (`PlaneEffect`).
+    Background,
+    /// Foreground plane chain (`PlaneEffect`).
+    Foreground,
+    /// Post-composite chain (`PostEffect`).
+    Post,
+}
+
+impl SubchainKind {
+    /// Stable identifier matching the wire / TOML form.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mask => "mask",
+            Self::Background => "background",
+            Self::Foreground => "foreground",
+            Self::Post => "post",
+        }
+    }
+}
+
+impl std::fmt::Display for SubchainKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SubchainKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "mask" => Ok(Self::Mask),
+            "background" => Ok(Self::Background),
+            "foreground" => Ok(Self::Foreground),
+            "post" => Ok(Self::Post),
+            other => Err(format!(
+                "unknown sub-chain '{other}' (expected mask|background|foreground|post)"
+            )),
+        }
+    }
+}
+
 /// Mutable view on a mask plane: `f32` confidence values in `[0, 1]`
 /// laid out as `height * width` in row-major order.
 ///
@@ -129,6 +188,18 @@ pub trait MaskEffect: Send {
     /// Apply user-supplied configuration. May be a no-op for stateless
     /// effects (`invert`).
     ///
+    /// **MAY be called after `prepare()`** for live reconfiguration via
+    /// the control socket. Implementations must either:
+    /// * Cleanly update `self.config` and continue using existing
+    ///   scratch buffers (the typical case for `radius`/`level`/...
+    ///   params).
+    /// * Re-allocate scratch lazily inside the next `process()` call
+    ///   when a parameter forces a different scratch size.
+    ///
+    /// Implementations MUST NOT panic on a re-call. If the new config
+    /// is invalid, return `EffectError::InvalidConfig` without
+    /// mutating self.
+    ///
     /// # Errors
     ///
     /// Returns [`EffectError::InvalidConfig`] if parsing fails or the
@@ -185,6 +256,13 @@ pub trait PlaneEffect: Send {
     fn name(&self) -> &'static str;
 
     /// Apply user-supplied configuration.
+    ///
+    /// **MAY be called after `prepare()`** for live reconfiguration via
+    /// the control socket. Implementations must either update
+    /// `self.config` in place (typical) or re-allocate scratch lazily
+    /// inside the next `process()` call. MUST NOT panic on a re-call;
+    /// on invalid input, return `EffectError::InvalidConfig` without
+    /// mutating self.
     ///
     /// # Errors
     ///
@@ -250,6 +328,11 @@ pub trait PostEffect: Send {
     fn name(&self) -> &'static str;
 
     /// Apply user-supplied configuration.
+    ///
+    /// **MAY be called after `prepare()`** for live reconfiguration via
+    /// the control socket. Same semantics as [`PlaneEffect::configure`]
+    /// — update `self.config` in place or re-allocate lazily on next
+    /// `process()`. MUST NOT panic on a re-call.
     ///
     /// # Errors
     ///
@@ -325,5 +408,26 @@ mod tests {
     fn frame_plane_asserts_length() {
         let mut buf = vec![0_u8; 11];
         let _ = FramePlane::new(&mut buf, 2, 2);
+    }
+
+    #[test]
+    fn subchain_kind_round_trips_through_str() {
+        use std::str::FromStr;
+        for k in [
+            SubchainKind::Mask,
+            SubchainKind::Background,
+            SubchainKind::Foreground,
+            SubchainKind::Post,
+        ] {
+            assert_eq!(SubchainKind::from_str(k.as_str()).unwrap(), k);
+            assert_eq!(format!("{k}"), k.as_str());
+        }
+    }
+
+    #[test]
+    fn subchain_kind_from_str_rejects_unknown() {
+        use std::str::FromStr;
+        let err = SubchainKind::from_str("unknown").expect_err("unknown rejected");
+        assert!(err.contains("unknown"), "got: {err}");
     }
 }

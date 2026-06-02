@@ -10,5 +10,5 @@ pub mod effect;
 pub mod segmentation;
 
 pub use builder::CompositeBuilder;
-pub use effect::CompositeEffect;
+pub use effect::{CompositeEffect, SubChainPayload};
 pub use segmentation::{SegmentationBase, SegmentationConfig, SegmentationOutcome};

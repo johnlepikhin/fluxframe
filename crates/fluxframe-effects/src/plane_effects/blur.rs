@@ -114,6 +114,46 @@ impl Default for BlurPlaneEffect {
     }
 }
 
+impl BlurPlaneEffect {
+    /// Reconcile downscale-related state with the current
+    /// `self.config.downscale`. Called both from `prepare()` and
+    /// lazily from `process()` so the effect responds to a live
+    /// `configure()` that changed `downscale`.
+    ///
+    /// Backend `prepare()` is re-run when the effective resolution
+    /// changes (GPU/CPU backends may have allocated tile buffers
+    /// against the old resolution).
+    fn setup_downscale_buffers(&mut self) -> Result<(), EffectError> {
+        let max_downscale = (self.frame_w.min(self.frame_h) / 2).max(1);
+        let desired = self.config.downscale.max(1).min(max_downscale);
+        if desired == self.downscale_effective {
+            return Ok(());
+        }
+        self.downscale_effective = desired;
+        if desired == 1 {
+            self.blur_down_w = self.frame_w;
+            self.blur_down_h = self.frame_h;
+            self.frame_down.clear();
+            self.blurred_down.clear();
+        } else {
+            self.blur_down_w = (self.frame_w / desired).max(1);
+            self.blur_down_h = (self.frame_h / desired).max(1);
+            let down_bytes = (self.blur_down_w as usize) * (self.blur_down_h as usize) * 3;
+            self.frame_down = vec![0u8; down_bytes];
+            self.blurred_down = vec![0u8; down_bytes];
+        }
+        if let Some(backend) = self.backend.as_mut() {
+            let (prepare_w, prepare_h) = if desired == 1 {
+                (self.frame_w, self.frame_h)
+            } else {
+                (self.blur_down_w, self.blur_down_h)
+            };
+            backend.prepare(prepare_w, prepare_h)?;
+        }
+        Ok(())
+    }
+}
+
 impl PlaneEffect for BlurPlaneEffect {
     fn name(&self) -> &'static str {
         Self::NAME
@@ -154,33 +194,18 @@ impl PlaneEffect for BlurPlaneEffect {
         self.counters.clone_from(&context.counters);
         let frame_bytes = (context.width as usize) * (context.height as usize) * 3;
         self.blurred = vec![0u8; frame_bytes];
+        // Force the lazy setup to actually re-allocate by zeroing out
+        // the cached downscale factor before calling.
+        self.downscale_effective = 0;
 
-        let max_downscale = (context.width.min(context.height) / 2).max(1);
-        let downscale = self.config.downscale.max(1).min(max_downscale);
-        self.downscale_effective = downscale;
-        if downscale == 1 {
-            self.blur_down_w = context.width;
-            self.blur_down_h = context.height;
-            self.frame_down.clear();
-            self.blurred_down.clear();
-        } else {
-            self.blur_down_w = (context.width / downscale).max(1);
-            self.blur_down_h = (context.height / downscale).max(1);
-            let down_bytes = (self.blur_down_w as usize) * (self.blur_down_h as usize) * 3;
-            self.frame_down = vec![0u8; down_bytes];
-            self.blurred_down = vec![0u8; down_bytes];
-        }
-
-        let (prepare_w, prepare_h) = if downscale == 1 {
-            (context.width, context.height)
-        } else {
-            (self.blur_down_w, self.blur_down_h)
-        };
         let mut backend =
             build_blur_backend(BackendOverrides::current(), context.counters.clone())?;
-        backend.prepare(prepare_w, prepare_h)?;
+        // Backend prepare against full-res first; `setup_downscale_buffers`
+        // below may re-prepare it against a smaller resolution when
+        // `downscale > 1`.
+        backend.prepare(context.width, context.height)?;
         self.backend = Some(backend);
-        Ok(())
+        self.setup_downscale_buffers()
     }
 
     fn process(
@@ -197,6 +222,11 @@ impl PlaneEffect for BlurPlaneEffect {
                 ),
             });
         }
+        // Live re-configuration via the control socket can change
+        // `self.config.downscale` between `prepare()` and `process()`.
+        // Detect the drift and re-allocate scratch + re-prepare the
+        // backend before using them.
+        self.setup_downscale_buffers()?;
         let backend = self
             .backend
             .as_mut()
@@ -307,5 +337,42 @@ mod tests {
         let mut ctx = FrameContext::default();
         effect.process(&mut plane, &mut ctx).expect("process");
         assert_ne!(data, original, "blur must change the plane");
+    }
+
+    #[test]
+    fn configure_after_prepare_relocates_downscale_scratch() {
+        // Live-reconfig contract: configure() can be called post-prepare.
+        // Changing `downscale` must trigger lazy realloc of `frame_down`
+        // / `blurred_down` on the next process() without panicking.
+        let mut effect = BlurPlaneEffect::new();
+        effect
+            .configure(toml::from_str("radius = 4\npasses = 1\ndownscale = 1").unwrap())
+            .expect("configure 1");
+        let context = ProcessingContext {
+            width: 16,
+            height: 16,
+            format: fluxframe_core::PixelFormat::Rgb,
+            fps: 30,
+            counters: None,
+        };
+        effect.prepare(&context).expect("prepare");
+        assert_eq!(effect.downscale_effective, 1);
+        assert!(effect.frame_down.is_empty(), "no downscale scratch yet");
+
+        // Re-configure with downscale = 2 (post-prepare).
+        effect
+            .configure(toml::from_str("radius = 4\npasses = 1\ndownscale = 2").unwrap())
+            .expect("re-configure ok");
+        // Drive one process() — should detect the drift and re-allocate.
+        let mut data = vec![128u8; 16 * 16 * 3];
+        let mut plane = FramePlane::new(&mut data, 16, 16);
+        let mut fctx = FrameContext::default();
+        effect.process(&mut plane, &mut fctx).expect("process");
+        assert_eq!(effect.downscale_effective, 2);
+        assert_eq!(
+            effect.frame_down.len(),
+            (16 / 2) * (16 / 2) * 3,
+            "downscale=2 buffer sized to (w/2)*(h/2)*3"
+        );
     }
 }

@@ -550,7 +550,9 @@ mod tests {
     #[test]
     fn process_zoom_max_one_is_no_op() {
         let mut effect = AutoFrameEffect::new();
-        effect.configure(parse("zoom_max = 1.0")).expect("configure");
+        effect
+            .configure(parse("zoom_max = 1.0"))
+            .expect("configure");
         effect.prepare(&ctx(8, 8)).expect("prepare");
         let mut frame = vec![123u8; 8 * 8 * 3];
         let original = frame.clone();
@@ -579,5 +581,74 @@ mod tests {
             .expect_err("dim mismatch");
         let msg = format!("{err}");
         assert!(msg.contains("plane dimensions"), "got: {msg}");
+    }
+
+    #[test]
+    fn configure_after_prepare_is_safe() {
+        // Live-reconfig contract (Stage 13): configure() may be re-called
+        // after prepare(). For this stateful post-effect, the smoothing
+        // state (`state: Option<SmoothBox>`) is preserved across
+        // re-configure (only prepare() resets it). The next process()
+        // recomputes the observed bbox against the new `threshold` and
+        // must not panic.
+        let mut effect = AutoFrameEffect::new();
+        effect
+            .configure(toml::Value::Table(toml::map::Map::new()))
+            .expect("configure 1 (defaults)");
+        effect.prepare(&ctx(8, 8)).expect("prepare");
+
+        // 8×8 mask with a 4×4 hot region (values = 0.7) in the upper-
+        // left. With default threshold 0.5 those pixels count; with
+        // threshold 0.8 (post-reconfigure) they do not.
+        let make_mask = || {
+            let mut m = vec![0.0_f32; 64];
+            for y in 0..4 {
+                for x in 0..4 {
+                    m[y * 8 + x] = 0.7;
+                }
+            }
+            m
+        };
+
+        let mut frame = vec![100u8; 8 * 8 * 3];
+        let mut mask_data = make_mask();
+        {
+            let mut plane = FramePlane::new(&mut frame, 8, 8);
+            let mask = MaskPlane::new(&mut mask_data, 8, 8);
+            let mut fctx = FrameContext::default();
+            effect
+                .process(&mut plane, &mask, &mut fctx)
+                .expect("process 1");
+        }
+        // With threshold=0.5 the bbox is detected and `state` is set.
+        assert!(effect.state.is_some(), "default threshold must detect bbox");
+
+        // Re-configure with a higher threshold post-prepare. State must
+        // be preserved (only prepare() clears it).
+        let state_before = effect.state;
+        effect
+            .configure(parse(
+                "threshold = 0.8\npadding = 0.0\nsmoothing = 0.0\nzoom_max = 2.0",
+            ))
+            .expect("re-configure ok");
+        assert!(
+            effect.state.is_some()
+                && state_before.is_some()
+                && (effect.state.unwrap().cx - state_before.unwrap().cx).abs() < 1e-6,
+            "configure() must NOT reset smoothing state (only prepare() does)",
+        );
+        assert!((effect.config.threshold - 0.8).abs() < 1e-6);
+
+        // Second process(): observed bbox is None (no pixel > 0.8), so
+        // the effect falls through with the previous state — does not
+        // panic.
+        let mut frame = vec![100u8; 8 * 8 * 3];
+        let mut mask_data = make_mask();
+        let mut plane = FramePlane::new(&mut frame, 8, 8);
+        let mask = MaskPlane::new(&mut mask_data, 8, 8);
+        let mut fctx = FrameContext::default();
+        effect
+            .process(&mut plane, &mask, &mut fctx)
+            .expect("process 2 must not panic on new threshold");
     }
 }

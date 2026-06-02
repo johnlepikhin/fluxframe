@@ -131,4 +131,53 @@ mod tests {
         assert!(data[2] > 0.0 && data[5] > 0.0 && data[8] > 0.0);
         assert!(data[1] < 1.0 && data[4] < 1.0 && data[7] < 1.0);
     }
+
+    #[test]
+    fn configure_after_prepare_is_safe() {
+        // Live-reconfig contract (Stage 13): configure() may be re-called
+        // after prepare(). Verify the next process() reflects the new
+        // `radius` (visible as a stronger blur of the same input) and
+        // does not panic.
+        let mut effect = FeatherMaskEffect::new();
+        effect
+            .configure(toml::from_str("radius = 1").unwrap())
+            .expect("configure 1");
+        let context = ProcessingContext {
+            width: 8,
+            height: 8,
+            format: fluxframe_core::PixelFormat::Rgb,
+            fps: 30,
+            counters: None,
+        };
+        effect.prepare(&context).expect("prepare");
+
+        // Seed mask: half-on / half-off step in the middle column.
+        // 5×1 row simplifies the verification — feather(radius=1) leaks
+        // exactly one pixel either side, radius=3 leaks further.
+        let seed = vec![1.0, 1.0, 0.0, 0.0, 0.0];
+        let mut data = seed.clone();
+        {
+            let mut plane = MaskPlane::new(&mut data, 5, 1);
+            let mut fctx = FrameContext::default();
+            effect.process(&mut plane, &mut fctx).expect("process 1");
+        }
+        let small_radius_far_edge = data[4];
+
+        // Re-configure with much larger radius.
+        effect
+            .configure(toml::from_str("radius = 3").unwrap())
+            .expect("re-configure ok");
+        // Re-seed and re-process: large radius must leak further into
+        // the originally-zero side of the mask.
+        let mut data = seed.clone();
+        let mut plane = MaskPlane::new(&mut data, 5, 1);
+        let mut fctx = FrameContext::default();
+        effect.process(&mut plane, &mut fctx).expect("process 2");
+        let big_radius_far_edge = data[4];
+        assert!(
+            big_radius_far_edge > small_radius_far_edge,
+            "radius=3 must bleed further than radius=1: r1={small_radius_far_edge}, r3={big_radius_far_edge}",
+        );
+        assert_eq!(effect.radius, 3);
+    }
 }

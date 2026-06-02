@@ -144,4 +144,57 @@ mod tests {
         let params: RawEffectParams = toml::from_str(&raw).unwrap();
         assert!(effect.configure(params).is_err());
     }
+
+    #[test]
+    fn configure_after_prepare_is_safe() {
+        // Live-reconfig contract (Stage 13): configure() may be re-called
+        // after prepare(). Verify the next process() reflects the new
+        // `iterations` count without panicking.
+        let mut effect = DilateMaskEffect::new();
+        effect
+            .configure(toml::Value::Table(toml::map::Map::new()))
+            .expect("configure 1 (defaults)");
+
+        let context = ProcessingContext {
+            width: 8,
+            height: 8,
+            format: fluxframe_core::PixelFormat::Rgb,
+            fps: 30,
+            counters: None,
+        };
+        effect.prepare(&context).expect("prepare");
+
+        // 5×5 mask, single hot pixel at the centre.
+        let mut data = vec![0.0_f32; 25];
+        data[12] = 1.0;
+        {
+            let mut plane = MaskPlane::new(&mut data, 5, 5);
+            let mut fctx = FrameContext::default();
+            effect.process(&mut plane, &mut fctx).expect("process 1");
+        }
+        // 1 iteration of 3×3 max → expands to a 3×3 block (corners at
+        // distance 1 from the centre). Corners of the 5×5 mask stay 0.
+        assert!(data[0] < 0.5, "iter=1 corner must stay 0: {data:?}");
+
+        // Re-configure with higher iterations (post-prepare).
+        effect
+            .configure(toml::from_str("iterations = 3").unwrap())
+            .expect("re-configure ok");
+
+        // Re-seed: single centre pixel again so we can observe the
+        // bigger spread.
+        let mut data = vec![0.0_f32; 25];
+        data[12] = 1.0;
+        let mut plane = MaskPlane::new(&mut data, 5, 5);
+        let mut fctx = FrameContext::default();
+        effect.process(&mut plane, &mut fctx).expect("process 2");
+        // 3 iterations of 3×3 max from the centre saturate the full 5×5
+        // (the diagonal corner is at Chebyshev distance 2; 3 iterations
+        // reach distance 3).
+        assert!(
+            data.iter().all(|&v| v > 0.99),
+            "iter=3 must fill the 5×5 mask: {data:?}"
+        );
+        assert_eq!(effect.iterations, 3);
+    }
 }

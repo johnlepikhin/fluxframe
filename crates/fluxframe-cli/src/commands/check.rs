@@ -7,9 +7,9 @@ use std::path::Path;
 use fluxframe_core::{FluxConfig, FluxError, InputDevice, PipelineSection, Preset};
 #[cfg(feature = "ml")]
 use fluxframe_effects::ml::OnnxEngine;
-use fluxframe_effects::{mask_effects, plane_effects};
 #[cfg(feature = "ml")]
 use fluxframe_effects::post_effects;
+use fluxframe_effects::{mask_effects, plane_effects};
 use fluxframe_gst::{V4l2DeviceKind, enumerate_devices};
 use tracing::{info, warn};
 
@@ -267,9 +267,7 @@ fn check_preset_sections(preset_name: &str, preset: &Preset) -> Result<(), FluxE
         // message. Catch it here.
         if preset.mask.is_none() {
             return Err(FluxError::Config {
-                reason: format!(
-                    "preset '{preset_name}' has a [post] chain but no [mask] section"
-                ),
+                reason: format!("preset '{preset_name}' has a [post] chain but no [mask] section"),
                 hint: Some(
                     "post-effects require a mask; either add a [mask] section or \
                      remove the [post] chain"
@@ -282,6 +280,8 @@ fn check_preset_sections(preset_name: &str, preset: &Preset) -> Result<(), FluxE
             let post_registry = post_effects::default_registry();
             check_post_chain(preset_name, post, &post_registry)?;
         }
+        #[cfg(not(feature = "ml"))]
+        let _ = post;
     }
     Ok(())
 }

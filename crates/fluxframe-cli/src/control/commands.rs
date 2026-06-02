@@ -1,0 +1,374 @@
+//! Wire format for the control socket: typed `Command` and `Response`
+//! enums, line-delimited JSON.
+//!
+//! Each socket connection follows a strict request/response cadence:
+//! the client writes one JSON object per line, the daemon writes one
+//! JSON object per line back, repeat until either side closes the
+//! socket.
+
+use fluxframe_core::SubchainKind;
+use serde::{Deserialize, Serialize};
+
+/// All commands accepted by the control socket.
+///
+/// Discriminated on the `"cmd"` field with `snake_case` rename. The
+/// `deny_unknown_fields` attribute keeps a payload typo (e.g.
+/// `{"cmd":"set","pat":"..."}`) from being silently accepted as a
+/// missing-field-defaults command.
+///
+/// ```json
+/// {"cmd":"set_preset","name":"blur"}
+/// {"cmd":"set","path":"background.blur.radius","value":40}
+/// {"cmd":"set_chain","section":"background","chain":["blur","vignette"]}
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "cmd", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Command {
+    /// List the names of every preset defined in the loaded config.
+    ListPresets,
+    /// Return the name of the currently-active preset.
+    CurrentPreset,
+    /// Dump the active preset (or a sub-path) as a JSON value.
+    /// `path` follows the dot-syntax used by `Set` (e.g.
+    /// `"background.blur"`); `null` means the whole preset.
+    GetConfig {
+        /// Dot-path into the active preset; `None` returns the whole
+        /// preset.
+        #[serde(default)]
+        path: Option<String>,
+    },
+    /// Swap the active preset for the named one. Triggers a full
+    /// composite rebuild (may take 100–500 ms when the model
+    /// changes).
+    SetPreset {
+        /// Name of the preset to activate.
+        name: String,
+    },
+    /// Update a single field. `path` is the dot-syntax
+    /// `<section>.<effect>.<field>` (e.g.
+    /// `"background.blur.radius"`); `<section>` ∈
+    /// `mask|background|foreground|post`. `value` is any JSON value
+    /// the effect's serde schema accepts.
+    Set {
+        /// Dot-path into the active preset.
+        path: String,
+        /// New value (typed as `serde_json::Value`, converted to
+        /// `toml::Value` at apply time).
+        value: serde_json::Value,
+    },
+    /// Replace the entire chain composition of a sub-section. Effects
+    /// listed get built from the corresponding registry, configured
+    /// from the preset's existing `per_effect` payload (or defaults
+    /// when absent), prepared against the active resolution, and
+    /// swapped in.
+    SetChain {
+        /// One of `mask|background|foreground|post` (parsed via
+        /// [`SubchainKind`] at the wire boundary).
+        section: SubchainKind,
+        /// New chain (effect names in order).
+        chain: Vec<String>,
+    },
+    /// Re-read the TOML config from disk and reapply the current
+    /// preset against the freshly-parsed config. Equivalent to
+    /// "edit the file then `set_preset <currently active>`".
+    Reload,
+}
+
+/// Response body returned for each command.
+///
+/// Encoded as `{"ok":true,"data":...}` or
+/// `{"ok":false,"error":"...","hint":"..."}`. The boolean
+/// discriminator on `ok` keeps the wire format scriptable from shell
+/// without parsing nested error variants.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "ok")]
+pub enum Response {
+    /// Successful response. `data` may be `Null`/an object/an array
+    /// depending on the command.
+    #[serde(rename = "true")]
+    Ok {
+        /// Optional payload (e.g. list of preset names for
+        /// [`Command::ListPresets`]).
+        #[serde(default = "null_value")]
+        data: serde_json::Value,
+    },
+    /// Failure. `error` is a one-line `reason`; `hint` mirrors
+    /// `FluxError`'s `Diagnostic::hint`.
+    #[serde(rename = "false")]
+    Err {
+        /// One-line reason.
+        error: String,
+        /// Optional hint at how to fix it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+    },
+}
+
+fn null_value() -> serde_json::Value {
+    serde_json::Value::Null
+}
+
+impl Response {
+    /// Convenience: empty-OK response (no payload).
+    #[must_use]
+    pub fn ok() -> Self {
+        Self::Ok {
+            data: serde_json::Value::Null,
+        }
+    }
+
+    /// Convenience: OK with a JSON payload.
+    #[must_use]
+    pub fn ok_with(data: serde_json::Value) -> Self {
+        Self::Ok { data }
+    }
+
+    /// Convenience: error response with reason + optional hint.
+    #[must_use]
+    pub fn err(error: impl Into<String>, hint: Option<String>) -> Self {
+        Self::Err {
+            error: error.into(),
+            hint,
+        }
+    }
+}
+
+/// A parsed `<section>.<effect>.<field>` path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetPath {
+    /// Sub-chain identifier parsed from the first dot-component.
+    pub section: SubchainKind,
+    /// Effect name inside the sub-chain (snake_case).
+    pub effect: String,
+    /// Field name on the effect's config struct.
+    pub field: String,
+}
+
+/// Parse the dot-syntax expected by the `set` command.
+///
+/// Accepts exactly three components — `<section>.<effect>.<field>`.
+/// Errors out on the wrong number of dots or an empty component.
+///
+/// # Errors
+///
+/// Returns a one-line reason string suitable for `Response::err`.
+pub fn parse_set_path(path: &str) -> Result<SetPath, String> {
+    let parts: Vec<&str> = path.split('.').collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "expected `<section>.<effect>.<field>`, got '{path}' ({} components)",
+            parts.len()
+        ));
+    }
+    if parts.iter().any(|s| s.is_empty()) {
+        return Err(format!("empty component in path '{path}'"));
+    }
+    let section: SubchainKind = parts[0]
+        .parse()
+        .map_err(|e: String| format!("{e} in path '{path}'"))?;
+    Ok(SetPath {
+        section,
+        effect: parts[1].to_string(),
+        field: parts[2].to_string(),
+    })
+}
+
+/// Convert a `serde_json::Value` into a `toml::Value`. Used to turn
+/// the wire-format payload (JSON) into the configuration vocabulary
+/// (TOML) the effect's `configure()` expects.
+///
+/// # Errors
+///
+/// Returns a reason string for unrepresentable inputs (`null`,
+/// out-of-range numbers).
+pub fn json_to_toml(v: serde_json::Value) -> Result<toml::Value, String> {
+    match v {
+        serde_json::Value::Null => Err("`null` is not representable in TOML".into()),
+        serde_json::Value::Bool(b) => Ok(toml::Value::Boolean(b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(toml::Value::Integer(i))
+            } else if let Some(f) = n.as_f64() {
+                Ok(toml::Value::Float(f))
+            } else {
+                Err(format!("number out of range: {n}"))
+            }
+        }
+        serde_json::Value::String(s) => Ok(toml::Value::String(s)),
+        serde_json::Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                out.push(json_to_toml(item)?);
+            }
+            Ok(toml::Value::Array(out))
+        }
+        serde_json::Value::Object(obj) => {
+            let mut table = toml::Table::new();
+            for (k, v) in obj {
+                table.insert(k, json_to_toml(v)?);
+            }
+            Ok(toml::Value::Table(table))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_presets_parses() {
+        let cmd: Command = serde_json::from_str(r#"{"cmd":"list_presets"}"#).expect("parses");
+        assert_eq!(cmd, Command::ListPresets);
+    }
+
+    #[test]
+    fn set_preset_parses() {
+        let cmd: Command =
+            serde_json::from_str(r#"{"cmd":"set_preset","name":"blur"}"#).expect("parses");
+        assert_eq!(
+            cmd,
+            Command::SetPreset {
+                name: "blur".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn set_parses_with_number() {
+        let cmd: Command =
+            serde_json::from_str(r#"{"cmd":"set","path":"background.blur.radius","value":40}"#)
+                .expect("parses");
+        match cmd {
+            Command::Set { path, value } => {
+                assert_eq!(path, "background.blur.radius");
+                assert_eq!(value, serde_json::json!(40));
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_chain_parses_array() {
+        let cmd: Command = serde_json::from_str(
+            r#"{"cmd":"set_chain","section":"background","chain":["blur","vignette"]}"#,
+        )
+        .expect("parses");
+        match cmd {
+            Command::SetChain { section, chain } => {
+                assert_eq!(section, SubchainKind::Background);
+                assert_eq!(chain, vec!["blur", "vignette"]);
+            }
+            other => panic!("expected SetChain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_chain_rejects_unknown_section() {
+        let res: Result<Command, _> =
+            serde_json::from_str(r#"{"cmd":"set_chain","section":"bogus","chain":["blur"]}"#);
+        assert!(res.is_err(), "unknown section must be rejected");
+    }
+
+    #[test]
+    fn command_rejects_unknown_field() {
+        // `deny_unknown_fields` on the enum catches typos in payload
+        // keys (e.g. `pat` instead of `path`).
+        let res: Result<Command, _> =
+            serde_json::from_str(r#"{"cmd":"set","pat":"background.blur.radius","value":40}"#);
+        assert!(res.is_err(), "typo'd field must be rejected");
+    }
+
+    #[test]
+    fn get_config_parses_with_optional_path() {
+        let cmd: Command = serde_json::from_str(r#"{"cmd":"get_config"}"#).expect("parses");
+        assert_eq!(cmd, Command::GetConfig { path: None });
+
+        let cmd: Command = serde_json::from_str(r#"{"cmd":"get_config","path":"background.blur"}"#)
+            .expect("parses");
+        assert_eq!(
+            cmd,
+            Command::GetConfig {
+                path: Some("background.blur".into())
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_command_rejected() {
+        let res: Result<Command, _> = serde_json::from_str(r#"{"cmd":"nope"}"#);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn response_ok_serialises_as_true() {
+        let r = Response::ok();
+        let s = serde_json::to_string(&r).expect("serialise");
+        assert!(s.contains("\"ok\":\"true\""), "got: {s}");
+    }
+
+    #[test]
+    fn response_err_includes_hint_when_present() {
+        let r = Response::err("nope", Some("fix it".into()));
+        let s = serde_json::to_string(&r).expect("serialise");
+        assert!(s.contains("\"ok\":\"false\""));
+        assert!(s.contains("\"hint\":\"fix it\""));
+    }
+
+    #[test]
+    fn parse_set_path_happy() {
+        let p = parse_set_path("background.blur.radius").expect("ok");
+        assert_eq!(p.section, SubchainKind::Background);
+        assert_eq!(p.effect, "blur");
+        assert_eq!(p.field, "radius");
+    }
+
+    #[test]
+    fn parse_set_path_rejects_wrong_component_count() {
+        assert!(parse_set_path("background.blur").is_err());
+        assert!(parse_set_path("background.blur.radius.extra").is_err());
+        assert!(parse_set_path("").is_err());
+    }
+
+    #[test]
+    fn parse_set_path_rejects_unknown_section() {
+        let err = parse_set_path("nope.blur.radius").unwrap_err();
+        assert!(err.contains("nope"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_set_path_rejects_empty_component() {
+        assert!(parse_set_path("background..radius").is_err());
+        assert!(parse_set_path(".blur.radius").is_err());
+        assert!(parse_set_path("background.blur.").is_err());
+    }
+
+    #[test]
+    fn json_to_toml_scalars_round_trip() {
+        let toml_int = json_to_toml(serde_json::json!(42)).unwrap();
+        assert_eq!(toml_int, toml::Value::Integer(42));
+        let toml_float = json_to_toml(serde_json::json!(0.5)).unwrap();
+        assert!(matches!(toml_float, toml::Value::Float(f) if (f - 0.5).abs() < 1e-9));
+        let toml_str = json_to_toml(serde_json::json!("hello")).unwrap();
+        assert_eq!(toml_str, toml::Value::String("hello".into()));
+        let toml_bool = json_to_toml(serde_json::json!(true)).unwrap();
+        assert_eq!(toml_bool, toml::Value::Boolean(true));
+    }
+
+    #[test]
+    fn json_to_toml_rejects_null() {
+        assert!(json_to_toml(serde_json::Value::Null).is_err());
+    }
+
+    #[test]
+    fn json_to_toml_array_of_ints() {
+        let v = json_to_toml(serde_json::json!([1, 2, 3])).unwrap();
+        match v {
+            toml::Value::Array(a) => {
+                assert_eq!(a.len(), 3);
+                assert_eq!(a[0], toml::Value::Integer(1));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+}

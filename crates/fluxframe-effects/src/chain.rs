@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
 use fluxframe_core::frame::VideoFrame;
+use fluxframe_core::plane::SubchainKind;
 use fluxframe_core::traits::{RawEffectParams, VideoEffect};
 
 /// Ordered list of effects executed sequentially per frame.
@@ -108,6 +109,73 @@ impl EffectChain {
             effect.process(frame, context)?;
         }
         Ok(())
+    }
+
+    /// Find the first [`crate::composite::CompositeEffect`] in the
+    /// chain, if any. Returns `None` for passthrough-only chains.
+    /// Used by Stage 13's `set_chain` flow to call composite-only
+    /// methods that the trait does not expose.
+    #[cfg(feature = "ml")]
+    #[must_use]
+    pub fn composite_mut(&mut self) -> Option<&mut crate::composite::CompositeEffect> {
+        for effect in &mut self.effects {
+            if let Some(c) = effect
+                .as_any_mut()
+                .downcast_mut::<crate::composite::CompositeEffect>()
+            {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    /// Live-reconfigure a sub-effect inside the chain. Routes
+    /// directly to the chain's composite effect (if any) via
+    /// [`Self::composite_mut`]; non-composite chains have no named
+    /// sub-effects to reconfigure and return a structured error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EffectError::ProcessFailed`] when the chain hosts no
+    /// composite effect (e.g. passthrough-only), or whatever the
+    /// composite raises (typically [`EffectError::InvalidConfig`]
+    /// when no effect matches `name`).
+    #[cfg(feature = "ml")]
+    pub fn reconfigure_named_effect(
+        &mut self,
+        section: SubchainKind,
+        name: &str,
+        params: RawEffectParams,
+    ) -> Result<(), EffectError> {
+        if let Some(composite) = self.composite_mut() {
+            return composite.reconfigure_named_effect(section, name, params);
+        }
+        Err(EffectError::ProcessFailed {
+            name: "chain".to_string(),
+            reason: format!("chain has no composite effect — cannot reconfigure {section}.{name}"),
+        })
+    }
+
+    /// Slim-build stub: without the `ml` feature there is no
+    /// composite, so live reconfiguration is unsupported.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`EffectError::ProcessFailed`].
+    #[cfg(not(feature = "ml"))]
+    pub fn reconfigure_named_effect(
+        &mut self,
+        section: SubchainKind,
+        name: &str,
+        _params: RawEffectParams,
+    ) -> Result<(), EffectError> {
+        Err(EffectError::ProcessFailed {
+            name: "chain".to_string(),
+            reason: format!(
+                "chain has no composite effect — cannot reconfigure {section}.{name} \
+                 (built without `ml` feature)"
+            ),
+        })
     }
 
     /// Best-effort shutdown.  Collects every error and returns the first,
@@ -324,5 +392,24 @@ mod tests {
         ];
         let chain = EffectChain::new(chain_effects);
         assert_eq!(chain.names(), vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn reconfigure_named_effect_on_passthrough_only_errors() {
+        // A chain with only non-composite effects has nothing to
+        // reconfigure — every section name surfaces as ProcessFailed.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut chain = EffectChain::new(vec![Box::new(RecordingEffect::new("p", log))]);
+        let err = chain
+            .reconfigure_named_effect(
+                SubchainKind::Background,
+                "anything",
+                toml::Value::Table(toml::Table::new()),
+            )
+            .expect_err("non-composite chain cannot reconfigure named effects");
+        match err {
+            EffectError::ProcessFailed { name, .. } => assert_eq!(name, "chain"),
+            other => panic!("expected ProcessFailed, got {other:?}"),
+        }
     }
 }

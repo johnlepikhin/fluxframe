@@ -11,7 +11,9 @@
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
 use fluxframe_core::frame::{PixelFormat, VideoFrame};
-use fluxframe_core::plane::{FramePlane, MaskEffect, MaskPlane, PlaneEffect, PostEffect};
+use fluxframe_core::plane::{
+    FramePlane, MaskEffect, MaskPlane, PlaneEffect, PostEffect, SubchainKind,
+};
 use fluxframe_core::traits::{RawEffectParams, VideoEffect};
 use tracing::trace;
 
@@ -62,6 +64,28 @@ pub struct CompositeEffect {
     bg_plane: Vec<u8>,
     frame_w: u32,
     frame_h: u32,
+    /// Snapshot of the `ProcessingContext` from the last successful
+    /// `prepare()`. Used by Stage 13's `set_chain` flow to prepare
+    /// newly-injected sub-effects against the right resolution.
+    /// `None` before the first `prepare()`.
+    processing_ctx: Option<ProcessingContext>,
+}
+
+/// Typed envelope of the four possible sub-chain payloads handed to
+/// [`CompositeEffect::replace_subchain`].
+///
+/// Each variant matches the corresponding sub-chain slot inside the
+/// composite. Variants own the new chain; on success they are swapped
+/// in atomically (the old chain is dropped on the swap-out vector).
+pub enum SubChainPayload {
+    /// Replacement mask post-processing chain.
+    Mask(Vec<Box<dyn MaskEffect>>),
+    /// Replacement background plane chain.
+    Background(Vec<Box<dyn PlaneEffect>>),
+    /// Replacement foreground plane chain.
+    Foreground(Vec<Box<dyn PlaneEffect>>),
+    /// Replacement post-composite chain.
+    Post(Vec<Box<dyn PostEffect>>),
 }
 
 impl CompositeEffect {
@@ -87,7 +111,123 @@ impl CompositeEffect {
             bg_plane: Vec::new(),
             frame_w: 0,
             frame_h: 0,
+            processing_ctx: None,
         }
+    }
+
+    /// Borrow the snapshot of [`ProcessingContext`] captured by the
+    /// last successful `prepare()`. `None` before the first prepare.
+    /// Used by Stage 13's `set_chain` flow to prepare newly-injected
+    /// sub-effects against the right resolution.
+    ///
+    /// Crate-private: external callers go through
+    /// [`Self::replace_subchain`] which reads the snapshot internally.
+    #[must_use]
+    #[allow(
+        dead_code,
+        reason = "kept as crate-private accessor for future tests / debug"
+    )]
+    pub(crate) fn processing_ctx(&self) -> Option<&ProcessingContext> {
+        self.processing_ctx.as_ref()
+    }
+
+    /// Replace one of the composite's sub-chains. New effects must
+    /// already have been `configure()`d by the caller. This call
+    /// drives `prepare()` on each new effect against the stored
+    /// [`ProcessingContext`] and swaps the new chain in. On failure
+    /// the old chain is left intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EffectError::PrepareFailed`] when prepare on a new
+    /// effect fails, or when the composite has not been prepared yet
+    /// (no stored `ProcessingContext`).
+    pub fn replace_subchain(&mut self, payload: SubChainPayload) -> Result<(), EffectError> {
+        let ctx = self.processing_ctx.clone();
+        match payload {
+            SubChainPayload::Mask(v) => replace_chain(&mut self.mask_chain, v, ctx.as_ref()),
+            SubChainPayload::Background(v) => replace_chain(&mut self.bg_chain, v, ctx.as_ref()),
+            SubChainPayload::Foreground(v) => replace_chain(&mut self.fg_chain, v, ctx.as_ref()),
+            SubChainPayload::Post(v) => replace_chain(&mut self.post_chain, v, ctx.as_ref()),
+        }
+    }
+}
+
+/// Internal sub-chain swap helper. Generic over the four sub-effect
+/// traits via [`SubEffectAdapter`] so the same body serves
+/// mask/bg/fg/post.
+fn replace_chain<E: ?Sized + SubEffectAdapter>(
+    target: &mut Vec<Box<E>>,
+    mut new_chain: Vec<Box<E>>,
+    ctx: Option<&ProcessingContext>,
+) -> Result<(), EffectError> {
+    let Some(ctx) = ctx else {
+        return Err(EffectError::PrepareFailed {
+            name: CompositeEffect::NAME.to_string(),
+            reason: "replace_subchain called before composite was prepared".into(),
+        });
+    };
+    // Prepare new effects first; on failure the old chain stays.
+    for effect in &mut new_chain {
+        effect.prepare_mut(ctx)?;
+    }
+    // Drop old chain (each effect's Drop releases its resources).
+    target.clear();
+    *target = new_chain;
+    Ok(())
+}
+
+/// Unified adapter trait that normalises `name()`, `configure()` and
+/// `prepare()` over the three sub-effect dyn types
+/// (`MaskEffect`/`PlaneEffect`/`PostEffect`). Object-safe; used by
+/// both [`replace_chain`] and [`reconfigure_in`] so the same body
+/// serves every sub-chain kind.
+///
+/// `pub(crate)` so other modules inside the crate can drive
+/// sub-effects uniformly without re-implementing the dispatch.
+pub(crate) trait SubEffectAdapter {
+    /// Stable name of the underlying effect.
+    fn name_str(&self) -> &str;
+    /// Apply user-supplied configuration. Routes to the effect's
+    /// `configure()` method.
+    fn configure_mut(&mut self, params: RawEffectParams) -> Result<(), EffectError>;
+    /// Run `prepare()` against the negotiated context.
+    fn prepare_mut(&mut self, ctx: &ProcessingContext) -> Result<(), EffectError>;
+}
+
+impl SubEffectAdapter for dyn MaskEffect {
+    fn name_str(&self) -> &str {
+        self.name()
+    }
+    fn configure_mut(&mut self, params: RawEffectParams) -> Result<(), EffectError> {
+        self.configure(params)
+    }
+    fn prepare_mut(&mut self, ctx: &ProcessingContext) -> Result<(), EffectError> {
+        self.prepare(ctx)
+    }
+}
+
+impl SubEffectAdapter for dyn PlaneEffect {
+    fn name_str(&self) -> &str {
+        self.name()
+    }
+    fn configure_mut(&mut self, params: RawEffectParams) -> Result<(), EffectError> {
+        self.configure(params)
+    }
+    fn prepare_mut(&mut self, ctx: &ProcessingContext) -> Result<(), EffectError> {
+        self.prepare(ctx)
+    }
+}
+
+impl SubEffectAdapter for dyn PostEffect {
+    fn name_str(&self) -> &str {
+        self.name()
+    }
+    fn configure_mut(&mut self, params: RawEffectParams) -> Result<(), EffectError> {
+        self.configure(params)
+    }
+    fn prepare_mut(&mut self, ctx: &ProcessingContext) -> Result<(), EffectError> {
+        self.prepare(ctx)
     }
 }
 
@@ -131,6 +271,7 @@ impl VideoEffect for CompositeEffect {
         let frame_bytes = frame_pixels * 3;
         self.mask_full = vec![0.0_f32; frame_pixels];
         self.bg_plane = vec![0_u8; frame_bytes];
+        self.processing_ctx = Some(context.clone());
         Ok(())
     }
 
@@ -240,16 +381,54 @@ impl VideoEffect for CompositeEffect {
 
         trace!(
             frame_seq = frame.meta.sequence,
-            seg_us,
-            mask_us,
-            fg_us,
-            bg_us,
-            compose_us,
-            post_us,
-            "composite per-stage timings",
+            seg_us, mask_us, fg_us, bg_us, compose_us, post_us, "composite per-stage timings",
         );
         Ok(())
     }
+
+    fn reconfigure_named_effect(
+        &mut self,
+        section: SubchainKind,
+        name: &str,
+        params: RawEffectParams,
+    ) -> Result<(), EffectError> {
+        match section {
+            SubchainKind::Mask => reconfigure_in(self.mask_chain.iter_mut(), name, params, section),
+            SubchainKind::Background => {
+                reconfigure_in(self.bg_chain.iter_mut(), name, params, section)
+            }
+            SubchainKind::Foreground => {
+                reconfigure_in(self.fg_chain.iter_mut(), name, params, section)
+            }
+            SubchainKind::Post => reconfigure_in(self.post_chain.iter_mut(), name, params, section),
+        }
+    }
+}
+
+/// Generic helper: walk a sub-chain by name and call `configure` on
+/// the matching effect. Returns `InvalidConfig` when no effect in the
+/// chain matches `name`. Generic over the sub-effect trait so the
+/// same body serves all four sub-chains.
+fn reconfigure_in<'a, E, I>(
+    iter: I,
+    name: &str,
+    params: RawEffectParams,
+    section: SubchainKind,
+) -> Result<(), EffectError>
+where
+    I: Iterator<Item = &'a mut Box<E>>,
+    E: 'a + ?Sized + SubEffectAdapter,
+{
+    for effect in iter {
+        if effect.name_str() == name {
+            return effect.configure_mut(params);
+        }
+    }
+    Err(EffectError::InvalidConfig {
+        name: CompositeEffect::NAME.to_string(),
+        reason: format!("no effect named '{name}' in the '{section}' sub-chain"),
+        hint: None,
+    })
 }
 
 // End-to-end test for `CompositeEffect::process` lives in

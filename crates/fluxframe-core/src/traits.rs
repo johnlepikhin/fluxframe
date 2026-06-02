@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::context::{FrameContext, ProcessingContext};
 use crate::error::{EffectError, InferenceError, PipelineError};
 use crate::frame::{PixelFormat, VideoFrame};
+use crate::plane::SubchainKind;
 
 /// Raw, format-coupled parameters passed to an effect at startup.
 ///
@@ -28,12 +29,43 @@ pub type RawEffectParams = toml::Value;
 /// effect on a single worker thread; if shared inspection is needed
 /// (e.g. metrics), wrap the effect in `Arc<Mutex<dyn VideoEffect>>` —
 /// `Mutex` provides `Sync` even when its contents are not.
-pub trait VideoEffect: Send {
+/// Object-safe helper enabling downcasting from `&mut dyn VideoEffect`
+/// to a concrete effect type (`CompositeEffect` in particular). All
+/// `'static` types automatically implement this via the blanket impl
+/// below; no per-effect boilerplate is needed.
+///
+/// End users **should not** implement this manually — the blanket impl
+/// below covers every `'static` type. Implementing it manually risks
+/// shadowing the blanket impl and confusing the downcast machinery.
+pub trait AsAnyMut {
+    /// Coerce `self` to `&mut dyn Any` for `downcast_mut`.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+}
+
+impl<T: std::any::Any> AsAnyMut for T {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Top-level video effect: operates on a whole [`VideoFrame`] at a
+/// time. The composite effect, passthrough effect, and any future
+/// frame-level effects implement this trait. `AsAnyMut` supertrait
+/// enables Stage 13 downcast from `&mut dyn VideoEffect` to a
+/// concrete type when the runtime needs effect-specific methods.
+pub trait VideoEffect: Send + AsAnyMut {
     /// Stable identifier used by the registry and the config (`snake_case`).
     fn name(&self) -> &'static str;
 
     /// Apply user-supplied configuration.  May be a no-op for stateless
     /// effects.
+    ///
+    /// **MAY be called after `prepare()`** for live reconfiguration via
+    /// the control socket (Stage 13). Implementations either update
+    /// `self.config` in place or re-allocate scratch lazily on the
+    /// next `process()`. MUST NOT panic on a re-call; return
+    /// `EffectError::InvalidConfig` on invalid input without
+    /// mutating self.
     ///
     /// # Errors
     ///
@@ -72,6 +104,39 @@ pub trait VideoEffect: Send {
     /// the error but continue shutdown of remaining effects.
     fn shutdown(&mut self) -> Result<(), EffectError> {
         Ok(())
+    }
+
+    /// Live-reconfigure a sub-effect identified by `(section, name)`.
+    /// Used by Stage 13's control socket. The default impl returns
+    /// [`EffectError::ProcessFailed`] indicating the effect does not
+    /// host a named sub-chain — only the composite effect's override
+    /// has a real implementation.
+    ///
+    /// `section` is the typed [`SubchainKind`] for the composite;
+    /// future effects may host their own namespaces.
+    ///
+    /// # Errors
+    ///
+    /// Implementations return [`EffectError::InvalidConfig`] for
+    /// unknown sub-chain names (the chain machinery exists but no
+    /// effect matches `name`) and [`EffectError::ProcessFailed`] only
+    /// when no sub-chain machinery exists at all (i.e. the default
+    /// implementation on a plain effect). [`EffectError::InvalidConfig`]
+    /// is also returned when the new params do not validate for the
+    /// named sub-effect.
+    fn reconfigure_named_effect(
+        &mut self,
+        section: SubchainKind,
+        name: &str,
+        _params: RawEffectParams,
+    ) -> Result<(), EffectError> {
+        Err(EffectError::ProcessFailed {
+            name: self.name().to_string(),
+            reason: format!(
+                "effect '{}' does not host a named sub-chain (asked for {section}.{name})",
+                self.name()
+            ),
+        })
     }
 }
 

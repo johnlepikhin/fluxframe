@@ -187,4 +187,62 @@ mod tests {
         // prev now holds raw frame2 = [1.0, 1.0] (for next iteration).
         assert_eq!(effect.prev, vec![1.0, 1.0]);
     }
+
+    #[test]
+    fn configure_after_prepare_is_safe() {
+        // Live-reconfig contract (Stage 13): configure() may be re-called
+        // after prepare(). For this stateful effect, also verify that
+        // re-configure() does NOT reset the alpha (prev) buffer — that's
+        // a feature, so changing `factor` mid-stream applies smoothly
+        // against the previously-seen frame.
+        let mut effect = SmoothTemporalMaskEffect::new();
+        effect
+            .configure(toml::from_str("factor = 0.5").unwrap())
+            .expect("configure 1");
+        let context = ProcessingContext {
+            width: 8,
+            height: 8,
+            format: fluxframe_core::PixelFormat::Rgb,
+            fps: 30,
+            counters: None,
+        };
+        effect.prepare(&context).expect("prepare");
+
+        // Frame 1: seeds `prev` with the input mask.
+        let mut frame1 = vec![0.0_f32; 4];
+        {
+            let mut plane = MaskPlane::new(&mut frame1, 2, 2);
+            let mut fctx = FrameContext::default();
+            effect.process(&mut plane, &mut fctx).expect("process 1");
+        }
+        assert_eq!(effect.prev, vec![0.0, 0.0, 0.0, 0.0]);
+
+        // Re-configure with a different factor (post-prepare). State
+        // (prev buffer) must persist — re-configure does not touch it.
+        let prev_before = effect.prev.clone();
+        effect
+            .configure(toml::from_str("factor = 0.9").unwrap())
+            .expect("re-configure ok");
+        assert_eq!(
+            effect.prev, prev_before,
+            "configure() must NOT reset the alpha buffer (state preservation is a feature)",
+        );
+        assert!((effect.factor - 0.9).abs() < 1e-6);
+
+        // Frame 2: 1.0 input against prev=0.0 with factor=0.9:
+        //   smoothed = 0.9 * 0.0 + 0.1 * 1.0 = 0.1
+        let mut frame2 = vec![1.0_f32; 4];
+        let mut plane = MaskPlane::new(&mut frame2, 2, 2);
+        let mut fctx = FrameContext::default();
+        effect.process(&mut plane, &mut fctx).expect("process 2");
+        for &v in &frame2 {
+            assert!(
+                (v - 0.1).abs() < 1e-5,
+                "expected ~0.1 with new factor, got {v}"
+            );
+        }
+        // After process, `prev` should now hold the raw frame2 (=1.0)
+        // ready for the next iteration.
+        assert_eq!(effect.prev, vec![1.0, 1.0, 1.0, 1.0]);
+    }
 }

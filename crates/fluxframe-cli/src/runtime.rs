@@ -17,15 +17,587 @@ use std::time::{Duration, Instant};
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::PipelineError;
-use fluxframe_core::{FluxConfig, FluxError, InputDevice};
+use fluxframe_core::{FluxConfig, FluxError, InputDevice, Preset, SubchainKind};
 use fluxframe_effects::EffectChain;
 use fluxframe_gst::input::{InputParams, InputPipeline};
 use fluxframe_gst::output::{OutputParams, OutputPipeline, OutputSink};
 use fluxframe_gst::{BusEvent, BusListener, BusSource, LatestFrameSlot, WatchedPipeline};
 use tracing::{error, info, warn};
 
+use crate::control::{
+    self, Command as ControlCommand, ListenerHandle, Response as ControlResponse,
+};
 use crate::metrics_reporter::MetricsReporter;
+use crate::preset;
 use crate::runtime_metrics::RuntimeMetrics;
+
+/// Worker-response cap for the listener thread. The worker only polls
+/// between frames; at 30 fps one cycle is ~33 ms, so 5 s is generous
+/// for a `set` and tight enough to surface a wedged worker.
+const WORKER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Depth of the listener → worker command channel. Sized to absorb a
+/// short burst of commands without blocking the listener.
+const CONTROL_CHANNEL_DEPTH: usize = 16;
+
+/// Depth of the worker → listener reply channel. Each command gets a
+/// fresh oneshot, so depth 1 is sufficient.
+const REPLY_CHANNEL_DEPTH: usize = 1;
+
+/// Envelope passed from the listener thread to the worker: a parsed
+/// command plus the channel the worker uses to send the response
+/// back. Reply channel acts as a oneshot ([`REPLY_CHANNEL_DEPTH`] = 1).
+pub(crate) struct ControlEnvelope {
+    pub cmd: ControlCommand,
+    pub reply_tx: crossbeam_channel::Sender<ControlResponse>,
+}
+
+/// Bridge from the listener's `CommandHandler` trait into the
+/// worker's command channel.
+struct ChannelHandler {
+    tx: crossbeam_channel::Sender<ControlEnvelope>,
+}
+
+impl control::CommandHandler for ChannelHandler {
+    fn handle(&self, cmd: ControlCommand) -> ControlResponse {
+        let (reply_tx, reply_rx) =
+            crossbeam_channel::bounded::<ControlResponse>(REPLY_CHANNEL_DEPTH);
+        if self.tx.send(ControlEnvelope { cmd, reply_tx }).is_err() {
+            return ControlResponse::err("worker channel closed", None);
+        }
+        match reply_rx.recv_timeout(WORKER_RESPONSE_TIMEOUT) {
+            Ok(r) => r,
+            Err(_) => ControlResponse::err(
+                "worker did not respond within timeout",
+                Some("the pipeline may be wedged; check the supervisor log".into()),
+            ),
+        }
+    }
+}
+
+/// Spawn the control listener when `[control].enabled = true`.
+/// Returns the listener handle (kept alive for the run) and the
+/// receiver the worker reads commands from. Returns `(None, None)`
+/// when the feature is disabled or the listener fails to bind
+/// (logged but not fatal).
+fn maybe_spawn_control(
+    cfg: &FluxConfig,
+) -> (
+    Option<ListenerHandle>,
+    Option<crossbeam_channel::Receiver<ControlEnvelope>>,
+) {
+    if !cfg.control.enabled {
+        return (None, None);
+    }
+    let socket_path = cfg
+        .control
+        .socket_path
+        .clone()
+        .unwrap_or_else(control::default_socket_path);
+    let (tx, rx) = crossbeam_channel::bounded::<ControlEnvelope>(CONTROL_CHANNEL_DEPTH);
+    let handler = ChannelHandler { tx };
+    match control::spawn(socket_path, handler) {
+        Ok(handle) => (Some(handle), Some(rx)),
+        Err(e) => {
+            warn!(error = %e, "control socket failed to bind; live-reconfig disabled");
+            (None, None)
+        }
+    }
+}
+
+/// Apply a single control command. Returns the response the worker
+/// will hand back to the listener thread.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "command dispatcher; refactor deferred"
+)]
+fn apply_control_command(
+    cfg: &mut FluxConfig,
+    config_path: Option<&std::path::Path>,
+    processing_ctx: &ProcessingContext,
+    chain: &mut EffectChain,
+    active_preset_name: &mut String,
+    active_preset: &mut Preset,
+    cmd: ControlCommand,
+) -> ControlResponse {
+    match cmd {
+        ControlCommand::ListPresets => {
+            let names: Vec<&str> = cfg.presets.keys().map(String::as_str).collect();
+            ControlResponse::ok_with(serde_json::json!(names))
+        }
+        ControlCommand::CurrentPreset => {
+            ControlResponse::ok_with(serde_json::json!(active_preset_name.clone()))
+        }
+        ControlCommand::SetPreset { name } => {
+            let Some(new_preset) = cfg.presets.get(&name) else {
+                let available: Vec<&str> = cfg.presets.keys().map(String::as_str).collect();
+                return ControlResponse::err(
+                    format!("preset '{name}' not defined"),
+                    Some(format!("available: {}", available.join(", "))),
+                );
+            };
+            let mut new_chain = match preset::build_chain(&name, new_preset) {
+                Ok(c) => c,
+                Err(e) => return ControlResponse::err(format!("build chain failed: {e}"), None),
+            };
+            if let Err(e) = new_chain.prepare_all(processing_ctx) {
+                return ControlResponse::err(
+                    format!("prepare failed: {e}"),
+                    Some(format!(
+                        "preset '{name}' parsed but did not initialise at runtime"
+                    )),
+                );
+            }
+            // Swap in the new chain; old chain is shut down on the
+            // local variable.
+            std::mem::swap(chain, &mut new_chain);
+            if let Err(e) = new_chain.shutdown_all() {
+                warn!(error = %e, "old chain shutdown reported an error");
+            }
+            active_preset_name.clone_from(&name);
+            // Refresh the working preset copy from the source-of-truth
+            // config so `current_config` / `set` see the new pipeline.
+            *active_preset = new_preset.clone();
+            info!(preset = %name, "control: swapped active preset");
+            ControlResponse::ok()
+        }
+        ControlCommand::Set { path, value } => {
+            apply_set_command(chain, active_preset, &path, value)
+        }
+        ControlCommand::SetChain {
+            section,
+            chain: new_names,
+        } => apply_set_chain_command(chain, active_preset, section, &new_names),
+        ControlCommand::GetConfig { path } => {
+            apply_get_config_command(active_preset, path.as_deref())
+        }
+        ControlCommand::Reload => apply_reload_command(
+            cfg,
+            config_path,
+            processing_ctx,
+            chain,
+            active_preset_name,
+            active_preset,
+        ),
+    }
+}
+
+/// Apply `reload`. Re-reads the TOML file from disk, validates it,
+/// re-binds the daemon's `cfg`, then rebuilds the currently-active
+/// preset (looking up the same name in the new config). CLI
+/// overrides are NOT re-applied — they were captured at startup and
+/// remain in effect through `working_cfg`.
+fn apply_reload_command(
+    cfg: &mut FluxConfig,
+    config_path: Option<&std::path::Path>,
+    processing_ctx: &ProcessingContext,
+    chain: &mut EffectChain,
+    active_preset_name: &mut String,
+    active_preset: &mut Preset,
+) -> ControlResponse {
+    let Some(path) = config_path else {
+        return ControlResponse::err(
+            "no config path provided at startup",
+            Some("pass --config <PATH> on the command line to enable reload".into()),
+        );
+    };
+    let new_cfg = match crate::config_merge::load(Some(path)) {
+        Ok(c) => c,
+        Err(e) => {
+            return ControlResponse::err(
+                format!("re-read failed: {e}"),
+                Some(format!("path: {}", path.display())),
+            );
+        }
+    };
+    if let Err(e) = new_cfg.validate() {
+        return ControlResponse::err(format!("validation failed: {e}"), None);
+    }
+    let Some(new_preset) = new_cfg.presets.get(active_preset_name) else {
+        let available: Vec<&str> = new_cfg.presets.keys().map(String::as_str).collect();
+        return ControlResponse::err(
+            format!("active preset '{active_preset_name}' is gone from the reloaded config"),
+            Some(format!(
+                "available presets after reload: {}",
+                available.join(", ")
+            )),
+        );
+    };
+    let mut new_chain = match preset::build_chain(active_preset_name, new_preset) {
+        Ok(c) => c,
+        Err(e) => return ControlResponse::err(format!("build chain failed: {e}"), None),
+    };
+    if let Err(e) = new_chain.prepare_all(processing_ctx) {
+        return ControlResponse::err(
+            format!("prepare on reloaded chain failed: {e}"),
+            Some("the live chain is unchanged".into()),
+        );
+    }
+    std::mem::swap(chain, &mut new_chain);
+    if let Err(e) = new_chain.shutdown_all() {
+        warn!(error = %e, "old chain shutdown reported an error during reload");
+    }
+    *active_preset = new_preset.clone();
+    *cfg = new_cfg;
+    info!(path = %path.display(), preset = %active_preset_name, "control: reloaded config from disk");
+    ControlResponse::ok()
+}
+
+/// Apply `get_config { path }`. With `path = None`, serialise the
+/// whole active preset; otherwise walk the dot-path into the JSON
+/// representation and return that subtree.
+fn apply_get_config_command(active_preset: &Preset, path: Option<&str>) -> ControlResponse {
+    let full = match serde_json::to_value(active_preset) {
+        Ok(v) => v,
+        Err(e) => return ControlResponse::err(format!("serialise failed: {e}"), None),
+    };
+    let Some(path) = path else {
+        return ControlResponse::ok_with(full);
+    };
+    // Walk dot-path into the serialised value. Components must exist
+    // as object keys at each step.
+    let mut current = &full;
+    for component in path.split('.') {
+        if component.is_empty() {
+            return ControlResponse::err(format!("empty component in path '{path}'"), None);
+        }
+        match current.get(component) {
+            Some(v) => current = v,
+            None => {
+                return ControlResponse::err(
+                    format!("path '{path}' has no value at '{component}'"),
+                    None,
+                );
+            }
+        }
+    }
+    ControlResponse::ok_with(current.clone())
+}
+
+/// Apply a `set <path> <value>` command. Parses the dot-path,
+/// converts the JSON value to TOML, merges the field into the active
+/// preset's `per_effect[effect]` table, builds a fresh `RawEffectParams`
+/// from the merged table, and calls into the chain's named-effect
+/// reconfiguration.
+fn apply_set_command(
+    chain: &mut EffectChain,
+    active_preset: &mut Preset,
+    path: &str,
+    value: serde_json::Value,
+) -> ControlResponse {
+    let set_path = match crate::control::commands::parse_set_path(path) {
+        Ok(p) => p,
+        Err(e) => return ControlResponse::err(e, None),
+    };
+    let toml_value = match crate::control::commands::json_to_toml(value) {
+        Ok(v) => v,
+        Err(e) => return ControlResponse::err(e, None),
+    };
+    let Some(section_mut) = section_mut(active_preset, set_path.section) else {
+        return ControlResponse::err(
+            format!(
+                "preset does not have a [{section}] sub-section",
+                section = set_path.section,
+            ),
+            Some("set the chain on this section first (or use set_chain)".into()),
+        );
+    };
+    // Read the existing per-effect table for this effect (defaulting
+    // to empty), insert the new field, then hand the merged table to
+    // the chain for reconfiguration. On failure we revert the in-memory
+    // copy AND re-call reconfigure with the ORIGINAL params so the
+    // live effect's `self.config` matches what we kept in memory —
+    // important for effects with lazy reload (image_fill, blur) that
+    // pick up the new config on the next `process()`.
+    let original_entry = section_mut.per_effect.get(&set_path.effect).cloned();
+    let mut effect_table = match original_entry.clone() {
+        Some(toml::Value::Table(t)) => t,
+        _ => toml::Table::new(),
+    };
+    effect_table.insert(set_path.field.clone(), toml_value);
+    let merged_params: fluxframe_core::traits::RawEffectParams =
+        toml::Value::Table(effect_table.clone());
+    section_mut
+        .per_effect
+        .insert(set_path.effect.clone(), toml::Value::Table(effect_table));
+    match chain.reconfigure_named_effect(set_path.section, &set_path.effect, merged_params) {
+        Ok(()) => {
+            info!(
+                section = %set_path.section,
+                effect = %set_path.effect,
+                field = %set_path.field,
+                "control: live-reconfigured effect"
+            );
+            ControlResponse::ok()
+        }
+        Err(e) => {
+            tracing::debug!(
+                section = %set_path.section,
+                effect = %set_path.effect,
+                field = %set_path.field,
+                error = %e,
+                "control: set rejected",
+            );
+            // Revert the in-memory copy.
+            match &original_entry {
+                Some(v) => {
+                    section_mut
+                        .per_effect
+                        .insert(set_path.effect.clone(), v.clone());
+                }
+                None => {
+                    section_mut.per_effect.remove(&set_path.effect);
+                }
+            }
+            // Best-effort revert of the live effect: reconfigure with
+            // the ORIGINAL params so an effect that already swapped
+            // its `self.config` rolls back. Build a TOML table from
+            // `original_entry` (or an empty one) and replay. If this
+            // second call also fails, log a warn — we cannot do
+            // better without tearing the chain down.
+            let revert_params: fluxframe_core::traits::RawEffectParams = match original_entry {
+                Some(toml::Value::Table(t)) => toml::Value::Table(t),
+                _ => toml::Value::Table(toml::Table::new()),
+            };
+            if let Err(revert_err) =
+                chain.reconfigure_named_effect(set_path.section, &set_path.effect, revert_params)
+            {
+                warn!(
+                    section = %set_path.section,
+                    effect = %set_path.effect,
+                    error = %revert_err,
+                    "control: revert reconfigure also failed; live effect may be in an inconsistent state",
+                );
+            }
+            let (reason, hint) = match &e {
+                fluxframe_core::EffectError::InvalidConfig { reason, hint, .. } => {
+                    (reason.clone(), hint.clone())
+                }
+                other => (format!("{other}"), None),
+            };
+            ControlResponse::err(reason, hint)
+        }
+    }
+}
+
+/// Mutable accessor for a sub-section of a [`Preset`] by typed kind.
+fn section_mut(
+    preset: &mut Preset,
+    section: SubchainKind,
+) -> Option<&mut fluxframe_core::PipelineSection> {
+    match section {
+        SubchainKind::Mask => preset.mask.as_mut(),
+        SubchainKind::Background => preset.background.as_mut(),
+        SubchainKind::Foreground => preset.foreground.as_mut(),
+        SubchainKind::Post => preset.post.as_mut(),
+    }
+}
+
+/// Apply `set_chain <section> [...]`. Rebuilds the named sub-chain
+/// against the live registry, configures each effect with the
+/// matching `per_effect` payload from the active preset (defaults
+/// when absent), prepares them against the composite's stored
+/// `ProcessingContext`, and swaps them in.
+///
+/// Available only with the `ml` feature: `set_chain` rebuilds the
+/// composite's sub-chains, which depend on the composite effect (and
+/// the post/mask/plane registries that the composite owns).
+#[cfg(feature = "ml")]
+fn apply_set_chain_command(
+    chain: &mut EffectChain,
+    active_preset: &mut Preset,
+    section: SubchainKind,
+    new_names: &[String],
+) -> ControlResponse {
+    let Some(composite) = chain.composite_mut() else {
+        return ControlResponse::err(
+            "active chain has no composite (preset has no [mask] section)",
+            Some("set a composite preset first via set_preset".into()),
+        );
+    };
+    let Some(section_data) = section_mut(active_preset, section) else {
+        return ControlResponse::err(
+            format!("preset does not have a [{section}] sub-section"),
+            Some("expected mask|background|foreground|post".into()),
+        );
+    };
+    // Build new effects + configure them. The old `per_effect` payload
+    // is reused when present; otherwise an empty TOML table feeds
+    // the effect its serde defaults.
+    let result = build_and_configure_subchain(section, new_names, &section_data.per_effect);
+    let payload = match result {
+        Ok(o) => o,
+        Err(e) => return ControlResponse::err(e.reason, e.hint),
+    };
+    // Hand the new chain to the composite. `replace_subchain` runs
+    // `prepare()` against the stored ProcessingContext and atomically
+    // swaps. On failure, the old chain stays intact and we don't
+    // touch active_preset.
+    match composite.replace_subchain(payload) {
+        Ok(()) => {
+            section_data.chain = new_names.to_vec();
+            info!(section = %section, chain = ?new_names, "control: replaced sub-chain");
+            ControlResponse::ok()
+        }
+        Err(e) => ControlResponse::err(
+            format!("prepare on new chain failed: {e}"),
+            Some("the previous chain is still active".into()),
+        ),
+    }
+}
+
+/// Slim-build stub for `set_chain`: the post/mask/plane registries
+/// and the composite effect are all `ml`-gated, so this command is
+/// unavailable without `--features ml`.
+#[cfg(not(feature = "ml"))]
+fn apply_set_chain_command(
+    _chain: &mut EffectChain,
+    _active_preset: &mut Preset,
+    _section: SubchainKind,
+    _new_names: &[String],
+) -> ControlResponse {
+    ControlResponse::err(
+        "set_chain unavailable: built without ml feature",
+        Some("rebuild with `--features fluxframe-cli/ml` to enable composite live-reconfig".into()),
+    )
+}
+
+/// Sub-error type the chain-build path can surface.
+#[cfg(feature = "ml")]
+struct SubChainError {
+    reason: String,
+    hint: Option<String>,
+}
+
+/// Resolve effect names against the right registry and configure each
+/// with the matching `per_effect` table. Mirrors what
+/// `CompositeBuilder` does at construction time, but exposed here so
+/// the worker can rebuild a single sub-chain at runtime.
+#[cfg(feature = "ml")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "four enum arms × build+configure pattern; trait-object types differ so each arm is its own monomorphisation"
+)]
+fn build_and_configure_subchain(
+    section: SubchainKind,
+    names: &[String],
+    per_effect: &std::collections::BTreeMap<String, toml::Value>,
+) -> Result<fluxframe_effects::composite::SubChainPayload, SubChainError> {
+    use fluxframe_effects::composite::SubChainPayload;
+    use fluxframe_effects::{mask_effects, plane_effects, post_effects};
+
+    /// Local helper: trait object with a `configure()` method, used
+    /// to drive each effect's `configure()` after registry build.
+    /// Implemented in this crate for the three sub-effect dyn types
+    /// because the unified `SubEffectAdapter` lives `pub(crate)` in
+    /// `fluxframe-effects` and is not exposed here.
+    trait Configure {
+        fn configure_mut(
+            &mut self,
+            params: fluxframe_core::traits::RawEffectParams,
+        ) -> Result<(), fluxframe_core::EffectError>;
+    }
+    impl Configure for dyn fluxframe_core::MaskEffect {
+        fn configure_mut(
+            &mut self,
+            params: fluxframe_core::traits::RawEffectParams,
+        ) -> Result<(), fluxframe_core::EffectError> {
+            self.configure(params)
+        }
+    }
+    impl Configure for dyn fluxframe_core::PlaneEffect {
+        fn configure_mut(
+            &mut self,
+            params: fluxframe_core::traits::RawEffectParams,
+        ) -> Result<(), fluxframe_core::EffectError> {
+            self.configure(params)
+        }
+    }
+    impl Configure for dyn fluxframe_core::PostEffect {
+        fn configure_mut(
+            &mut self,
+            params: fluxframe_core::traits::RawEffectParams,
+        ) -> Result<(), fluxframe_core::EffectError> {
+            self.configure(params)
+        }
+    }
+
+    fn configure_each<E>(
+        chain: &mut [Box<E>],
+        names: &[String],
+        per_effect: &std::collections::BTreeMap<String, toml::Value>,
+    ) -> Result<(), fluxframe_core::EffectError>
+    where
+        E: ?Sized + Configure,
+    {
+        for (effect, name) in chain.iter_mut().zip(names.iter()) {
+            let params = per_effect
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+            effect.configure_mut(params)?;
+        }
+        Ok(())
+    }
+    match section {
+        SubchainKind::Mask => {
+            let mut built = mask_effects::default_registry()
+                .build_chain(names)
+                .map_err(|e| SubChainError {
+                    reason: format!("mask chain build failed: {e}"),
+                    hint: None,
+                })?;
+            configure_each::<dyn fluxframe_core::MaskEffect>(&mut built, names, per_effect)
+                .map_err(|e| SubChainError {
+                    reason: format!("configure failed: {e}"),
+                    hint: None,
+                })?;
+            Ok(SubChainPayload::Mask(built))
+        }
+        SubchainKind::Background => {
+            let mut built = plane_effects::default_registry()
+                .build_chain(names)
+                .map_err(|e| SubChainError {
+                    reason: format!("background chain build failed: {e}"),
+                    hint: None,
+                })?;
+            configure_each::<dyn fluxframe_core::PlaneEffect>(&mut built, names, per_effect)
+                .map_err(|e| SubChainError {
+                    reason: format!("configure failed: {e}"),
+                    hint: None,
+                })?;
+            Ok(SubChainPayload::Background(built))
+        }
+        SubchainKind::Foreground => {
+            let mut built = plane_effects::default_registry()
+                .build_chain(names)
+                .map_err(|e| SubChainError {
+                    reason: format!("foreground chain build failed: {e}"),
+                    hint: None,
+                })?;
+            configure_each::<dyn fluxframe_core::PlaneEffect>(&mut built, names, per_effect)
+                .map_err(|e| SubChainError {
+                    reason: format!("configure failed: {e}"),
+                    hint: None,
+                })?;
+            Ok(SubChainPayload::Foreground(built))
+        }
+        SubchainKind::Post => {
+            let mut built = post_effects::default_registry()
+                .build_chain(names)
+                .map_err(|e| SubChainError {
+                    reason: format!("post chain build failed: {e}"),
+                    hint: None,
+                })?;
+            configure_each::<dyn fluxframe_core::PostEffect>(&mut built, names, per_effect)
+                .map_err(|e| SubChainError {
+                    reason: format!("configure failed: {e}"),
+                    hint: None,
+                })?;
+            Ok(SubChainPayload::Post(built))
+        }
+    }
+}
 
 /// How long the worker waits on an empty frame slot before re-checking the
 /// shutdown flag.  Short enough to be responsive to Ctrl-C, long enough to
@@ -283,9 +855,21 @@ pub(crate) fn classify_output(cfg: &FluxConfig) -> OutputSpec {
 ///
 /// Propagates [`FluxError`] from pipeline construction, effect chain
 /// preparation, or runtime failures.
-#[tracing::instrument(skip_all, fields(sink = ?cfg.output.device))]
-pub(crate) fn run_testsrc_chain(cfg: &FluxConfig, chain: EffectChain) -> Result<(), FluxError> {
-    run_chain(cfg, chain, "testsrc", InputPipeline::build_testsrc)
+#[tracing::instrument(skip_all, fields(sink = ?cfg.output.device, preset = preset_name))]
+pub(crate) fn run_testsrc_chain(
+    cfg: &FluxConfig,
+    preset_name: &str,
+    config_path: Option<&std::path::Path>,
+    chain: EffectChain,
+) -> Result<(), FluxError> {
+    run_chain(
+        cfg,
+        preset_name,
+        config_path,
+        chain,
+        "testsrc",
+        InputPipeline::build_testsrc,
+    )
 }
 
 /// Run the effect chain against a V4L2 capture device.
@@ -295,8 +879,13 @@ pub(crate) fn run_testsrc_chain(cfg: &FluxConfig, chain: EffectChain) -> Result<
 /// Propagates [`FluxError`] from pipeline construction (including a
 /// structured [`PipelineError::InputDeviceUnavailable`] when the
 /// pre-open check fails), effect chain preparation, or runtime failures.
-#[tracing::instrument(skip_all, fields(device = %cfg.input.device, sink = ?cfg.output.device))]
-pub(crate) fn run_v4l2_chain(cfg: &FluxConfig, chain: EffectChain) -> Result<(), FluxError> {
+#[tracing::instrument(skip_all, fields(device = %cfg.input.device, sink = ?cfg.output.device, preset = preset_name))]
+pub(crate) fn run_v4l2_chain(
+    cfg: &FluxConfig,
+    preset_name: &str,
+    config_path: Option<&std::path::Path>,
+    chain: EffectChain,
+) -> Result<(), FluxError> {
     // Detect the camera's native fps so the operator's `[input] fps`
     // hint becomes an upper bound, not a hard requirement: requesting
     // 30 fps from a 15 fps camera silently capped to 15 is friendlier
@@ -351,9 +940,14 @@ pub(crate) fn run_v4l2_chain(cfg: &FluxConfig, chain: EffectChain) -> Result<(),
     resolved.input.fps = detected.fps;
 
     let device_path_for_builder = device_path.clone();
-    run_chain(&resolved, chain, "v4l2src", move |params| {
-        InputPipeline::build_v4l2(&device_path_for_builder, params)
-    })
+    run_chain(
+        &resolved,
+        preset_name,
+        config_path,
+        chain,
+        "v4l2src",
+        move |params| InputPipeline::build_v4l2(&device_path_for_builder, params),
+    )
 }
 
 /// Shared driver for all input backends: takes a closure that builds the
@@ -361,6 +955,8 @@ pub(crate) fn run_v4l2_chain(cfg: &FluxConfig, chain: EffectChain) -> Result<(),
 /// lives in exactly one place.
 fn run_chain<F>(
     cfg: &FluxConfig,
+    preset_name: &str,
+    config_path: Option<&std::path::Path>,
     mut chain: EffectChain,
     source_label: &'static str,
     input_builder: F,
@@ -435,7 +1031,25 @@ where
     // `Drop` impl joins the thread before we tear down counters.
     let _reporter = spawn_metrics_reporter(cfg, &metrics, &running);
 
-    let process_result = run_process_loop(&running, &slot, &mut chain, &output, &metrics);
+    // Stage 13 control socket. Spawned only when explicitly enabled.
+    // The handle owns the listener thread; dropping it unlinks the
+    // socket file at end-of-run.
+    let (control_handle, control_rx) = maybe_spawn_control(cfg);
+
+    let process_result = run_process_loop(
+        cfg,
+        config_path,
+        preset_name,
+        &processing_ctx,
+        &running,
+        &slot,
+        &mut chain,
+        &output,
+        &metrics,
+        control_rx.as_ref(),
+    );
+
+    drop(control_handle);
 
     // Ensure the bus listener wakes and exits.  Dropping `_bus_listener`
     // at the end of the function calls `BusListener::stop` via Drop, but
@@ -647,12 +1261,21 @@ fn spawn_metrics_reporter(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "supervisor wiring; refactor deferred"
+)]
 fn run_process_loop(
+    cfg: &FluxConfig,
+    config_path: Option<&std::path::Path>,
+    initial_preset_name: &str,
+    processing_ctx: &ProcessingContext,
     running: &AtomicBool,
     slot: &LatestFrameSlot,
     chain: &mut EffectChain,
     output: &OutputPipeline,
     metrics: &RuntimeMetrics,
+    control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
 ) -> Result<(), FluxError> {
     let mut frame_context = FrameContext {
         // Hand the supervisor's inference histogram to every effect
@@ -666,7 +1289,44 @@ fn run_process_loop(
     // exact frame_seq, instead of being lost in the per-frame debug noise.
     let mut prev_fallback = false;
     let mut frames_seen: u64 = 0;
+    let mut active_preset_name = initial_preset_name.to_string();
+    // Owned config copy. `reload` replaces it with a freshly-read
+    // version; per-command lookups go through `&working_cfg`. This
+    // lets the worker stay self-contained across config reloads
+    // without rethreading lifetimes.
+    let mut working_cfg: FluxConfig = cfg.clone();
+    // Working copy of the active preset. Stage 13 `Set`/`SetChain`
+    // commands mutate this in addition to applying changes to the
+    // live chain; the copy keeps `current_config`/introspection
+    // consistent and serves as the rebuild source for chain
+    // composition changes.
+    let mut active_preset: Preset = working_cfg
+        .presets
+        .get(initial_preset_name)
+        .cloned()
+        .unwrap_or_default();
     while running.load(Ordering::Acquire) {
+        // Drain any pending control commands before processing the
+        // next frame. Each command is fully applied (or rejected)
+        // before the worker reads from the slot, so the swap is
+        // atomic with respect to frame boundaries.
+        if let Some(rx) = control_rx {
+            while let Ok(envelope) = rx.try_recv() {
+                let response = apply_control_command(
+                    &mut working_cfg,
+                    config_path,
+                    processing_ctx,
+                    chain,
+                    &mut active_preset_name,
+                    &mut active_preset,
+                    envelope.cmd,
+                );
+                // Best-effort: if the listener already dropped the
+                // reply receiver, the client has disconnected and we
+                // simply move on.
+                let _ = envelope.reply_tx.send(response);
+            }
+        }
         let Some(mut frame) = slot.recv_timeout(WORKER_POLL_TIMEOUT) else {
             // Either timeout (no frame within the poll window) or slot
             // closed by shutdown.  Re-check the flag and continue.
@@ -952,5 +1612,170 @@ mod tests {
                 node_name: Some("flux".into())
             }
         );
+    }
+
+    // ----------------------------------------------------------------
+    // Control-socket dispatcher tests (Stage 13)
+    //
+    // These exercise `apply_control_command` / `apply_set_command` /
+    // `apply_get_config_command` / `apply_reload_command` directly
+    // with a stub `EffectChain` (a single `PassthroughEffect`). The
+    // dispatch logic does not touch GStreamer, so we can synthesise
+    // the inputs without the rest of the supervisor.
+    // ----------------------------------------------------------------
+
+    use fluxframe_core::PipelineSection;
+    use fluxframe_core::frame::PixelFormat;
+    use fluxframe_effects::EffectChain as StubEffectChain;
+    use fluxframe_effects::PassthroughEffect;
+
+    /// Build a chain containing one `PassthroughEffect`. Sufficient
+    /// for tests that exercise the dispatcher control flow without
+    /// caring about per-frame processing.
+    fn stub_chain() -> StubEffectChain {
+        StubEffectChain::new(vec![Box::new(PassthroughEffect::new())])
+    }
+
+    fn stub_ctx() -> ProcessingContext {
+        ProcessingContext {
+            width: 4,
+            height: 4,
+            format: PixelFormat::Rgb,
+            fps: 30,
+            counters: None,
+        }
+    }
+
+    fn ok_payload(r: &ControlResponse) -> &serde_json::Value {
+        match r {
+            ControlResponse::Ok { data } => data,
+            ControlResponse::Err { .. } => panic!("expected Ok, got {r:?}"),
+        }
+    }
+
+    fn err_reason(r: &ControlResponse) -> &str {
+        match r {
+            ControlResponse::Err { error, .. } => error.as_str(),
+            ControlResponse::Ok { .. } => panic!("expected Err, got {r:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_control_command_list_presets_returns_names() {
+        let mut cfg = base_cfg();
+        cfg.presets.insert("a".into(), Preset::default());
+        cfg.presets.insert("b".into(), Preset::default());
+        let mut chain = stub_chain();
+        let mut name = "a".to_string();
+        let mut preset = Preset::default();
+        let ctx = stub_ctx();
+        let resp = apply_control_command(
+            &mut cfg,
+            None,
+            &ctx,
+            &mut chain,
+            &mut name,
+            &mut preset,
+            ControlCommand::ListPresets,
+        );
+        let data = ok_payload(&resp);
+        let arr = data.as_array().expect("ListPresets returns array");
+        let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        assert!(names.contains(&"a"), "names: {names:?}");
+        assert!(names.contains(&"b"), "names: {names:?}");
+    }
+
+    #[test]
+    fn apply_control_command_set_preset_unknown_name_lists_available() {
+        let mut cfg = base_cfg();
+        cfg.presets.insert("alpha".into(), Preset::default());
+        let mut chain = stub_chain();
+        let mut name = "alpha".to_string();
+        let mut preset = Preset::default();
+        let ctx = stub_ctx();
+        let resp = apply_control_command(
+            &mut cfg,
+            None,
+            &ctx,
+            &mut chain,
+            &mut name,
+            &mut preset,
+            ControlCommand::SetPreset {
+                name: "missing".into(),
+            },
+        );
+        match resp {
+            ControlResponse::Err { error, hint } => {
+                assert!(error.contains("missing"), "error: {error}");
+                let hint = hint.expect("hint must list available presets");
+                assert!(hint.contains("alpha"), "hint: {hint}");
+            }
+            ControlResponse::Ok { .. } => panic!("expected Err"),
+        }
+    }
+
+    #[test]
+    fn apply_set_command_revert_on_invalid_value() {
+        // Stub chain has no composite, so `reconfigure_named_effect`
+        // returns Err for any path. The in-memory preset must NOT
+        // grow the new key — the revert path puts it back the way it
+        // was.
+        let mut chain = stub_chain();
+        let mut preset = Preset {
+            background: Some(PipelineSection::default()),
+            ..Preset::default()
+        };
+        let before = preset.background.as_ref().unwrap().per_effect.clone();
+        let resp = apply_set_command(
+            &mut chain,
+            &mut preset,
+            "background.blur.radius",
+            serde_json::json!(42),
+        );
+        assert!(matches!(resp, ControlResponse::Err { .. }));
+        let after = preset.background.as_ref().unwrap().per_effect.clone();
+        assert_eq!(
+            before, after,
+            "in-memory preset must be unchanged after revert"
+        );
+    }
+
+    #[test]
+    fn apply_get_config_command_walks_nested_path() {
+        // Build a preset with a known nested shape so we can walk
+        // into it via the dot-path.
+        let section = PipelineSection {
+            chain: vec!["blur".into()],
+            ..PipelineSection::default()
+        };
+        let preset = Preset {
+            background: Some(section),
+            ..Preset::default()
+        };
+        let resp = apply_get_config_command(&preset, Some("background.chain"));
+        let data = ok_payload(&resp);
+        let arr = data.as_array().expect("chain returns array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0].as_str(), Some("blur"));
+    }
+
+    #[test]
+    fn apply_get_config_command_rejects_empty_component() {
+        let preset = Preset::default();
+        let resp = apply_get_config_command(&preset, Some("background..chain"));
+        let reason = err_reason(&resp);
+        assert!(reason.contains("empty"), "reason: {reason}");
+    }
+
+    #[test]
+    fn apply_reload_command_without_path_errors() {
+        let mut cfg = base_cfg();
+        let mut chain = stub_chain();
+        let mut name = "default".to_string();
+        let mut preset = Preset::default();
+        let ctx = stub_ctx();
+        let resp = apply_reload_command(&mut cfg, None, &ctx, &mut chain, &mut name, &mut preset);
+        let reason = err_reason(&resp);
+        assert!(reason.contains("config path"), "reason: {reason}");
     }
 }

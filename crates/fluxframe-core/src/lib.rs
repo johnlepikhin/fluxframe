@@ -18,8 +18,8 @@ pub mod plane;
 pub mod traits;
 
 pub use config::{
-    AutoInputConfig, BackendKind, FluxConfig, InputConfig, InputDevice, LoggingConfig,
-    OutputConfig, OutputScale, PipelineSection, Preset, RealtimeConfig,
+    AutoInputConfig, BackendKind, ControlConfig, FluxConfig, InputConfig, InputDevice,
+    LoggingConfig, OutputConfig, OutputScale, PipelineSection, Preset, RealtimeConfig,
 };
 pub use context::{FrameContext, ProcessingContext, RuntimeState};
 pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineError};
@@ -27,7 +27,7 @@ pub use frame::{FrameBuffer, FrameMeta, PixelFormat, Timestamp, VideoFrame};
 pub use metrics::{
     CounterValues, Counters, EffectTelemetry, LatencyHistogram, LatencySnapshot, MetricsSnapshot,
 };
-pub use plane::{FramePlane, MaskEffect, MaskPlane, PlaneEffect, PostEffect};
+pub use plane::{FramePlane, MaskEffect, MaskPlane, PlaneEffect, PostEffect, SubchainKind};
 pub use traits::{
     InferenceEngine, InferenceInput, InferenceOutput, ModelInfo, RawEffectParams, VideoEffect,
     VideoSink, VideoSource,
@@ -483,6 +483,52 @@ forground = "typo"
             msg.contains("forground") || msg.contains("unknown"),
             "diagnostic must point at the typo, got: {msg}"
         );
+    }
+
+    #[test]
+    fn control_section_defaults_disabled() {
+        // No [control] in TOML — section is present in the struct
+        // through `#[serde(default)]` and disabled.
+        let cfg = FluxConfig::from_toml_str(
+            r#"
+[input]
+device = "testsrc"
+"#,
+        )
+        .expect("parses without [control]");
+        assert!(!cfg.control.enabled);
+        assert!(cfg.control.socket_path.is_none());
+    }
+
+    #[test]
+    fn control_section_parses_enabled_and_path() {
+        let cfg = FluxConfig::from_toml_str(
+            r#"
+[control]
+enabled = true
+socket_path = "/run/user/1000/fluxframe.sock"
+"#,
+        )
+        .expect("parses [control]");
+        assert!(cfg.control.enabled);
+        assert_eq!(
+            cfg.control.socket_path.as_deref(),
+            Some(std::path::Path::new("/run/user/1000/fluxframe.sock"))
+        );
+    }
+
+    #[test]
+    fn control_rejects_unknown_field() {
+        let err = FluxConfig::from_toml_str(
+            r"
+[control]
+enabled = true
+bogus = 42
+",
+        )
+        .expect_err("unknown [control] field must be rejected");
+        let msg = format!("{err}");
+        assert!(msg.contains("bogus"), "got: {msg}");
     }
 
     #[test]
