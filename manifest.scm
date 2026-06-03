@@ -53,5 +53,19 @@
    ;; Keep around because GStreamer plugins built from source still
    ;; want libstdc++ available.
    "gcc-toolchain"
+   ;; GTK 4 + libadwaita stack for the `fluxframe-gui` crate.
+   ;; `gtk` in Guix is GTK 4 (not GTK 3 — that one is `gtk+`).
+   ;; `libadwaita` 1.x layers GNOME widgets (AdwApplicationWindow,
+   ;; AdwPreferencesPage, AdwToastOverlay) on top of GTK 4.
+   ;; `graphene` is GTK 4's small math library — pulled by gtk4-rs
+   ;; bindings.  `pango`, `cairo`, `gdk-pixbuf` come transitively
+   ;; through gtk/gstreamer, but listing them keeps the cargo build
+   ;; honest when guix recomposes profiles.
+   "gtk"
+   "libadwaita"
+   "graphene"
+   "pango"
+   "cairo"
+   "gdk-pixbuf"
    "nss-certs"
    "coreutils"))

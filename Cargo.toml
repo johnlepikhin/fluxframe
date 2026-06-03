@@ -5,6 +5,7 @@ members = [
     "crates/fluxframe-gst",
     "crates/fluxframe-effects",
     "crates/fluxframe-cli",
+    "crates/fluxframe-gui",
 ]
 
 [workspace.package]
@@ -70,6 +71,9 @@ openvino = { version = "0.11", default-features = false, features = ["runtime-li
 # support; we only need `jpeg` + `png` for typical corporate brand
 # backgrounds.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# GTK 4 + libadwaita stack lives in `fluxframe-gui/Cargo.toml` directly
+# because the `package = "..."` rename does not interact cleanly with
+# `workspace.dependencies` inheritance. Version pins documented there.
 
 [workspace.lints.rust]
 # `forbid` (not `deny`) so a stray `#[allow(unsafe_code)]` somewhere in

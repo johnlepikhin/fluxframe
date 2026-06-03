@@ -1,0 +1,31 @@
+[package]
+name = "fluxframe-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "GTK4/libadwaita GUI client for the FluxFrame control socket."
+
+[dependencies]
+fluxframe-core = { workspace = true }
+# GTK stack — keep these out of workspace.dependencies because the
+# `package = "..."` rename does not play well with workspace
+# inheritance. Version + features must match the daemon-shared
+# workspace pin (kept in sync by hand).
+relm4 = { version = "0.10", default-features = false, features = ["macros", "libadwaita", "gnome_48"] }
+gtk = { package = "gtk4", version = "0.10", features = ["v4_18"] }
+adw = { package = "libadwaita", version = "0.8", features = ["v1_6", "gtk_v4_18"] }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "fluxframe-gui"
+path = "src/main.rs"
+
+[lints]
+workspace = true
