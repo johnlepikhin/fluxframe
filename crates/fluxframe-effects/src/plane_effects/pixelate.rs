@@ -12,6 +12,9 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::{
+    CommitStrategy, DEBOUNCE_STANDARD_MS, EffectMetadata, ParamDescriptor, ParamKind, Scale,
+};
 use fluxframe_core::plane::{FramePlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
@@ -20,11 +23,16 @@ use serde::Deserialize;
 /// is its own block); rejecting it surfaces the misconfiguration
 /// instead of silently doing nothing.
 const MIN_BLOCK_SIZE: u32 = 2;
+const MIN_BLOCK_SIZE_I64: i64 = MIN_BLOCK_SIZE as i64; // cast at module scope, used by METADATA below
 /// Arbitrary safety cap.  Above this the output is indistinguishable
 /// from a single solid colour even on 4K frames, and the `u32`
 /// accumulator must stay well under `u32::MAX` (`256^2 * 255 ≈ 1.67e7`
 /// today — see invariant note in `process`).
 const MAX_BLOCK_SIZE: u32 = 256;
+const MAX_BLOCK_SIZE_I64: i64 = MAX_BLOCK_SIZE as i64; // cast at module scope, used by METADATA below
+
+/// Default block edge length, in pixels.
+pub const DEFAULT_BLOCK_SIZE: u32 = 16;
 
 /// TOML schema:
 ///
@@ -45,7 +53,7 @@ pub struct PixelateConfig {
 }
 
 fn default_block_size() -> u32 {
-    16
+    DEFAULT_BLOCK_SIZE
 }
 
 impl Default for PixelateConfig {
@@ -64,6 +72,26 @@ pub struct PixelateEffect {
 impl PixelateEffect {
     /// Effect name as registered in the plane registry.
     pub const NAME: &'static str = "pixelate";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Mosaic the plane via per-block colour averaging.",
+        params: &[ParamDescriptor {
+            name: "block_size",
+            kind: ParamKind::Integer {
+                default: DEFAULT_BLOCK_SIZE as i64,
+                min: MIN_BLOCK_SIZE_I64,
+                max: MAX_BLOCK_SIZE_I64,
+                step: 1,
+                scale: Scale::Logarithmic,
+            },
+            help: "Edge length of each averaging block, in pixels.",
+            commit: CommitStrategy::Live {
+                debounce_ms: DEBOUNCE_STANDARD_MS,
+            },
+        }],
+    };
 
     /// Construct with the default block size.
     #[must_use]

@@ -2,6 +2,9 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::{
+    CommitStrategy, DEBOUNCE_STANDARD_MS, EffectMetadata, ParamDescriptor, ParamKind, Scale,
+};
 use fluxframe_core::plane::{MaskEffect, MaskPlane};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
@@ -9,6 +12,10 @@ use serde::Deserialize;
 use crate::processing::feather;
 
 const MAX_RADIUS: u32 = 64;
+const MAX_RADIUS_I64: i64 = MAX_RADIUS as i64; // cast at module scope, used by METADATA below
+
+/// Default half-kernel radius for the `radius` field.
+pub const DEFAULT_RADIUS: u32 = 7;
 
 /// TOML schema: `radius = 7` (default).
 #[derive(Debug, Clone, Deserialize)]
@@ -21,7 +28,7 @@ pub struct FeatherConfig {
 }
 
 fn default_radius() -> u32 {
-    7
+    DEFAULT_RADIUS
 }
 
 impl Default for FeatherConfig {
@@ -42,6 +49,26 @@ pub struct FeatherMaskEffect {
 impl FeatherMaskEffect {
     /// Effect name as registered in the mask registry.
     pub const NAME: &'static str = "feather";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Soften the mask edge via a separable box blur.",
+        params: &[ParamDescriptor {
+            name: "radius",
+            kind: ParamKind::Integer {
+                default: DEFAULT_RADIUS as i64,
+                min: 0,
+                max: MAX_RADIUS_I64,
+                step: 1,
+                scale: Scale::Linear,
+            },
+            help: "Half-kernel radius in mask-resolution pixels (0 disables).",
+            commit: CommitStrategy::Live {
+                debounce_ms: DEBOUNCE_STANDARD_MS,
+            },
+        }],
+    };
 
     /// Construct with the default radius.
     #[must_use]

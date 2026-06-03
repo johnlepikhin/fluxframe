@@ -14,11 +14,19 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::{
+    CommitStrategy, DEBOUNCE_FAST_MS, EffectMetadata, ParamDescriptor, ParamKind, Scale,
+};
 use fluxframe_core::plane::{FramePlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
 use super::helpers::reject_out_of_range;
+
+/// Default maximum darkening at the frame corners for the `strength` field.
+pub const DEFAULT_STRENGTH: f32 = 0.4;
+/// Default normalised radius at which the vignette begins to take effect.
+pub const DEFAULT_INNER_RADIUS: f32 = 0.5;
 
 /// TOML schema:
 ///
@@ -46,11 +54,11 @@ pub struct VignetteConfig {
 }
 
 fn default_strength() -> f32 {
-    0.4
+    DEFAULT_STRENGTH
 }
 
 fn default_inner_radius() -> f32 {
-    0.5
+    DEFAULT_INNER_RADIUS
 }
 
 impl Default for VignetteConfig {
@@ -76,6 +84,42 @@ pub struct VignetteEffect {
 impl VignetteEffect {
     /// Effect name as registered in the plane registry.
     pub const NAME: &'static str = "vignette";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Smooth radial darkening toward the frame corners.",
+        params: &[
+            ParamDescriptor {
+                name: "strength",
+                kind: ParamKind::Float {
+                    default: DEFAULT_STRENGTH,
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.05,
+                    scale: Scale::Linear,
+                },
+                help: "Max darkening at the corners; 0 disables.",
+                commit: CommitStrategy::Live {
+                    debounce_ms: DEBOUNCE_FAST_MS,
+                },
+            },
+            ParamDescriptor {
+                name: "inner_radius",
+                kind: ParamKind::Float {
+                    default: DEFAULT_INNER_RADIUS,
+                    min: 0.0,
+                    max: 0.99,
+                    step: 0.05,
+                    scale: Scale::Linear,
+                },
+                help: "Normalised radius where falloff starts (0=centre).",
+                commit: CommitStrategy::Live {
+                    debounce_ms: DEBOUNCE_FAST_MS,
+                },
+            },
+        ],
+    };
 
     /// Construct with the default strength and inner radius — must be
     /// `configure`d and `prepare`d before use.

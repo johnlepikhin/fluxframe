@@ -7,6 +7,10 @@ use std::sync::Arc;
 use fluxframe_core::Counters;
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::{
+    CommitStrategy, DEBOUNCE_FAST_MS, DEBOUNCE_HEAVY_MS, DEBOUNCE_STANDARD_MS, EffectMetadata,
+    ParamDescriptor, ParamKind, Scale,
+};
 use fluxframe_core::plane::{FramePlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
@@ -15,8 +19,18 @@ use crate::backend::{BackendOverrides, BlurBackend, build_blur_backend};
 use crate::processing::{resize_rgb_bilinear, resize_rgb_nearest};
 
 const MAX_BLUR_RADIUS: u32 = 256;
+const MAX_BLUR_RADIUS_I64: i64 = MAX_BLUR_RADIUS as i64; // cast at module scope, used by METADATA below
 const MAX_BLUR_PASSES: u32 = 16;
+const MAX_BLUR_PASSES_I64: i64 = MAX_BLUR_PASSES as i64; // cast at module scope, used by METADATA below
 const MAX_BLUR_DOWNSCALE: u32 = 8;
+const MAX_BLUR_DOWNSCALE_I64: i64 = MAX_BLUR_DOWNSCALE as i64; // cast at module scope, used by METADATA below
+
+/// Default box-blur half-kernel radius in frame pixels.
+pub const DEFAULT_RADIUS: u32 = 20;
+/// Default number of box-blur passes.
+pub const DEFAULT_PASSES: u32 = 2;
+/// Default downscale factor for the blur pipeline.
+pub const DEFAULT_DOWNSCALE: u32 = 4;
 
 /// TOML schema:
 ///
@@ -44,13 +58,13 @@ pub struct BlurConfig {
 }
 
 fn default_radius() -> u32 {
-    20
+    DEFAULT_RADIUS
 }
 fn default_passes() -> u32 {
-    2
+    DEFAULT_PASSES
 }
 fn default_downscale() -> u32 {
-    4
+    DEFAULT_DOWNSCALE
 }
 
 impl Default for BlurConfig {
@@ -88,6 +102,56 @@ pub struct BlurPlaneEffect {
 impl BlurPlaneEffect {
     /// Effect name as registered in the plane registry.
     pub const NAME: &'static str = "blur";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Box-blur the plane with an optional internal downscale.",
+        params: &[
+            ParamDescriptor {
+                name: "radius",
+                kind: ParamKind::Integer {
+                    default: DEFAULT_RADIUS as i64,
+                    min: 0,
+                    max: MAX_BLUR_RADIUS_I64,
+                    step: 1,
+                    scale: Scale::Logarithmic,
+                },
+                help: "Box half-kernel radius in frame pixels.",
+                commit: CommitStrategy::Live {
+                    debounce_ms: DEBOUNCE_FAST_MS,
+                },
+            },
+            ParamDescriptor {
+                name: "passes",
+                kind: ParamKind::Integer {
+                    default: DEFAULT_PASSES as i64,
+                    min: 1,
+                    max: MAX_BLUR_PASSES_I64,
+                    step: 1,
+                    scale: Scale::Linear,
+                },
+                help: "Number of box passes; >= 2 approximates a Gaussian.",
+                commit: CommitStrategy::Live {
+                    debounce_ms: DEBOUNCE_STANDARD_MS,
+                },
+            },
+            ParamDescriptor {
+                name: "downscale",
+                kind: ParamKind::Integer {
+                    default: DEFAULT_DOWNSCALE as i64,
+                    min: 1,
+                    max: MAX_BLUR_DOWNSCALE_I64,
+                    step: 1,
+                    scale: Scale::Linear,
+                },
+                help: "Internal downscale factor; 1 disables.",
+                commit: CommitStrategy::Live {
+                    debounce_ms: DEBOUNCE_HEAVY_MS,
+                },
+            },
+        ],
+    };
 
     /// Construct with defaults; configure/prepare before use.
     #[must_use]

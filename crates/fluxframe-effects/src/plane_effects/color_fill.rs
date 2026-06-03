@@ -6,6 +6,7 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::{CommitStrategy, EffectMetadata, ParamDescriptor, ParamKind};
 use fluxframe_core::plane::{FramePlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
@@ -32,6 +33,20 @@ pub struct ColorFillEffect {
 impl ColorFillEffect {
     /// Effect name as registered in the plane registry.
     pub const NAME: &'static str = "color_fill";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Replace the plane with a single RGB fill colour.",
+        params: &[ParamDescriptor {
+            name: "rgb",
+            kind: ParamKind::Color {
+                default: [128, 128, 128],
+            },
+            help: "Fill colour as a 3-byte RGB tuple.",
+            commit: CommitStrategy::OnCommit,
+        }],
+    };
 
     /// Construct with an explicit colour (mostly for tests; the
     /// production path goes through [`PlaneEffect::configure`]).

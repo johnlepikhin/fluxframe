@@ -2,6 +2,9 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::{
+    CommitStrategy, DEBOUNCE_STANDARD_MS, EffectMetadata, ParamDescriptor, ParamKind, Scale,
+};
 use fluxframe_core::plane::{MaskEffect, MaskPlane};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
@@ -9,6 +12,10 @@ use serde::Deserialize;
 use crate::processing::dilate;
 
 const MAX_ITERATIONS: u32 = 32;
+const MAX_ITERATIONS_I64: i64 = MAX_ITERATIONS as i64; // cast at module scope, used by METADATA below
+
+/// Default number of 3×3 dilation passes for the `iterations` field.
+pub const DEFAULT_ITERATIONS: u32 = 1;
 
 /// TOML schema: `iterations = 1` (default).
 #[derive(Debug, Clone, Deserialize)]
@@ -21,7 +28,7 @@ pub struct DilateConfig {
 }
 
 fn default_iterations() -> u32 {
-    1
+    DEFAULT_ITERATIONS
 }
 
 impl Default for DilateConfig {
@@ -46,6 +53,26 @@ pub struct DilateMaskEffect {
 impl DilateMaskEffect {
     /// Effect name as registered in the mask registry.
     pub const NAME: &'static str = "dilate";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Morphological dilation: expand the mask foreground by N 3×3 passes.",
+        params: &[ParamDescriptor {
+            name: "iterations",
+            kind: ParamKind::Integer {
+                default: DEFAULT_ITERATIONS as i64,
+                min: 0,
+                max: MAX_ITERATIONS_I64,
+                step: 1,
+                scale: Scale::Linear,
+            },
+            help: "Number of 3×3 max-kernel passes; 0 disables.",
+            commit: CommitStrategy::Live {
+                debounce_ms: DEBOUNCE_STANDARD_MS,
+            },
+        }],
+    };
 
     /// Construct with the default iteration count.
     #[must_use]

@@ -18,6 +18,9 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::{
+    CommitStrategy, DEBOUNCE_STANDARD_MS, EffectMetadata, ParamDescriptor, ParamKind, Scale,
+};
 use fluxframe_core::plane::{FramePlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
@@ -51,6 +54,14 @@ const MAX_PERCENTILE_LOW: f32 = 0.2;
 /// Minimum permitted `percentile_high`. Below `0.8` (80 %) the stretch
 /// blows highlights to pure white.
 const MIN_PERCENTILE_HIGH: f32 = 0.8;
+
+/// Default target mean luminance for the `target_brightness` field.
+pub const DEFAULT_TARGET_BRIGHTNESS: f32 = 0.55;
+/// Default lower percentile cutoff for the `percentile_low` field.
+pub const DEFAULT_PERCENTILE_LOW: f32 = 0.05;
+/// Default upper percentile cutoff for the `percentile_high` field.
+pub const DEFAULT_PERCENTILE_HIGH: f32 = 0.95;
+
 /// Symmetric guard the normalised post-stretch mean is clamped into
 /// before feeding the logarithm. Keeps `mean = 0` or `mean = 255`
 /// (fully black / fully white frames) from producing `log(0) = -inf`
@@ -90,15 +101,15 @@ pub struct ExposureCorrectConfig {
 }
 
 fn default_target_brightness() -> f32 {
-    0.55
+    DEFAULT_TARGET_BRIGHTNESS
 }
 
 fn default_percentile_low() -> f32 {
-    0.05
+    DEFAULT_PERCENTILE_LOW
 }
 
 fn default_percentile_high() -> f32 {
-    0.95
+    DEFAULT_PERCENTILE_HIGH
 }
 
 impl Default for ExposureCorrectConfig {
@@ -120,6 +131,56 @@ pub struct ExposureCorrectEffect {
 impl ExposureCorrectEffect {
     /// Effect name as registered in the plane registry.
     pub const NAME: &'static str = "exposure_correct";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Histogram stretch + gamma toward a target mean brightness.",
+        params: &[
+            ParamDescriptor {
+                name: "target_brightness",
+                kind: ParamKind::Float {
+                    default: DEFAULT_TARGET_BRIGHTNESS,
+                    min: MIN_TARGET_BRIGHTNESS,
+                    max: MAX_TARGET_BRIGHTNESS,
+                    step: 0.05,
+                    scale: Scale::Linear,
+                },
+                help: "Target mean luminance after correction.",
+                commit: CommitStrategy::Live {
+                    debounce_ms: DEBOUNCE_STANDARD_MS,
+                },
+            },
+            ParamDescriptor {
+                name: "percentile_low",
+                kind: ParamKind::Float {
+                    default: DEFAULT_PERCENTILE_LOW,
+                    min: 0.0,
+                    max: MAX_PERCENTILE_LOW,
+                    step: 0.01,
+                    scale: Scale::Linear,
+                },
+                help: "Lower histogram percentile mapped to 0.",
+                commit: CommitStrategy::Live {
+                    debounce_ms: DEBOUNCE_STANDARD_MS,
+                },
+            },
+            ParamDescriptor {
+                name: "percentile_high",
+                kind: ParamKind::Float {
+                    default: DEFAULT_PERCENTILE_HIGH,
+                    min: MIN_PERCENTILE_HIGH,
+                    max: 1.0,
+                    step: 0.01,
+                    scale: Scale::Linear,
+                },
+                help: "Upper histogram percentile mapped to 255.",
+                commit: CommitStrategy::Live {
+                    debounce_ms: DEBOUNCE_STANDARD_MS,
+                },
+            },
+        ],
+    };
 
     /// Construct with default settings (target 0.55, percentiles 5/95)
     /// — must be `configure`d and `prepare`d before use.

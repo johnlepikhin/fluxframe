@@ -32,6 +32,9 @@ use std::collections::VecDeque;
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::{
+    CommitStrategy, DEBOUNCE_FAST_MS, EffectMetadata, ParamDescriptor, ParamKind, Scale,
+};
 use fluxframe_core::plane::{MaskEffect, MaskPlane};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
@@ -84,6 +87,26 @@ pub struct LargestBlobMaskEffect {
 impl LargestBlobMaskEffect {
     /// Effect name as registered in the mask registry.
     pub const NAME: &'static str = "largest_blob";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Keep only the largest connected mask component above a threshold.",
+        params: &[ParamDescriptor {
+            name: "level",
+            kind: ParamKind::Float {
+                default: DEFAULT_LEVEL,
+                min: 0.0,
+                max: 1.0,
+                step: 0.01,
+                scale: Scale::Linear,
+            },
+            help: "Pixels with value >= level are eligible for blob labeling.",
+            commit: CommitStrategy::Live {
+                debounce_ms: DEBOUNCE_FAST_MS,
+            },
+        }],
+    };
 
     /// Construct with the default threshold.
     #[must_use]

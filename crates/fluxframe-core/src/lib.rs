@@ -13,8 +13,10 @@ pub mod config;
 pub mod context;
 pub mod error;
 pub mod frame;
+pub mod metadata;
 pub mod metrics;
 pub mod plane;
+pub mod protocol;
 pub mod traits;
 
 pub use config::{
@@ -24,10 +26,12 @@ pub use config::{
 pub use context::{FrameContext, ProcessingContext, RuntimeState};
 pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineError};
 pub use frame::{FrameBuffer, FrameMeta, PixelFormat, Timestamp, VideoFrame};
+pub use metadata::{CommitStrategy, EffectMetadata, ParamDescriptor, ParamKind, Scale};
 pub use metrics::{
     CounterValues, Counters, EffectTelemetry, LatencyHistogram, LatencySnapshot, MetricsSnapshot,
 };
 pub use plane::{FramePlane, MaskEffect, MaskPlane, PlaneEffect, PostEffect, SubchainKind};
+pub use protocol::{Command, Response, SetPath, default_socket_path, parse_set_path};
 pub use traits::{
     InferenceEngine, InferenceInput, InferenceOutput, ModelInfo, RawEffectParams, VideoEffect,
     VideoSink, VideoSource,

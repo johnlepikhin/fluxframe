@@ -15,6 +15,9 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::{
+    CommitStrategy, DEBOUNCE_FAST_MS, EffectMetadata, ParamDescriptor, ParamKind, Scale,
+};
 use fluxframe_core::plane::{FramePlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
@@ -25,6 +28,9 @@ use super::helpers::reject_out_of_range;
 /// pronounced ringing halos rather than perceived sharpness; reject
 /// loudly so the operator notices the misconfiguration.
 const MAX_AMOUNT: f32 = 2.0;
+
+/// Default sharpening strength for the `amount` field.
+pub const DEFAULT_AMOUNT: f32 = 0.3;
 
 /// TOML schema:
 ///
@@ -47,7 +53,7 @@ pub struct SharpenConfig {
 }
 
 fn default_amount() -> f32 {
-    0.3
+    DEFAULT_AMOUNT
 }
 
 impl Default for SharpenConfig {
@@ -74,6 +80,26 @@ pub struct SharpenEffect {
 impl SharpenEffect {
     /// Effect name as registered in the plane registry.
     pub const NAME: &'static str = "sharpen";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "3x3 separable unsharp-mask sharpening.",
+        params: &[ParamDescriptor {
+            name: "amount",
+            kind: ParamKind::Float {
+                default: DEFAULT_AMOUNT,
+                min: 0.0,
+                max: MAX_AMOUNT,
+                step: 0.05,
+                scale: Scale::Linear,
+            },
+            help: "Sharpening strength; 0 disables, 0.2-0.5 is typical.",
+            commit: CommitStrategy::Live {
+                debounce_ms: DEBOUNCE_FAST_MS,
+            },
+        }],
+    };
 
     /// Construct with the default amount — must be `configure`d and
     /// `prepare`d before use.

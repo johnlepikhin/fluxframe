@@ -2,9 +2,14 @@
 //! [`crate::mask_effects::MaskEffectRegistry`] and
 //! [`crate::plane_effects::PlaneEffectRegistry`], on the post-composite
 //! mask-aware side.
+//!
+//! Each entry pairs a build closure with a `&'static EffectMetadata`
+//! reference. Metadata is registry-only (no method on the trait) so a
+//! caller introspecting the inventory never has to build an instance.
 
 use std::collections::BTreeMap;
 
+use fluxframe_core::EffectMetadata;
 use fluxframe_core::error::EffectError;
 use fluxframe_core::plane::PostEffect;
 
@@ -23,10 +28,15 @@ where
     }
 }
 
+struct Entry {
+    factory: Box<dyn PostEffectFactory>,
+    metadata: &'static EffectMetadata,
+}
+
 /// Name-keyed map of post-effect factories.
 #[derive(Default)]
 pub struct PostEffectRegistry {
-    factories: BTreeMap<&'static str, Box<dyn PostEffectFactory>>,
+    entries: BTreeMap<&'static str, Entry>,
 }
 
 impl PostEffectRegistry {
@@ -36,39 +46,56 @@ impl PostEffectRegistry {
         Self::default()
     }
 
-    /// Register a factory under the canonical name.
-    pub fn register(&mut self, name: &'static str, factory: Box<dyn PostEffectFactory>) {
-        self.factories.insert(name, factory);
+    /// Register a factory under the canonical name, paired with its
+    /// metadata descriptor.
+    pub fn register(
+        &mut self,
+        name: &'static str,
+        factory: Box<dyn PostEffectFactory>,
+        metadata: &'static EffectMetadata,
+    ) {
+        self.entries.insert(name, Entry { factory, metadata });
     }
 
     /// Look up a factory.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&dyn PostEffectFactory> {
-        self.factories.get(name).map(std::convert::AsRef::as_ref)
+        self.entries.get(name).map(|e| e.factory.as_ref())
+    }
+
+    /// Look up the metadata for a registered name.
+    #[must_use]
+    pub fn metadata(&self, name: &str) -> Option<&'static EffectMetadata> {
+        self.entries.get(name).map(|e| e.metadata)
+    }
+
+    /// Iterate every registered effect's metadata, in name order.
+    pub fn iter_metadata(&self) -> impl Iterator<Item = &'static EffectMetadata> + '_ {
+        self.entries.values().map(|e| e.metadata)
     }
 
     /// Sorted list of registered effect names.
     #[must_use]
     pub fn names(&self) -> Vec<&'static str> {
-        self.factories.keys().copied().collect()
+        self.entries.keys().copied().collect()
     }
 
     /// Number of registered factories.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.factories.len()
+        self.entries.len()
     }
 
     /// Returns `true` if no factory has been registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.factories.is_empty()
+        self.entries.is_empty()
     }
 
     /// Returns `true` if a factory is registered under `name`.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
-        self.factories.contains_key(name)
+        self.entries.contains_key(name)
     }
 
     /// Build a chain from a list of effect names.
@@ -104,10 +131,12 @@ pub fn default_registry() -> PostEffectRegistry {
     registry.register(
         PassthroughPostEffect::NAME,
         Box::new(|| -> Box<dyn PostEffect> { Box::new(PassthroughPostEffect::new()) }),
+        &PassthroughPostEffect::METADATA,
     );
     registry.register(
         AutoFrameEffect::NAME,
         Box::new(|| -> Box<dyn PostEffect> { Box::new(AutoFrameEffect::new()) }),
+        &AutoFrameEffect::METADATA,
     );
     registry
 }
@@ -129,5 +158,21 @@ mod tests {
         let reg = default_registry();
         let res = reg.build_chain(&["nonexistent"]);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn metadata_exposed_for_every_registered_name() {
+        let reg = default_registry();
+        for name in reg.names() {
+            let meta = reg.metadata(name).expect("metadata for registered name");
+            assert_eq!(meta.name, name, "metadata.name must match registry key");
+        }
+    }
+
+    #[test]
+    fn iter_metadata_yields_one_entry_per_name() {
+        let reg = default_registry();
+        let count = reg.iter_metadata().count();
+        assert_eq!(count, reg.len());
     }
 }

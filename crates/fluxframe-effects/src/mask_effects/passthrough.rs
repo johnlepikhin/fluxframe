@@ -6,6 +6,7 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::EffectMetadata;
 use fluxframe_core::plane::{MaskEffect, MaskPlane};
 use fluxframe_core::traits::RawEffectParams;
 
@@ -16,6 +17,13 @@ pub struct PassthroughMaskEffect;
 impl PassthroughMaskEffect {
     /// Effect name as registered in the mask registry.
     pub const NAME: &'static str = "passthrough";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Identity mask: leaves the mask untouched.",
+        params: &[],
+    };
 
     /// Construct.
     #[must_use]

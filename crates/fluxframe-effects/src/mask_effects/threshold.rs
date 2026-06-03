@@ -2,11 +2,18 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::{
+    CommitStrategy, DEBOUNCE_FAST_MS, EffectMetadata, ParamDescriptor, ParamKind, Scale,
+};
 use fluxframe_core::plane::{MaskEffect, MaskPlane};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
 use crate::processing::threshold;
+
+/// Default binarisation cutoff for the `level` field — pixels with
+/// `mask >= DEFAULT_LEVEL` become 1.0, others 0.0.
+pub const DEFAULT_LEVEL: f32 = 0.5;
 
 /// TOML schema: `level = 0.5` (default).
 #[derive(Debug, Clone, Deserialize)]
@@ -18,7 +25,7 @@ pub struct ThresholdConfig {
 }
 
 fn default_level() -> f32 {
-    0.5
+    DEFAULT_LEVEL
 }
 
 impl Default for ThresholdConfig {
@@ -38,6 +45,26 @@ pub struct ThresholdMaskEffect {
 impl ThresholdMaskEffect {
     /// Effect name as registered in the mask registry.
     pub const NAME: &'static str = "threshold";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Binarise the mask at a fixed level.",
+        params: &[ParamDescriptor {
+            name: "level",
+            kind: ParamKind::Float {
+                default: DEFAULT_LEVEL,
+                min: 0.0,
+                max: 1.0,
+                step: 0.01,
+                scale: Scale::Linear,
+            },
+            help: "Mask values >= level become 1.0, others 0.0.",
+            commit: CommitStrategy::Live {
+                debounce_ms: DEBOUNCE_FAST_MS,
+            },
+        }],
+    };
 
     /// Construct with default `level = 0.5`.
     #[must_use]

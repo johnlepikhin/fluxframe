@@ -4,6 +4,7 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::EffectMetadata;
 use fluxframe_core::plane::{FramePlane, MaskPlane, PostEffect};
 use fluxframe_core::traits::RawEffectParams;
 
@@ -14,6 +15,13 @@ pub struct PassthroughPostEffect;
 impl PassthroughPostEffect {
     /// Canonical (snake_case) name used by the registry and CLI.
     pub const NAME: &'static str = "passthrough";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Identity post-effect: leaves the composited frame untouched.",
+        params: &[],
+    };
 
     /// Construct a fresh passthrough effect.
     #[must_use]

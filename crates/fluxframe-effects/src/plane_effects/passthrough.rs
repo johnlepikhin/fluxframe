@@ -6,6 +6,7 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::EffectMetadata;
 use fluxframe_core::plane::{FramePlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 
@@ -17,6 +18,13 @@ pub struct PassthroughPlaneEffect;
 impl PassthroughPlaneEffect {
     /// Effect name as registered in the plane registry.
     pub const NAME: &'static str = "passthrough";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Identity plane effect: leaves the plane untouched.",
+        params: &[],
+    };
 
     /// Construct.
     #[must_use]

@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::{CommitStrategy, EffectMetadata, ParamDescriptor, ParamKind};
 use fluxframe_core::plane::{FramePlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use image::imageops::FilterType;
@@ -107,6 +108,44 @@ pub struct ImageFillEffect {
 impl ImageFillEffect {
     /// Effect name as registered in the plane registry.
     pub const NAME: &'static str = "image_fill";
+
+    /// Self-describing metadata for the registry and the GUI.
+    ///
+    /// `path` is `required = true, default = None` — the consistency
+    /// test in [`crate::plane_effects::metadata_tests`] skips this
+    /// effect because no defaulting strategy can supply a valid file
+    /// path.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Replace the plane with a static image loaded from disk.",
+        params: &[
+            ParamDescriptor {
+                name: "path",
+                kind: ParamKind::Path {
+                    default: None,
+                    extensions: &["png", "jpg", "jpeg"],
+                    required: true,
+                },
+                help: "Path to the background image (PNG or JPEG).",
+                commit: CommitStrategy::OnCommit,
+            },
+            ParamDescriptor {
+                name: "fit",
+                kind: ParamKind::Enum {
+                    default: "cover",
+                    variants: &["cover", "stretch", "contain"],
+                },
+                help: "How to fit the source image into the frame.",
+                commit: CommitStrategy::Instant,
+            },
+            ParamDescriptor {
+                name: "letterbox_rgb",
+                kind: ParamKind::Color { default: [0, 0, 0] },
+                help: "Fill colour for `contain` mode letterbox bars.",
+                commit: CommitStrategy::OnCommit,
+            },
+        ],
+    };
 
     /// Construct without configuration — must be `configure`d and
     /// `prepare`d before use.

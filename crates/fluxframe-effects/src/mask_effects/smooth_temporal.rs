@@ -14,11 +14,17 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::{
+    CommitStrategy, DEBOUNCE_FAST_MS, EffectMetadata, ParamDescriptor, ParamKind, Scale,
+};
 use fluxframe_core::plane::{MaskEffect, MaskPlane};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
 use crate::processing::smooth_temporal;
+
+/// Default EMA inertia for the `factor` field.
+pub const DEFAULT_FACTOR: f32 = 0.65;
 
 /// TOML schema: `factor = 0.65` (default). Closer to 1 → smoother
 /// (more inertia, more visible lag); 0 → no smoothing.
@@ -32,7 +38,7 @@ pub struct SmoothTemporalConfig {
 }
 
 fn default_factor() -> f32 {
-    0.65
+    DEFAULT_FACTOR
 }
 
 impl Default for SmoothTemporalConfig {
@@ -58,6 +64,26 @@ pub struct SmoothTemporalMaskEffect {
 impl SmoothTemporalMaskEffect {
     /// Effect name as registered in the mask registry.
     pub const NAME: &'static str = "smooth_temporal";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Exponential moving average smoothing across frames.",
+        params: &[ParamDescriptor {
+            name: "factor",
+            kind: ParamKind::Float {
+                default: DEFAULT_FACTOR,
+                min: 0.0,
+                max: 1.0,
+                step: 0.01,
+                scale: Scale::Linear,
+            },
+            help: "EMA inertia: 0 disables; 1.0 freezes the mask indefinitely.",
+            commit: CommitStrategy::Live {
+                debounce_ms: DEBOUNCE_FAST_MS,
+            },
+        }],
+    };
 
     /// Construct with the default factor.
     #[must_use]

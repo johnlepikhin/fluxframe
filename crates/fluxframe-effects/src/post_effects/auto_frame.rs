@@ -22,6 +22,9 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::{
+    CommitStrategy, DEBOUNCE_STANDARD_MS, EffectMetadata, ParamDescriptor, ParamKind, Scale,
+};
 use fluxframe_core::plane::{FramePlane, MaskPlane, PostEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
@@ -37,6 +40,15 @@ const MAX_ZOOM: f32 = 4.0;
 /// updates (state stuck at the first sample). Cap below `1.0` so the
 /// operator can't accidentally freeze the crop window.
 const MAX_SMOOTHING: f32 = 0.99;
+
+/// Default mask-confidence threshold for the `threshold` field.
+pub const DEFAULT_THRESHOLD: f32 = 0.5;
+/// Default symmetric bbox expansion fraction for the `padding` field.
+pub const DEFAULT_PADDING: f32 = 0.15;
+/// Default EMA inertia for the `smoothing` field.
+pub const DEFAULT_SMOOTHING: f32 = 0.85;
+/// Default maximum zoom factor for the `zoom_max` field.
+pub const DEFAULT_ZOOM_MAX: f32 = 1.6;
 
 /// TOML schema:
 ///
@@ -75,16 +87,16 @@ pub struct AutoFrameConfig {
 }
 
 fn default_threshold() -> f32 {
-    0.5
+    DEFAULT_THRESHOLD
 }
 fn default_padding() -> f32 {
-    0.15
+    DEFAULT_PADDING
 }
 fn default_smoothing() -> f32 {
-    0.85
+    DEFAULT_SMOOTHING
 }
 fn default_zoom_max() -> f32 {
-    1.6
+    DEFAULT_ZOOM_MAX
 }
 
 impl Default for AutoFrameConfig {
@@ -124,6 +136,70 @@ pub struct AutoFrameEffect {
 impl AutoFrameEffect {
     /// Effect name as registered in the post-effect registry.
     pub const NAME: &'static str = "auto_frame";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Mask-driven auto-framing: crop and recenter around the subject.",
+        params: &[
+            ParamDescriptor {
+                name: "threshold",
+                kind: ParamKind::Float {
+                    default: DEFAULT_THRESHOLD,
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.05,
+                    scale: Scale::Linear,
+                },
+                help: "Mask confidence cutoff for bbox extraction.",
+                commit: CommitStrategy::Live {
+                    debounce_ms: DEBOUNCE_STANDARD_MS,
+                },
+            },
+            ParamDescriptor {
+                name: "padding",
+                kind: ParamKind::Float {
+                    default: DEFAULT_PADDING,
+                    min: 0.0,
+                    max: 1.0,
+                    step: 0.05,
+                    scale: Scale::Linear,
+                },
+                help: "Symmetric bbox expansion fraction.",
+                commit: CommitStrategy::Live {
+                    debounce_ms: DEBOUNCE_STANDARD_MS,
+                },
+            },
+            ParamDescriptor {
+                name: "smoothing",
+                kind: ParamKind::Float {
+                    default: DEFAULT_SMOOTHING,
+                    min: 0.0,
+                    max: MAX_SMOOTHING,
+                    step: 0.05,
+                    scale: Scale::Linear,
+                },
+                help: "EMA inertia for the crop window; 0 snaps, 0.99 freezes.",
+                commit: CommitStrategy::Live {
+                    debounce_ms: DEBOUNCE_STANDARD_MS,
+                },
+            },
+            ParamDescriptor {
+                name: "zoom_max",
+                kind: ParamKind::Float {
+                    default: DEFAULT_ZOOM_MAX,
+                    min: 1.0,
+                    max: MAX_ZOOM,
+                    step: 0.1,
+                    scale: Scale::Linear,
+                },
+                help: "Maximum allowed zoom; 1.0 disables cropping.",
+                commit: CommitStrategy::Live {
+                    debounce_ms: DEBOUNCE_STANDARD_MS,
+                },
+            },
+        ],
+    };
 
     /// Construct with defaults. `configure()` and `prepare()` must be
     /// called before `process()`.

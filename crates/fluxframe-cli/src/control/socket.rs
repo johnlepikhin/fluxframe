@@ -39,6 +39,15 @@ use super::commands::{Command, Response};
 /// the cap exists strictly as a safety valve.
 pub const MAX_COMMAND_LENGTH: usize = 64 * 1024;
 
+/// Upper bound on a single serialised response line, in bytes.
+/// Symmetric with [`MAX_COMMAND_LENGTH`] — responses that exceed
+/// this are replaced with a structured error rather than shipping
+/// a partial line that the client would parse-fail on. Picked
+/// generously (256 KiB) because metadata payloads can grow as the
+/// effect catalogue does; below this the daemon should never hit
+/// it in practice.
+pub const MAX_RESPONSE_LENGTH: usize = 256 * 1024;
+
 /// Trait implemented by the worker-side command dispatcher. The
 /// listener thread keeps no state — every parsed command goes through
 /// `handle`. Implementations send the command to the worker and
@@ -345,33 +354,34 @@ fn write_response<W: Write>(writer: &mut W, response: &Response) -> std::io::Res
             return Ok(());
         }
     };
+    let payload = if payload.len() > MAX_RESPONSE_LENGTH {
+        warn!(
+            len = payload.len(),
+            limit = MAX_RESPONSE_LENGTH,
+            "response exceeded byte limit; replacing with error"
+        );
+        // Re-serialise a known-small error instead.
+        let err = Response::err(
+            format!("response exceeded {MAX_RESPONSE_LENGTH}-byte limit"),
+            Some("the daemon's reply was too large for the control protocol".into()),
+        );
+        serde_json::to_string(&err).unwrap_or_else(|_| {
+            // Extremely unlikely (the error struct is tiny and known-serialisable),
+            // but if it ever fails, emit a hand-written JSON literal.
+            r#"{"ok":"false","error":"response too large and re-serialisation failed"}"#.to_string()
+        })
+    } else {
+        payload
+    };
     writeln!(writer, "{payload}")
 }
 
-/// Derive the default socket path from an `XDG_RUNTIME_DIR` value
-/// (typically read from the environment). When `xdg` is `None` or
-/// empty, falls back to `/tmp/fluxframe.sock`.
-///
-/// The split between this pure helper and the env-reading wrapper
-/// [`default_socket_path`] keeps the workspace's `forbid(unsafe_code)`
-/// invariant intact — env mutation in tests would require unsafe.
-#[must_use]
-pub fn resolve_socket_path(xdg: Option<&str>) -> PathBuf {
-    match xdg {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir).join("fluxframe.sock"),
-        _ => PathBuf::from("/tmp/fluxframe.sock"),
-    }
-}
-
-/// Resolve the default socket path from `$XDG_RUNTIME_DIR`.
-#[must_use]
-pub fn default_socket_path() -> PathBuf {
-    resolve_socket_path(std::env::var("XDG_RUNTIME_DIR").ok().as_deref())
-}
+pub use fluxframe_core::protocol::default_socket_path;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxframe_core::protocol::resolve_socket_path;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream as ClientStream;
     use std::sync::atomic::AtomicUsize;
@@ -574,5 +584,24 @@ mod tests {
             ),
         }
         assert_eq!(&buf, b"trailing");
+    }
+
+    #[test]
+    fn write_response_replaces_oversize_payload_with_error() {
+        // Construct a response whose serialisation exceeds MAX_RESPONSE_LENGTH.
+        let huge = "a".repeat(MAX_RESPONSE_LENGTH + 100);
+        let resp = Response::ok_with(serde_json::Value::String(huge));
+        let mut buf: Vec<u8> = Vec::new();
+        write_response(&mut buf, &resp).expect("write");
+        let s = String::from_utf8(buf).expect("utf8");
+        // Output must be the error variant, not the original payload.
+        assert!(s.contains("\"ok\":\"false\""), "got: {s}");
+        assert!(s.contains("response exceeded"), "got: {s}");
+        // Output stays within the cap + a tiny envelope margin (< 1 KiB).
+        assert!(
+            s.len() < 2 * 1024,
+            "error response should be small, got {}",
+            s.len()
+        );
     }
 }

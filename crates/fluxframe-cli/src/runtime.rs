@@ -105,6 +105,23 @@ fn maybe_spawn_control(
     }
 }
 
+/// Short stable label for a control [`ControlCommand`] variant. Used
+/// by the worker loop to tag the per-command telemetry line, so
+/// elapsed time can be filtered by command kind in log queries
+/// without binding payload values into the log target.
+fn command_label(cmd: &ControlCommand) -> &'static str {
+    match cmd {
+        ControlCommand::ListPresets => "list_presets",
+        ControlCommand::CurrentPreset => "current_preset",
+        ControlCommand::ListEffects => "list_effects",
+        ControlCommand::GetConfig { .. } => "get_config",
+        ControlCommand::SetPreset { .. } => "set_preset",
+        ControlCommand::Set { .. } => "set",
+        ControlCommand::SetChain { .. } => "set_chain",
+        ControlCommand::Reload => "reload",
+    }
+}
+
 /// Apply a single control command. Returns the response the worker
 /// will hand back to the listener thread.
 #[allow(
@@ -179,7 +196,77 @@ fn apply_control_command(
             active_preset_name,
             active_preset,
         ),
+        ControlCommand::ListEffects => apply_list_effects_command(),
     }
+}
+
+/// Walk the three sub-chain registries and return their full metadata
+/// inventory keyed by section. The GUI uses this on startup to build
+/// param widgets without hard-coding which effects exist.
+///
+/// The response also includes a `build_features` array of strings
+/// (e.g. `["ml", "image-fill"]`) so the GUI can distinguish a slim
+/// daemon (which yields `post = []` and may omit `image_fill` from
+/// the plane registry) from a full daemon that happens to have those
+/// entries unconfigured. The JSON shape would otherwise be ambiguous.
+///
+/// Under a slim build (`--no-default-features`) `image_fill` is absent
+/// from the plane registry and therefore from the response, which is
+/// the correct behaviour: the GUI should only offer effects the daemon
+/// can actually instantiate.
+///
+/// The payload is built once per process and cached in a file-local
+/// `OnceLock<serde_json::Value>` — effect metadata is fully static,
+/// and this handler runs on the hot worker thread between frames
+/// (~33 ms budget at 30 fps).  Subsequent calls clone the cached
+/// `Value` instead of rebuilding three `Vec<&EffectMetadata>` and
+/// re-serialising them.  Exactly one cfg branch is active per build,
+/// so the cache covers both ml and slim configurations.
+fn apply_list_effects_command() -> ControlResponse {
+    static CACHE: OnceLock<serde_json::Value> = OnceLock::new();
+    let payload = CACHE.get_or_init(|| {
+        use fluxframe_effects::{mask_effects, plane_effects};
+
+        let mask: Vec<_> = mask_effects::default_registry().iter_metadata().collect();
+        let background: Vec<_> = plane_effects::default_registry().iter_metadata().collect();
+        // foreground and background currently share the same plane
+        // registry; if that changes (e.g. foreground-only effects),
+        // split the call site and update the GUI contract.
+        let foreground = background.clone();
+        // Post effects exist only when the `ml` feature is enabled
+        // (the composite path itself is ml-gated). Under a slim build
+        // the section is reported empty so the GUI knows not to offer
+        // post-effect editing.
+        #[cfg(feature = "ml")]
+        let post: Vec<_> = fluxframe_effects::post_effects::default_registry()
+            .iter_metadata()
+            .collect();
+        #[cfg(not(feature = "ml"))]
+        let post: Vec<&'static fluxframe_core::EffectMetadata> = Vec::new();
+
+        // Build-feature inventory: lets the GUI distinguish a slim
+        // daemon from a full one without inferring it from the
+        // (possibly empty) effect lists. `mut` is conditional because
+        // under a fully-slim build no `push` is reachable.
+        #[allow(
+            unused_mut,
+            reason = "slim build leaves `features` empty; mut is needed when any feature is enabled"
+        )]
+        let mut features: Vec<&'static str> = Vec::new();
+        #[cfg(feature = "ml")]
+        features.push("ml");
+        #[cfg(feature = "image-fill")]
+        features.push("image-fill");
+
+        serde_json::json!({
+            "mask": mask,
+            "background": background,
+            "foreground": foreground,
+            "post": post,
+            "build_features": features,
+        })
+    });
+    ControlResponse::ok_with(payload.clone())
 }
 
 /// Apply `reload`. Re-reads the TOML file from disk, validates it,
@@ -1312,6 +1399,12 @@ fn run_process_loop(
         // atomic with respect to frame boundaries.
         if let Some(rx) = control_rx {
             while let Ok(envelope) = rx.try_recv() {
+                // Capture variant label BEFORE the move into
+                // `apply_control_command`. Slow control commands
+                // silently eat frame budget (~33 ms at 30 fps), so
+                // surface elapsed_us per command for diagnosis.
+                let cmd_kind = command_label(&envelope.cmd);
+                let start = Instant::now();
                 let response = apply_control_command(
                     &mut working_cfg,
                     config_path,
@@ -1320,6 +1413,11 @@ fn run_process_loop(
                     &mut active_preset_name,
                     &mut active_preset,
                     envelope.cmd,
+                );
+                tracing::debug!(
+                    command = cmd_kind,
+                    elapsed_us = start.elapsed().as_micros() as u64,
+                    "control command applied",
                 );
                 // Best-effort: if the listener already dropped the
                 // reply receiver, the client has disconnected and we
@@ -1683,6 +1781,137 @@ mod tests {
         let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
         assert!(names.contains(&"a"), "names: {names:?}");
         assert!(names.contains(&"b"), "names: {names:?}");
+    }
+
+    #[test]
+    fn apply_list_effects_returns_inventory_for_all_sections() {
+        use fluxframe_effects::{mask_effects, plane_effects};
+
+        let resp = apply_list_effects_command();
+        let data = ok_payload(&resp);
+        let obj = data.as_object().expect("ListEffects returns object");
+        // All four section keys present, even under slim build.
+        for section in ["mask", "background", "foreground", "post"] {
+            let arr = obj
+                .get(section)
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| panic!("section '{section}' missing or not array"));
+            for row in arr {
+                let row_obj = row.as_object().expect("metadata is object");
+                assert!(row_obj.contains_key("name"));
+                assert!(row_obj.contains_key("params"));
+            }
+        }
+        // mask/background/foreground always populated; `post` only
+        // under the `ml` feature.
+        for section in ["mask", "background", "foreground"] {
+            assert!(
+                !obj[section].as_array().unwrap().is_empty(),
+                "section '{section}' must list at least one effect"
+            );
+        }
+        #[cfg(feature = "ml")]
+        assert!(
+            !obj["post"].as_array().unwrap().is_empty(),
+            "post must populate under ml feature"
+        );
+        // Spot-check a known effect.
+        let mask_spot: Vec<_> = obj["mask"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["name"].as_str())
+            .collect();
+        assert!(mask_spot.contains(&"threshold"), "got: {mask_spot:?}");
+
+        // Cross-check each section against the registry's own
+        // `names()` so a future drift between the registry and the
+        // response (duplicate registrations, missing entries, order
+        // changes) trips the test rather than silently shipping.
+        let mask_names: Vec<&str> = obj["mask"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["name"].as_str())
+            .collect();
+        assert_eq!(
+            mask_names,
+            mask_effects::default_registry().names(),
+            "ListEffects mask list must equal default_registry().names()",
+        );
+        let bg_names: Vec<&str> = obj["background"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["name"].as_str())
+            .collect();
+        assert_eq!(
+            bg_names,
+            plane_effects::default_registry().names(),
+            "ListEffects background list must equal plane registry names()",
+        );
+        let fg_names: Vec<&str> = obj["foreground"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["name"].as_str())
+            .collect();
+        assert_eq!(
+            fg_names,
+            plane_effects::default_registry().names(),
+            "ListEffects foreground list must equal plane registry names()",
+        );
+        #[cfg(feature = "ml")]
+        {
+            use fluxframe_effects::post_effects;
+            let post_names: Vec<&str> = obj["post"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v["name"].as_str())
+                .collect();
+            assert_eq!(
+                post_names,
+                post_effects::default_registry().names(),
+                "ListEffects post list must equal post registry names() under ml",
+            );
+        }
+        // Contract: `build_features` is always present so the GUI
+        // can distinguish slim-by-build from missing-by-config.
+        assert!(
+            obj.contains_key("build_features"),
+            "build_features must be present in ListEffects response",
+        );
+        assert!(
+            obj["build_features"].is_array(),
+            "build_features must be an array",
+        );
+    }
+
+    #[test]
+    fn apply_list_effects_foreground_equals_background_today() {
+        // foreground and background share the same plane registry, so
+        // their inventories MUST match element-by-element. If the
+        // codebase ever introduces foreground-only or background-only
+        // effects, this test fails — at which point the GUI contract
+        // (and the comment near the `background.clone()` call) need
+        // updating.
+        let resp = apply_list_effects_command();
+        let data = ok_payload(&resp);
+        let obj = data.as_object().expect("ListEffects returns object");
+        let bg = obj["background"].as_array().expect("background is array");
+        let fg = obj["foreground"].as_array().expect("foreground is array");
+        assert_eq!(
+            bg.len(),
+            fg.len(),
+            "foreground and background must have the same length today",
+        );
+        for (i, (b, f)) in bg.iter().zip(fg.iter()).enumerate() {
+            assert_eq!(
+                b, f,
+                "foreground[{i}] must equal background[{i}] (shared plane registry)",
+            );
+        }
     }
 
     #[test]

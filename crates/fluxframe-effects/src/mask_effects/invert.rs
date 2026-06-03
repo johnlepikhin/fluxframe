@@ -2,6 +2,7 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
+use fluxframe_core::metadata::EffectMetadata;
 use fluxframe_core::plane::{MaskEffect, MaskPlane};
 use fluxframe_core::traits::RawEffectParams;
 
@@ -13,6 +14,13 @@ pub struct InvertMaskEffect;
 impl InvertMaskEffect {
     /// Effect name as registered in the mask registry.
     pub const NAME: &'static str = "invert";
+
+    /// Self-describing metadata for the registry and the GUI.
+    pub const METADATA: EffectMetadata = EffectMetadata {
+        name: Self::NAME,
+        help: "Invert the mask (value = 1 - value).",
+        params: &[],
+    };
 
     /// Construct.
     #[must_use]
