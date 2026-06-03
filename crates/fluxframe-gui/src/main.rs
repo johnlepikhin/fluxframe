@@ -6,9 +6,12 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod debounce;
 mod ipc;
 mod state;
 mod components {
+    pub mod chain_page;
+    pub mod param_row;
     pub mod preset_bar;
     pub mod status_page;
 }

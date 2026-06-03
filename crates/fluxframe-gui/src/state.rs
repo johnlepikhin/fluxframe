@@ -11,7 +11,6 @@ use fluxframe_core::EffectMetadata;
 
 /// Inventory of available effects per sub-chain, as reported by the
 /// daemon's `list_effects` command.
-#[allow(dead_code, reason = "fields consumed by Stage 14 Step 5 chain editor")]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct EffectInventory {
     /// One key per [`fluxframe_core::SubchainKind`]
@@ -20,13 +19,17 @@ pub(crate) struct EffectInventory {
     /// Cargo features the daemon was built with (`"ml"`,
     /// `"image-fill"`). Lets the GUI distinguish a slim daemon from a
     /// misconfigured one.
+    #[allow(
+        dead_code,
+        reason = "surfaced by Stage 14 Step 7's 'About daemon' dialog"
+    )]
     pub(crate) build_features: Vec<String>,
 }
 
 /// Connection state for the IPC link.
 #[allow(
     dead_code,
-    reason = "variants inspected by Stage 14 Step 5 chain editor"
+    reason = "variants inspected by Step 7 'connection status' indicator"
 )]
 #[derive(Debug, Clone)]
 pub(crate) enum ConnectionStatus {
@@ -54,6 +57,11 @@ pub(crate) struct AppState {
     pub(crate) active_preset: Option<String>,
     /// Effect inventory, per `list_effects`.
     pub(crate) inventory: EffectInventory,
+    /// Active preset's full configuration, as returned by
+    /// `get_config { path: None }`. Stored as the raw JSON tree the
+    /// chain editor walks (`background.chain`,
+    /// `background.per_effect.<name>.<field>`).
+    pub(crate) active_config: serde_json::Value,
 }
 
 impl AppState {
@@ -67,6 +75,124 @@ impl AppState {
             presets: Vec::new(),
             active_preset: None,
             inventory: EffectInventory::default(),
+            active_config: serde_json::Value::Null,
         }
+    }
+
+    /// Look up a single per-effect parameter in the active config.
+    /// Returns the raw JSON `Value` or `Null` if absent.
+    ///
+    /// Walks `<section>.per_effect.<effect>.<field>`. Used by the
+    /// chain editor to seed widget initial values without re-querying
+    /// the daemon.
+    pub(crate) fn config_field(
+        &self,
+        section: &str,
+        effect: &str,
+        field: &str,
+    ) -> &serde_json::Value {
+        const NULL: serde_json::Value = serde_json::Value::Null;
+        self.active_config
+            .get(section)
+            .and_then(|s| s.get("per_effect"))
+            .and_then(|p| p.get(effect))
+            .and_then(|e| e.get(field))
+            .unwrap_or(&NULL)
+    }
+
+    /// Chain of effect names for the given section (`"mask"`,
+    /// `"background"`, `"foreground"`, `"post"`). Empty if the
+    /// section is absent or has no `chain` array.
+    pub(crate) fn chain_for(&self, section: &str) -> Vec<String> {
+        self.active_config
+            .get(section)
+            .and_then(|s| s.get("chain"))
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> AppState {
+        let mut s = AppState::new(PathBuf::from("/tmp/test.sock"));
+        s.active_config = serde_json::json!({
+            "background": {
+                "chain": ["blur", "vignette"],
+                "per_effect": {
+                    "blur": { "radius": 30, "passes": 2 },
+                    "vignette": { "strength": 0.4 }
+                }
+            },
+            "foreground": {
+                "chain": []
+            }
+        });
+        s
+    }
+
+    #[test]
+    fn config_field_returns_present_value() {
+        let s = fixture();
+        let v = s.config_field("background", "blur", "radius");
+        assert_eq!(v.as_i64(), Some(30));
+    }
+
+    #[test]
+    fn config_field_returns_null_for_missing_section() {
+        let s = fixture();
+        let v = s.config_field("post", "auto_frame", "threshold");
+        assert!(v.is_null());
+    }
+
+    #[test]
+    fn config_field_returns_null_for_missing_per_effect() {
+        let s = fixture();
+        let v = s.config_field("background", "unknown_effect", "field");
+        assert!(v.is_null());
+    }
+
+    #[test]
+    fn config_field_returns_null_for_missing_field() {
+        let s = fixture();
+        let v = s.config_field("background", "blur", "nonexistent");
+        assert!(v.is_null());
+    }
+
+    #[test]
+    fn chain_for_returns_names_in_order() {
+        let s = fixture();
+        assert_eq!(
+            s.chain_for("background"),
+            vec!["blur".to_string(), "vignette".to_string()]
+        );
+    }
+
+    #[test]
+    fn chain_for_empty_section_returns_empty_vec() {
+        let s = fixture();
+        assert!(s.chain_for("foreground").is_empty());
+    }
+
+    #[test]
+    fn chain_for_missing_section_returns_empty_vec() {
+        let s = fixture();
+        assert!(s.chain_for("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn chain_for_handles_non_array_chain_gracefully() {
+        let mut s = AppState::new(PathBuf::from("/tmp/test.sock"));
+        s.active_config = serde_json::json!({
+            "mask": { "chain": "not-an-array" }
+        });
+        assert!(s.chain_for("mask").is_empty());
     }
 }
