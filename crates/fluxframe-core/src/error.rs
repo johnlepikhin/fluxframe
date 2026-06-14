@@ -117,8 +117,10 @@ pub enum InferenceError {
 pub enum PipelineError {
     /// A required GStreamer element is not registered.
     ///
-    /// `hint` names the package that typically ships it
-    /// (e.g. `gstreamer1.0-plugins-good`).
+    /// `hint` is a distro-agnostic remediation string supplied by the
+    /// caller (the CLI/translation layer is the right place to map a
+    /// missing element to a distro-specific package name; the core
+    /// stays free of OS-specific guidance).
     #[error("required GStreamer element '{element}' is missing")]
     MissingElement { element: String, hint: String },
 
@@ -301,13 +303,20 @@ impl FluxError {
             //   * Config / ConfigParse — TOML or merged config invalid.
             //   * Effect::InvalidConfig — per-effect TOML rejected at
             //     configure time, e.g. `background_blur` without `model`.
+            //   * Aggregated — conservatively permanent: the variant
+            //     only carries the `primary` failure plus a `count`;
+            //     the other underlying errors were already rendered by
+            //     the producer and are not retained for introspection.
+            //     Without visibility into every contained error we
+            //     cannot prove the aggregate is fully transient, and a
+            //     single permanent failure in the batch must not be
+            //     silently retried just because the primary happens to
+            //     be retryable.
             FluxError::Pipeline(PipelineError::MissingElement { .. })
             | FluxError::Config { .. }
             | FluxError::ConfigParse { .. }
-            | FluxError::Effect(EffectError::InvalidConfig { .. }) => false,
-
-            // Aggregates inherit their primary error's classification.
-            FluxError::Aggregated { primary, .. } => primary.is_transient(),
+            | FluxError::Effect(EffectError::InvalidConfig { .. })
+            | FluxError::Aggregated { .. } => false,
 
             // Default: prefer retry. Covers device hot-unplug, IO
             // flakes, runtime / state-change failures, effect prepare /
@@ -385,7 +394,7 @@ mod tests {
     fn is_transient_treats_missing_element_as_permanent() {
         let err = FluxError::Pipeline(PipelineError::MissingElement {
             element: "v4l2src".into(),
-            hint: "install gstreamer1.0-plugins-good".into(),
+            hint: "install the GStreamer plugin package for your distro".into(),
         });
         assert!(
             !err.is_transient(),
@@ -436,6 +445,37 @@ mod tests {
         assert!(
             err.is_transient(),
             "per-frame process failures can clear up"
+        );
+    }
+
+    #[test]
+    fn aggregated_with_permanent_secondary_is_permanent() {
+        // The aggregate variant only retains the `primary` failure plus
+        // a `count` of total failures — the remaining (secondary)
+        // failures were rendered by the producer and dropped. Without
+        // visibility into them, the safe classification is permanent:
+        // a transient `primary` must not unlock retry for an aggregate
+        // that may have hidden permanent failures in the count.
+        //
+        // Construct an aggregate whose `primary` is transient (IO) and
+        // whose `count` claims additional failures; the aggregate must
+        // still report `is_transient() == false`.
+        let transient_primary = FluxError::io(
+            std::path::PathBuf::from("/tmp/flake"),
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "boom"),
+        );
+        assert!(
+            transient_primary.is_transient(),
+            "sanity: IO is transient on its own"
+        );
+
+        let aggregate = FluxError::Aggregated {
+            primary: Box::new(transient_primary),
+            count: 3,
+        };
+        assert!(
+            !aggregate.is_transient(),
+            "aggregate with possible permanent failures must not be retried"
         );
     }
 }

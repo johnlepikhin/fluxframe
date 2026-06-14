@@ -52,6 +52,9 @@ pub fn pixel_format_to_gst(fmt: PixelFormat) -> gstreamer_video::VideoFormat {
         PixelFormat::Yuy2 => G::Yuy2,
         PixelFormat::Nv12 => G::Nv12,
         PixelFormat::Gray8 => G::Gray8,
+        // `PixelFormat` is `#[non_exhaustive]` for forward-compat;
+        // an unmapped variant is a TODO at this layer.
+        _ => G::Unknown,
     }
 }
 

@@ -119,6 +119,10 @@ fn command_label(cmd: &ControlCommand) -> &'static str {
         ControlCommand::Set { .. } => "set",
         ControlCommand::SetChain { .. } => "set_chain",
         ControlCommand::Reload => "reload",
+        // `ControlCommand` is `#[non_exhaustive]` for forward-compat
+        // with future wire variants. Tag unknowns explicitly so log
+        // queries surface "we received something we cannot label yet".
+        _ => "unknown",
     }
 }
 
@@ -197,6 +201,13 @@ fn apply_control_command(
             active_preset,
         ),
         ControlCommand::ListEffects => apply_list_effects_command(),
+        // `ControlCommand` is `#[non_exhaustive]`; a future variant
+        // that this build does not yet handle gets a structured
+        // error rather than panicking the worker thread.
+        _ => ControlResponse::err(
+            "unknown command — daemon was built without support for this wire variant",
+            Some("update the daemon, or check the client is not ahead of the daemon".into()),
+        ),
     }
 }
 
@@ -380,14 +391,39 @@ fn apply_set_command(
         Ok(v) => v,
         Err(e) => return ControlResponse::err(e, None),
     };
-    let Some(section_mut) = section_mut(active_preset, set_path.section) else {
+    // Snapshot whether the targeted section existed BEFORE we touch
+    // the preset; the Err arm below uses this to revert any
+    // materialisation we performed on behalf of a doomed Set.
+    let was_absent = section_is_absent(active_preset, set_path.section);
+    // Mask cannot be conjured (the composite needs an ONNX model that
+    // the control protocol cannot synthesise) — return a typed error
+    // pointing the operator at a preset with `[mask]`. Plane/Post
+    // sections are materialised on demand via
+    // `ensure_plane_or_post_section_mut`.
+    if set_path.section == SubchainKind::Mask && was_absent {
         return ControlResponse::err(
-            format!(
-                "preset does not have a [{section}] sub-section",
-                section = set_path.section,
+            "preset does not have a [mask] sub-section",
+            Some(
+                "this preset has no segmentation; switch to a preset with [mask] to add post-process effects"
+                    .into(),
             ),
-            Some("set the chain on this section first (or use set_chain)".into()),
         );
+    }
+    let section_mut = if set_path.section == SubchainKind::Mask {
+        // Safe to unwrap: `was_absent == false` here (we returned above otherwise).
+        let Some(s) = mask_section_mut(active_preset) else {
+            debug_assert!(
+                false,
+                "mask section disappeared between absence check and access"
+            );
+            return ControlResponse::err(
+                "internal: mask section missing",
+                Some("this is a bug; please report".into()),
+            );
+        };
+        s
+    } else {
+        ensure_plane_or_post_section_mut(active_preset, set_path.section)
     };
     // Read the existing per-effect table for this effect (defaulting
     // to empty), insert the new field, then hand the merged table to
@@ -456,6 +492,13 @@ fn apply_set_command(
                     "control: revert reconfigure also failed; live effect may be in an inconsistent state",
                 );
             }
+            // If we materialised the section purely to host this doomed
+            // Set, undo the materialisation. We only do this when the
+            // section is now empty (no chain, no per_effect entries
+            // besides the one we just removed) — a non-empty section
+            // means someone else populated it concurrently or the Set
+            // partially succeeded, and we should leave it alone.
+            revert_absent_section_if_empty(active_preset, set_path.section, was_absent);
             let (reason, hint) = match &e {
                 fluxframe_core::EffectError::InvalidConfig { reason, hint, .. } => {
                     (reason.clone(), hint.clone())
@@ -467,17 +510,62 @@ fn apply_set_command(
     }
 }
 
-/// Mutable accessor for a sub-section of a [`Preset`] by typed kind.
-fn section_mut(
+/// Mutable handle to the `[mask]` sub-section of `preset`. Returns
+/// `None` when the preset declares no mask — the mask section is the
+/// only sub-section that **cannot** be materialised on demand because
+/// the composite requires an ONNX model that the control protocol
+/// has no way to synthesise.
+fn mask_section_mut(preset: &mut Preset) -> Option<&mut fluxframe_core::PipelineSection> {
+    preset.mask.as_mut()
+}
+
+/// Mutable handle to a plane (Background/Foreground) or Post
+/// sub-section, creating it from `PipelineSection::default()` if
+/// absent. Used by [`apply_set_chain_command`] so the control protocol
+/// can extend a preset with a section it did not originally declare in
+/// TOML (e.g. add a `[post]` chain to a preset that only had
+/// `[mask]` + `[background]`).
+///
+/// **Caller MUST be prepared to revert the materialisation** on
+/// subsequent failure (e.g. effect-name typo, prepare error). See
+/// [`apply_set_chain_command`] for the snapshot/revert pattern.
+///
+/// `tracing::info!` fires when a new section is created so the
+/// operator can correlate "preset now has [post]" with the originating
+/// command.
+fn ensure_plane_or_post_section_mut(
     preset: &mut Preset,
     section: SubchainKind,
-) -> Option<&mut fluxframe_core::PipelineSection> {
-    match section {
-        SubchainKind::Mask => preset.mask.as_mut(),
-        SubchainKind::Background => preset.background.as_mut(),
-        SubchainKind::Foreground => preset.foreground.as_mut(),
-        SubchainKind::Post => preset.post.as_mut(),
+) -> &mut fluxframe_core::PipelineSection {
+    let slot: &mut Option<fluxframe_core::PipelineSection> = match section {
+        SubchainKind::Background => &mut preset.background,
+        SubchainKind::Foreground => &mut preset.foreground,
+        SubchainKind::Post => &mut preset.post,
+        SubchainKind::Mask => {
+            // `Mask` is filtered out by the `PlaneOrPostKind` typestate
+            // approach we considered, but for now a runtime check with
+            // debug_assert! suffices — callers that hit this arm are
+            // programming errors, not user-facing.
+            debug_assert!(
+                false,
+                "ensure_plane_or_post_section_mut called with Mask — use mask_section_mut"
+            );
+            // Fall back to mask in release builds; this restores the
+            // pre-fix behaviour (silent None propagation) rather than
+            // panicking on operators.
+            return preset.mask.get_or_insert_with(|| {
+                tracing::info!(
+                    section = "mask",
+                    "materialised absent mask section on demand (fallback)"
+                );
+                fluxframe_core::PipelineSection::default()
+            });
+        }
+    };
+    if slot.is_none() {
+        tracing::info!(section = %section, "materialised absent sub-section on demand");
     }
+    slot.get_or_insert_with(Default::default)
 }
 
 /// Apply `set_chain <section> [...]`. Rebuilds the named sub-chain
@@ -499,14 +587,34 @@ fn apply_set_chain_command(
     let Some(composite) = chain.composite_mut() else {
         return ControlResponse::err(
             "active chain has no composite (preset has no [mask] section)",
-            Some("set a composite preset first via set_preset".into()),
+            Some(
+                "this preset has no segmentation; switch to a preset with [mask] to add post-process effects"
+                    .into(),
+            ),
         );
     };
-    let Some(section_data) = section_mut(active_preset, section) else {
-        return ControlResponse::err(
-            format!("preset does not have a [{section}] sub-section"),
-            Some("expected mask|background|foreground|post".into()),
-        );
+    // Snapshot whether the targeted section existed BEFORE we touch
+    // the preset; failures below revert any materialisation we did.
+    let was_absent = section_is_absent(active_preset, section);
+    // Mask cannot be materialised on demand (the composite is bound to
+    // a model that the control protocol cannot synthesise). The
+    // `composite_mut()` guard above ensures the composite exists, which
+    // implies the original preset had `[mask]`. If the active preset
+    // somehow lacks it, that's an internal inconsistency.
+    let section_data = if section == SubchainKind::Mask {
+        let Some(s) = mask_section_mut(active_preset) else {
+            debug_assert!(
+                false,
+                "internal: composite present but active preset has no [mask] section"
+            );
+            return ControlResponse::err(
+                "internal: composite present but mask section missing",
+                Some("this is a bug; please report".into()),
+            );
+        };
+        s
+    } else {
+        ensure_plane_or_post_section_mut(active_preset, section)
     };
     // Build new effects + configure them. The old `per_effect` payload
     // is reused when present; otherwise an empty TOML table feeds
@@ -514,7 +622,12 @@ fn apply_set_chain_command(
     let result = build_and_configure_subchain(section, new_names, &section_data.per_effect);
     let payload = match result {
         Ok(o) => o,
-        Err(e) => return ControlResponse::err(e.reason, e.hint),
+        Err(e) => {
+            // Revert the materialisation if we created an empty section
+            // purely to host this doomed `set_chain`.
+            revert_absent_section_if_empty(active_preset, section, was_absent);
+            return ControlResponse::err(e.reason, e.hint);
+        }
     };
     // Hand the new chain to the composite. `replace_subchain` runs
     // `prepare()` against the stored ProcessingContext and atomically
@@ -522,14 +635,82 @@ fn apply_set_chain_command(
     // touch active_preset.
     match composite.replace_subchain(payload) {
         Ok(()) => {
+            // Re-borrow because the previous `section_data` borrow was
+            // released when we handed `payload` to the composite.
+            let section_data = match section {
+                SubchainKind::Mask => mask_section_mut(active_preset)
+                    .expect("mask presence checked above and not removed since"),
+                SubchainKind::Background | SubchainKind::Foreground | SubchainKind::Post => {
+                    ensure_plane_or_post_section_mut(active_preset, section)
+                }
+            };
             section_data.chain = new_names.to_vec();
             info!(section = %section, chain = ?new_names, "control: replaced sub-chain");
             ControlResponse::ok()
         }
-        Err(e) => ControlResponse::err(
-            format!("prepare on new chain failed: {e}"),
-            Some("the previous chain is still active".into()),
-        ),
+        Err(e) => {
+            revert_absent_section_if_empty(active_preset, section, was_absent);
+            ControlResponse::err(
+                format!("prepare on new chain failed: {e}"),
+                Some("the previous chain is still active".into()),
+            )
+        }
+    }
+}
+
+/// Whether the given sub-section of `preset` is currently `None`.
+/// Snapshot helper used by [`apply_set_command`] and
+/// [`apply_set_chain_command`] before any code path that might
+/// materialise the section via [`ensure_plane_or_post_section_mut`].
+fn section_is_absent(preset: &Preset, section: SubchainKind) -> bool {
+    match section {
+        SubchainKind::Mask => preset.mask.is_none(),
+        SubchainKind::Background => preset.background.is_none(),
+        SubchainKind::Foreground => preset.foreground.is_none(),
+        SubchainKind::Post => preset.post.is_none(),
+    }
+}
+
+/// If `was_absent` is `true` AND the target section is now empty
+/// (no chain entries, no per-effect overrides), revert it to `None`.
+/// Used by [`apply_set_chain_command`] and [`apply_set_command`] to
+/// undo a section materialisation when the command that triggered it
+/// fails — keeps `active_preset` in sync with the TOML's structural
+/// shape so the operator does not see a phantom `[post]` they never
+/// created.
+fn revert_absent_section_if_empty(
+    active_preset: &mut Preset,
+    section: SubchainKind,
+    was_absent: bool,
+) {
+    if !was_absent {
+        return;
+    }
+    let now_empty = match section {
+        SubchainKind::Mask => active_preset
+            .mask
+            .as_ref()
+            .is_some_and(|s| s.chain.is_empty() && s.per_effect.is_empty()),
+        SubchainKind::Background => active_preset
+            .background
+            .as_ref()
+            .is_some_and(|s| s.chain.is_empty() && s.per_effect.is_empty()),
+        SubchainKind::Foreground => active_preset
+            .foreground
+            .as_ref()
+            .is_some_and(|s| s.chain.is_empty() && s.per_effect.is_empty()),
+        SubchainKind::Post => active_preset
+            .post
+            .as_ref()
+            .is_some_and(|s| s.chain.is_empty() && s.per_effect.is_empty()),
+    };
+    if now_empty {
+        match section {
+            SubchainKind::Mask => active_preset.mask = None,
+            SubchainKind::Background => active_preset.background = None,
+            SubchainKind::Foreground => active_preset.foreground = None,
+            SubchainKind::Post => active_preset.post = None,
+        }
     }
 }
 
@@ -1748,6 +1929,7 @@ mod tests {
         match r {
             ControlResponse::Ok { data } => data,
             ControlResponse::Err { .. } => panic!("expected Ok, got {r:?}"),
+            _ => panic!("non-exhaustive Response variant: {r:?}"),
         }
     }
 
@@ -1755,6 +1937,7 @@ mod tests {
         match r {
             ControlResponse::Err { error, .. } => error.as_str(),
             ControlResponse::Ok { .. } => panic!("expected Err, got {r:?}"),
+            _ => panic!("non-exhaustive Response variant: {r:?}"),
         }
     }
 
@@ -1940,6 +2123,7 @@ mod tests {
                 assert!(hint.contains("alpha"), "hint: {hint}");
             }
             ControlResponse::Ok { .. } => panic!("expected Err"),
+            _ => panic!("non-exhaustive Response variant"),
         }
     }
 
@@ -1994,6 +2178,55 @@ mod tests {
         let resp = apply_get_config_command(&preset, Some("background..chain"));
         let reason = err_reason(&resp);
         assert!(reason.contains("empty"), "reason: {reason}");
+    }
+
+    #[test]
+    fn ensure_plane_or_post_section_mut_materialises_absent_post() {
+        let mut p = fluxframe_core::Preset::default();
+        assert!(p.post.is_none(), "fixture preset has no [post]");
+        let section = ensure_plane_or_post_section_mut(&mut p, SubchainKind::Post);
+        assert!(
+            section.chain.is_empty(),
+            "newly-materialised chain is empty"
+        );
+        assert!(section.per_effect.is_empty(), "no per-effect overrides");
+        assert!(p.post.is_some(), "section persisted into preset");
+    }
+
+    #[test]
+    fn ensure_plane_or_post_section_mut_returns_existing_background() {
+        let mut p = fluxframe_core::Preset {
+            background: Some(fluxframe_core::PipelineSection {
+                chain: vec!["blur".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let section = ensure_plane_or_post_section_mut(&mut p, SubchainKind::Background);
+        assert_eq!(
+            section.chain,
+            vec!["blur".to_string()],
+            "existing chain preserved"
+        );
+    }
+
+    #[test]
+    fn mask_section_mut_does_not_materialise_absent() {
+        let mut p = fluxframe_core::Preset::default();
+        assert!(mask_section_mut(&mut p).is_none(), "absent mask stays None");
+        assert!(p.mask.is_none(), "preset.mask is not mutated");
+    }
+
+    #[test]
+    fn mask_section_mut_returns_existing() {
+        let mut p = fluxframe_core::Preset {
+            mask: Some(fluxframe_core::PipelineSection {
+                chain: vec!["threshold".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(mask_section_mut(&mut p).is_some());
     }
 
     #[test]

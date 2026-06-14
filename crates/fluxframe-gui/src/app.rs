@@ -11,6 +11,7 @@ use std::process::Command as ProcessCommand;
 
 use adw::prelude::*;
 use fluxframe_core::protocol::Command;
+use gtk::glib;
 use relm4::prelude::{Component, ComponentParts, ComponentSender};
 use relm4::{Sender, WorkerController};
 
@@ -18,6 +19,11 @@ use crate::components::{chain_page, preset_bar, status_page};
 use crate::debounce::Debouncer;
 use crate::ipc::{IpcWorker, WorkerInput, WorkerOutput};
 use crate::state::{AppState, ConnectionStatus};
+
+/// Dwell time for daemon-error toasts. 5 seconds is long enough for
+/// the operator to read but short enough to avoid stacking when a
+/// slider drags through several rejection cases.
+const TOAST_TIMEOUT_SECS: u32 = 5;
 
 /// Messages the AppModel handles internally.
 #[derive(Debug)]
@@ -27,6 +33,13 @@ pub enum AppMsg {
     Ipc(WorkerOutput),
     /// User clicked the preset DropDown — switch to `name`.
     SetPreset(String),
+    /// Keyboard shortcut `Ctrl+<digit>` — switch to the preset at the
+    /// 1-indexed slot, or no-op if the slot is empty.
+    SetPresetByIndex {
+        /// 1-indexed slot in the loaded preset list. `NonZeroUsize`
+        /// rules out the `slot - 1` underflow at the type level.
+        slot: std::num::NonZeroUsize,
+    },
     /// User clicked the Reload button.
     Reload,
     /// User clicked "Open preview" — spawn an external viewer.
@@ -40,6 +53,41 @@ pub enum AppMsg {
         path: String,
         /// New value as a JSON `Value`.
         value: serde_json::Value,
+    },
+    /// User added an effect to a section's chain (via the section's
+    /// add MenuButton). The new effect appends to the end.
+    AddEffect {
+        /// Sub-chain identifier as the typed [`fluxframe_core::SubchainKind`]
+        /// enum (no longer accepts arbitrary strings).
+        section: fluxframe_core::SubchainKind,
+        /// Effect registry name to append.
+        effect: String,
+    },
+    /// User removed an effect (✕ button on the chain item).
+    RemoveEffect {
+        /// Sub-chain identifier as the typed [`fluxframe_core::SubchainKind`]
+        /// enum (no longer accepts arbitrary strings).
+        section: fluxframe_core::SubchainKind,
+        /// Position in the chain (0-indexed) to remove.
+        index: usize,
+    },
+    /// User moved an effect one slot toward the chain head (`↑` button).
+    /// No-op at index 0.
+    MoveEffectUp {
+        /// Sub-chain identifier as the typed [`fluxframe_core::SubchainKind`]
+        /// enum (no longer accepts arbitrary strings).
+        section: fluxframe_core::SubchainKind,
+        /// Position to move (0-indexed); must be > 0.
+        index: usize,
+    },
+    /// User moved an effect one slot toward the chain tail (`↓` button).
+    /// No-op at the last index.
+    MoveEffectDown {
+        /// Sub-chain identifier as the typed [`fluxframe_core::SubchainKind`]
+        /// enum (no longer accepts arbitrary strings).
+        section: fluxframe_core::SubchainKind,
+        /// Position to move (0-indexed).
+        index: usize,
     },
 }
 
@@ -56,7 +104,10 @@ pub enum AppMsg {
 struct PendingSet {
     path: String,
     new: serde_json::Value,
-    #[allow(dead_code, reason = "reserved for targeted widget rollback")]
+    #[allow(
+        dead_code,
+        reason = "reserved for future per-widget rollback (rebuild-from-active_config covers it today)"
+    )]
     previous: serde_json::Value,
 }
 
@@ -122,11 +173,27 @@ impl Component for AppModel {
     type Widgets = ();
 
     fn init_root() -> Self::Root {
-        adw::ApplicationWindow::builder()
+        let geometry = crate::persistence::load();
+        let window = adw::ApplicationWindow::builder()
             .title("FluxFrame")
-            .default_width(720)
-            .default_height(540)
-            .build()
+            .default_width(geometry.width)
+            .default_height(geometry.height)
+            .build();
+        if geometry.maximized {
+            window.maximize();
+        }
+        // Persist geometry on close. `close-request` fires before
+        // teardown so the window's size is still queryable.
+        window.connect_close_request(|w| {
+            let state = crate::persistence::WindowState {
+                width: w.default_width(),
+                height: w.default_height(),
+                maximized: w.is_maximized(),
+            };
+            crate::persistence::save(&state);
+            glib::Propagation::Proceed
+        });
+        window
     }
 
     fn init(
@@ -176,6 +243,10 @@ impl Component for AppModel {
         toast_overlay.set_child(Some(&outer));
         root.set_content(Some(&toast_overlay));
 
+        // Global keyboard shortcuts (Ctrl+R reload, Ctrl+Q quit,
+        // Ctrl+1..9 preset switch).
+        crate::shortcuts::install(&root, sender.input_sender());
+
         let state = AppState::new(socket_path);
         let input_sender = sender.input_sender().clone();
         let model = Self {
@@ -199,6 +270,15 @@ impl Component for AppModel {
             AppMsg::SetPreset(name) => {
                 self.send_kind(Command::SetPreset { name }, PendingKind::Other);
             }
+            AppMsg::SetPresetByIndex { slot } => {
+                // 1-indexed slot → list position (slot - 1). `NonZeroUsize`
+                // makes the subtraction safe at the type level.
+                let Some(name) = self.state.presets.get(slot.get() - 1).cloned() else {
+                    tracing::debug!(slot = slot.get(), "no preset at slot");
+                    return;
+                };
+                let _ = self.input_sender.send(AppMsg::SetPreset(name));
+            }
             AppMsg::Reload => {
                 self.send_kind(Command::Reload, PendingKind::Other);
                 // After a successful reload the cached active_preset
@@ -210,6 +290,33 @@ impl Component for AppModel {
             AppMsg::Retry => self.retry(),
             AppMsg::SetParam { path, value } => {
                 self.send_set_param(path, value);
+            }
+            AppMsg::AddEffect { section, effect } => {
+                self.mutate_chain(section, |chain| chain.push(effect));
+            }
+            AppMsg::RemoveEffect { section, index } => {
+                self.mutate_chain(section, |chain| {
+                    if index < chain.len() {
+                        chain.remove(index);
+                    }
+                });
+            }
+            AppMsg::MoveEffectUp { section, index } => {
+                if index == 0 {
+                    return;
+                }
+                self.mutate_chain(section, |chain| {
+                    if index < chain.len() {
+                        chain.swap(index - 1, index);
+                    }
+                });
+            }
+            AppMsg::MoveEffectDown { section, index } => {
+                self.mutate_chain(section, |chain| {
+                    if index + 1 < chain.len() {
+                        chain.swap(index, index + 1);
+                    }
+                });
             }
         }
     }
@@ -234,6 +341,24 @@ impl AppModel {
         let worker = self.worker.as_ref().expect("worker presence checked above");
         self.pending.insert(tag, kind);
         let _ = worker.sender().send(WorkerInput::Send { tag, command });
+    }
+
+    /// Apply `mutate` to the chain array for `section`, dispatch a
+    /// `Command::SetChain` with the result, then refetch the active
+    /// config so widgets pick up the new chain shape (and any defaulting
+    /// the daemon applied).
+    fn mutate_chain(
+        &mut self,
+        section: fluxframe_core::SubchainKind,
+        mutate: impl FnOnce(&mut Vec<String>),
+    ) {
+        let chain_str = section.as_str();
+        let mut chain = self.state.chain_for(chain_str);
+        mutate(&mut chain);
+        self.send_kind(Command::SetChain { section, chain }, PendingKind::Other);
+        // Refetch the active config so widgets pick up the new chain
+        // shape (and any defaulting the daemon applied).
+        self.send_kind(Command::GetConfig { path: None }, PendingKind::GetConfig);
     }
 
     /// Dispatch a parameter change as a `Command::Set` while capturing
@@ -328,21 +453,44 @@ impl AppModel {
                         // every widget snaps back to active_config
                         // (which still holds the previous value because
                         // we only commit on Ok above).
-                        let message = format_toast_error(&error, hint.as_deref());
-                        let toast = adw::Toast::builder().title(&message).timeout(5).build();
-                        self.toast_overlay.add_toast(toast);
+                        self.show_error_toast(&error, hint.as_deref());
                         self.rebuild_chain_page();
                     }
-                    Some(
-                        PendingKind::CurrentPreset | PendingKind::GetConfig | PendingKind::Other,
-                    )
-                    | None => {
-                        // Other commands have no widget rollback story
+                    Some(PendingKind::Other) => {
+                        // Reload / SetPreset / SetChain — no widget
+                        // rollback, but the user still deserves to
+                        // know the daemon refused the request (e.g.
+                        // "preset does not have a [post] sub-section"
+                        // on AddEffect into an absent section).
+                        self.show_error_toast(&error, hint.as_deref());
+                    }
+                    Some(PendingKind::CurrentPreset | PendingKind::GetConfig) | None => {
+                        // Internal refetches and unknown tags
                         // — log only, the operator will see the warn.
                     }
                 }
             }
+            // `Response` is `#[non_exhaustive]`; tolerate future
+            // variants without panicking the UI thread.
+            _ => {
+                tracing::warn!(tag, "unrecognised Response variant");
+            }
         }
+    }
+
+    /// Surface a daemon error as a 5-second `AdwToast` overlay banner.
+    ///
+    /// Used by [`Self::on_reply`] for any [`PendingKind`] variant whose
+    /// Err reply deserves operator attention. Internally builds a single
+    /// formatted line via [`format_toast_error`] so error and hint share
+    /// a consistent shape across rejection sources.
+    fn show_error_toast(&self, error: &str, hint: Option<&str>) {
+        let message = format_toast_error(error, hint);
+        let toast = adw::Toast::builder()
+            .title(&message)
+            .timeout(TOAST_TIMEOUT_SECS)
+            .build();
+        self.toast_overlay.add_toast(toast);
     }
 
     /// Drop the current body content and re-render the chain editor
@@ -493,6 +641,8 @@ fn format_toast_error(error: &str, hint: Option<&str>) -> String {
 /// because the operation is best-effort.
 fn open_preview() {
     let mut cmd = ProcessCommand::new("gst-launch-1.0");
+    // TODO(stage-15): read [output].device from the daemon's active
+    // config instead of hardcoding /dev/video10.
     cmd.args([
         "v4l2src",
         "device=/dev/video10",

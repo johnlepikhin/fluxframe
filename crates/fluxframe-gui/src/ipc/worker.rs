@@ -63,10 +63,6 @@ pub enum WorkerOutput {
 /// would otherwise dominate the enum's size — `Vec<EffectMetadata>`
 /// inside `EffectInventory` makes the struct itself ~200 bytes; the
 /// rest of `WorkerOutput` is small.
-#[allow(
-    dead_code,
-    reason = "`active_config` consumed by Stage 14 Step 5 chain editor"
-)]
 #[derive(Debug)]
 pub struct InitialState {
     /// Inventory + build features.
@@ -76,8 +72,7 @@ pub struct InitialState {
     /// Currently-active preset name.
     pub active_preset: String,
     /// Active preset's full configuration, as returned by
-    /// `get_config { path: None }`. Reserved for the chain editor in
-    /// Step 5.
+    /// `get_config { path: None }`. Consumed by the chain editor.
     pub active_config: serde_json::Value,
 }
 
@@ -111,6 +106,7 @@ impl BufferedStream {
     }
 
     /// Send one command line, read one response line, parse it.
+    #[tracing::instrument(skip(self), level = "debug")]
     fn round_trip(&mut self, cmd: &Command) -> Result<Response, String> {
         tracing::debug!(?cmd, "ipc round trip start");
         let payload =
@@ -198,7 +194,7 @@ impl Worker for IpcWorker {
 /// Pulled out as a free function so a future test can drive it
 /// against a mock `BufferedStream` without spinning up the relm4
 /// runtime.
-#[tracing::instrument(skip(stream))]
+#[tracing::instrument(skip(stream), level = "info")]
 fn handshake(stream: &mut BufferedStream) -> Result<InitialState, String> {
     let inventory = one(stream, &Command::ListEffects, "list_effects", |d| {
         parse_inventory(&d)
@@ -233,6 +229,9 @@ fn one<T>(
     match stream.round_trip(cmd)? {
         Response::Ok { data } => parse(data),
         Response::Err { error, hint } => Err(format!("{label} failed: {error}{}", fmt_hint(hint))),
+        // `Response` is `#[non_exhaustive]`; surface unknown variants
+        // as a hard handshake failure rather than panicking.
+        _ => Err(format!("{label} failed: unrecognised Response variant")),
     }
 }
 

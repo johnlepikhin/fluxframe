@@ -5,39 +5,20 @@
 //! Each entry pairs a build closure with a `&'static EffectMetadata`
 //! reference. Metadata is registry-only (no method on the trait) so a
 //! caller introspecting the inventory never has to build an instance.
-
-use std::collections::BTreeMap;
+//!
+//! Storage and lookup are delegated to the generic
+//! [`crate::registry_common::Registry`]. This newtype wrapper exists
+//! to give the public API a concrete, self-documenting type.
 
 use fluxframe_core::EffectMetadata;
 use fluxframe_core::error::EffectError;
 use fluxframe_core::plane::PlaneEffect;
 
-/// Factory closure producing a fresh [`PlaneEffect`] instance.
-pub trait PlaneEffectFactory: Send + Sync {
-    /// Build a brand-new effect.
-    fn build(&self) -> Box<dyn PlaneEffect>;
-}
-
-impl<F> PlaneEffectFactory for F
-where
-    F: Fn() -> Box<dyn PlaneEffect> + Send + Sync,
-{
-    fn build(&self) -> Box<dyn PlaneEffect> {
-        self()
-    }
-}
-
-/// One row of the registry: factory + descriptor.
-struct Entry {
-    factory: Box<dyn PlaneEffectFactory>,
-    metadata: &'static EffectMetadata,
-}
+use crate::registry_common::Registry;
 
 /// Name-keyed map of plane-effect factories.
 #[derive(Default)]
-pub struct PlaneEffectRegistry {
-    entries: BTreeMap<&'static str, Entry>,
-}
+pub struct PlaneEffectRegistry(pub(crate) Registry<dyn PlaneEffect>);
 
 impl PlaneEffectRegistry {
     /// Create an empty registry.
@@ -51,51 +32,51 @@ impl PlaneEffectRegistry {
     pub fn register(
         &mut self,
         name: &'static str,
-        factory: Box<dyn PlaneEffectFactory>,
+        factory: Box<dyn Fn() -> Box<dyn PlaneEffect> + Send + Sync>,
         metadata: &'static EffectMetadata,
     ) {
-        self.entries.insert(name, Entry { factory, metadata });
+        self.0.register(name, factory, metadata);
     }
 
-    /// Look up a factory.
+    /// Build a fresh effect by name.
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<&dyn PlaneEffectFactory> {
-        self.entries.get(name).map(|e| e.factory.as_ref())
+    pub fn build(&self, name: &str) -> Option<Box<dyn PlaneEffect>> {
+        self.0.build(name)
     }
 
     /// Look up the metadata for a registered name.
     #[must_use]
     pub fn metadata(&self, name: &str) -> Option<&'static EffectMetadata> {
-        self.entries.get(name).map(|e| e.metadata)
+        self.0.metadata(name)
     }
 
     /// Iterate every registered effect's metadata, in name order.
     pub fn iter_metadata(&self) -> impl Iterator<Item = &'static EffectMetadata> + '_ {
-        self.entries.values().map(|e| e.metadata)
+        self.0.iter_metadata()
     }
 
     /// Sorted list of registered effect names.
     #[must_use]
     pub fn names(&self) -> Vec<&'static str> {
-        self.entries.keys().copied().collect()
+        self.0.names()
     }
 
     /// Number of registered factories.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.0.len()
     }
 
     /// Returns `true` if no factory has been registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.0.is_empty()
     }
 
     /// Returns `true` if a factory is registered under `name`.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
-        self.entries.contains_key(name)
+        self.0.contains(name)
     }
 
     /// Build a chain from a list of effect names.
@@ -107,19 +88,11 @@ impl PlaneEffectRegistry {
         &self,
         names: &[S],
     ) -> Result<Vec<Box<dyn PlaneEffect>>, EffectError> {
-        names
-            .iter()
-            .map(|name| {
-                let n = name.as_ref();
-                self.get(n).map(PlaneEffectFactory::build).ok_or_else(|| {
-                    EffectError::InvalidConfig {
-                        name: n.to_string(),
-                        reason: "unknown plane effect: not registered".into(),
-                        hint: Some("known names: see fluxframe_effects::plane_effects".into()),
-                    }
-                })
-            })
-            .collect()
+        self.0.build_chain(
+            names,
+            "plane",
+            "known names: see fluxframe_effects::plane_effects",
+        )
     }
 }
 

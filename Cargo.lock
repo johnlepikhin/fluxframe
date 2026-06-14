@@ -525,6 +525,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "tempfile",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
@@ -534,6 +535,7 @@ dependencies = [
 name = "fluxframe-core"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror",
@@ -583,6 +585,7 @@ dependencies = [
  "relm4",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

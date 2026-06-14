@@ -26,9 +26,10 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 /// Process-wide event counters.
 ///
@@ -218,17 +219,13 @@ impl LatencyHistogram {
     /// Record one latency sample in microseconds.  Evicts the oldest
     /// sample if the ring is already full.
     ///
-    /// Recovers from mutex poisoning (`PoisonError::into_inner`):
-    /// observability must never escalate an unrelated thread's panic
-    /// into a kill of the producer.  The contents stay valid because
-    /// every critical section is one `pop_front` + `push_back` with no
-    /// invariants that span operations.
+    /// `parking_lot::Mutex` has no poisoning concept, so the lock is
+    /// infallible — recording can never be derailed by an unrelated
+    /// thread's panic.  Each critical section is one `pop_front` +
+    /// `push_back` with no cross-call invariants.
     #[inline]
     pub fn record_us(&self, value: u64) {
-        let mut buf = self
-            .samples
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut buf = self.samples.lock();
         if buf.len() == self.capacity {
             buf.pop_front();
         }
@@ -239,14 +236,10 @@ impl LatencyHistogram {
     /// suitable for percentile queries.  The histogram itself is NOT
     /// emptied; recording continues against the live ring.
     ///
-    /// Poison-tolerant for the same reason as
-    /// [`LatencyHistogram::record_us`].
+    /// Infallible by virtue of `parking_lot::Mutex` (no poisoning).
     #[must_use]
     pub fn snapshot(&self) -> LatencySnapshot {
-        let buf = self
-            .samples
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let buf = self.samples.lock();
         let mut owned: Vec<u64> = Vec::with_capacity(buf.len());
         owned.extend(buf.iter().copied());
         // Release the lock before sorting — sort is O(n log n) and we

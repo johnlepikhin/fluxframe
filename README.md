@@ -252,6 +252,53 @@ sections cannot be reconfigured live (would require a GStreamer
 pipeline restart). Runtime tweaks are ephemeral — they are NOT
 written back to `fluxframe.toml`.
 
+## Live tuning via fluxframe-gui (Stage 14)
+
+A GTK4/libadwaita companion app provides a slider-style editor over
+the same control socket. Start the daemon with `[control].enabled =
+true` (above), then launch the GUI:
+
+```bash
+guix shell -m manifest.scm -- cargo run -p fluxframe-gui
+# or with a non-default socket path:
+guix shell -m manifest.scm -- cargo run -p fluxframe-gui -- \
+    --socket /run/user/1000/fluxframe.sock
+```
+
+What you get:
+
+* **Preset switcher** — a DropDown in the header bar lists every
+  preset defined in the loaded TOML; selecting one dispatches
+  `set_preset` and the chain editor refreshes.
+* **Chain editor** — one page with four groups (mask /
+  background / foreground / post). Each effect is an expandable row
+  with `↑` / `↓` / `✕` suffix buttons; clicking the `+` MenuButton on
+  a group header lists every effect the daemon's registry advertises
+  and adds the chosen one to the chain.
+* **Per-parameter widgets** — sliders, spin buttons, switches,
+  colour pickers, file pickers, drop-downs (chosen automatically from
+  the effect's `ParamKind` metadata). Changes are debounced (50 ms
+  for continuous Float / Integer params, 100–200 ms for heavier ones)
+  before hitting the daemon.
+* **Rollback toasts** — if the daemon rejects a `set` (e.g. out of
+  range), an `AdwToast` shows the error and the widget snaps back to
+  the last-good value.
+* **Open preview** — a button in the header bar spawns
+  `gst-launch-1.0 v4l2src device=/dev/video10 ! videoconvert !
+  autovideosink` so you can watch the daemon's output while tuning.
+* **Keyboard shortcuts**:
+  * `Ctrl+R` / `F5` — `reload` daemon TOML + refetch state.
+  * `Ctrl+Q` — quit.
+  * `Ctrl+1` … `Ctrl+9` — switch to preset slot N (1-indexed in the
+    preset list).
+* **Window geometry** is persisted to
+  `$XDG_CONFIG_HOME/fluxframe/gui.json` (or `~/.config/fluxframe/`)
+  between runs.
+
+The GUI requires `gtk` (≥ 4.18, Guix gives 4.20), `libadwaita` (≥ 1.6,
+Guix gives 1.8), `graphene`, `pango`, `cairo`, and `gdk-pixbuf` — all
+already listed in `manifest.scm`.
+
 ## Pre-commit
 
 Install once:

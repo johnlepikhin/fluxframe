@@ -241,6 +241,10 @@ fn format_priority(f: PixelFormat) -> u8 {
         PixelFormat::Yuy2 | PixelFormat::Nv12 => 0,
         PixelFormat::Rgb | PixelFormat::Bgr | PixelFormat::Rgba => 1,
         PixelFormat::Gray8 => 2,
+        // `PixelFormat` is `#[non_exhaustive]`; unknown future
+        // variants get the lowest priority so they are never
+        // accidentally picked over a real V4L2 format.
+        _ => u8::MAX,
     }
 }
 

@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use fluxframe_core::{CommitStrategy, ParamDescriptor, ParamKind, Scale};
+use gtk::gio;
 use relm4::Sender;
 use serde_json::Value;
 
@@ -26,6 +27,13 @@ use crate::debounce::Debouncer;
 
 /// Minimum horizontal pixel width for the param-row sliders.
 const SLIDER_MIN_WIDTH: i32 = 180;
+
+/// Number of discrete ticks the log-scale slider divides its
+/// `[ln(min), ln(max)]` range into. 100 ticks gives one-percent
+/// resolution at the visual level — fine enough for tuning, coarse
+/// enough that the GTK adjustment step lands on a visible
+/// quantisation.
+const LOG_SLIDER_TICKS: f64 = 100.0;
 
 /// Context shared by every param widget's signal handler.
 ///
@@ -72,6 +80,10 @@ pub(crate) fn build(
             scale,
         } => {
             let value = initial.as_f64().map_or(default, |v| v as f32);
+            #[allow(
+                clippy::match_same_arms,
+                reason = "wildcard arm exists solely to satisfy non_exhaustive ParamKind"
+            )]
             let widget = match scale {
                 Scale::Linear => float_slider(
                     f64::from(min),
@@ -80,6 +92,13 @@ pub(crate) fn build(
                     f64::from(value),
                 ),
                 Scale::Logarithmic => log_float_slider(min, max, value),
+                // `Scale` is `#[non_exhaustive]`; fall back to linear.
+                _ => float_slider(
+                    f64::from(min),
+                    f64::from(max),
+                    f64::from(step),
+                    f64::from(value),
+                ),
             };
             wire_float(&widget, path, descriptor.commit, scale, ctx);
             row.add_suffix(&widget);
@@ -138,7 +157,9 @@ pub(crate) fn build(
             row.add_suffix(&button);
         }
         ParamKind::Path {
-            default, required, ..
+            default,
+            required,
+            extensions,
         } => {
             let initial_path = initial
                 .as_str()
@@ -150,9 +171,7 @@ pub(crate) fn build(
                 })
                 .to_string();
             let button = gtk::Button::with_label(&initial_path);
-            // Path picker logic deferred to a follow-up — for now the
-            // row is informational. Stage 14 Step 6 wires
-            // `gtk::FileDialog` here.
+            wire_path(&button, path, extensions, ctx.sender);
             row.add_suffix(&button);
         }
         ParamKind::Enum { default, variants } => {
@@ -175,6 +194,15 @@ pub(crate) fn build(
             drop.set_valign(gtk::Align::Center);
             wire_enum(&drop, variants, path, ctx.sender);
             row.add_suffix(&drop);
+        }
+        // `ParamKind` is `#[non_exhaustive]`; future variants render
+        // as a placeholder so the chain page does not blow up on a
+        // newer daemon. Log so the operator sees something is off.
+        _ => {
+            tracing::warn!(
+                path = %path,
+                "unsupported ParamKind variant — rendering an empty row"
+            );
         }
     }
 
@@ -203,8 +231,8 @@ fn log_float_slider(min: f32, max: f32, value: f32) -> gtk::Scale {
     let ln_min = f64::from(safe_min.ln());
     let ln_max = f64::from(max.ln());
     let ln_value = f64::from(value.max(safe_min).ln());
-    // Step in log space: 100 ticks over the range.
-    let ln_step = (ln_max - ln_min) / 100.0;
+    // Step in log space: `LOG_SLIDER_TICKS` ticks over the range.
+    let ln_step = (ln_max - ln_min) / LOG_SLIDER_TICKS;
     let adj = gtk::Adjustment::new(ln_value, ln_min, ln_max, ln_step, ln_step, 0.0);
     let scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&adj));
     scale.set_hexpand(true);
@@ -228,7 +256,9 @@ fn wire_float(
     scale.connect_value_changed(move |s| {
         let value = match value_scale {
             Scale::Logarithmic => s.value().exp(),
-            Scale::Linear => s.value(),
+            // `Scale` is `#[non_exhaustive]`; treat unknown variants
+            // as linear (the raw slider value).
+            Scale::Linear | _ => s.value(),
         };
         let json = serde_json::Number::from_f64(value).map_or(Value::Null, Value::Number);
         dispatch(commit, path.clone(), json, &ctx);
@@ -309,6 +339,75 @@ fn wire_color(button: &gtk::ColorDialogButton, path: String, sender: Sender<AppM
     });
 }
 
+/// Wire a Path-parameter button to open a [`gtk::FileDialog`] and
+/// send the chosen file's path back to the daemon.
+///
+/// The dialog is anchored to the button's window; cancellation is a
+/// no-op (no `SetParam` is sent). Extension filters are advisory —
+/// the dialog still lets the user override with "All files".
+fn wire_path(
+    button: &gtk::Button,
+    path: String,
+    extensions: &'static [&'static str],
+    sender: Sender<AppMsg>,
+) {
+    let button_handle = button.clone();
+    button.connect_clicked(move |_| {
+        // Pull the last dot-segment of the path (the field name) so the
+        // dialog title tells the user what they're picking, instead of a
+        // generic "Pick a file".
+        let field_name = path.rsplit('.').next().unwrap_or("file");
+        let title = format!("Pick {field_name}");
+        let dialog = gtk::FileDialog::builder().title(&title).modal(true).build();
+        if !extensions.is_empty() {
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("Supported types"));
+            for ext in extensions {
+                filter.add_suffix(ext);
+            }
+            let filters = gio::ListStore::new::<gtk::FileFilter>();
+            filters.append(&filter);
+            dialog.set_filters(Some(&filters));
+            dialog.set_default_filter(Some(&filter));
+        }
+        let window = button_handle
+            .root()
+            .and_then(|w| w.downcast::<gtk::Window>().ok());
+        let path_for_dialog = path.clone();
+        let sender_for_dialog = sender.clone();
+        let button_for_dialog = button_handle.clone();
+        dialog.open(
+            window.as_ref(),
+            gio::Cancellable::NONE,
+            move |result| match result {
+                Ok(file) => {
+                    let Some(picked) = file.path() else {
+                        tracing::warn!("FileDialog returned a file without a path");
+                        return;
+                    };
+                    let picked_str = picked.to_string_lossy().into_owned();
+                    button_for_dialog.set_label(&picked_str);
+                    let _ = sender_for_dialog.send(AppMsg::SetParam {
+                        path: path_for_dialog.clone(),
+                        value: Value::String(picked_str),
+                    });
+                }
+                Err(e) => {
+                    // gio::IOErrorEnum::Cancelled is the normal "user
+                    // dismissed the dialog" path — log at debug only.
+                    // Anything else is a real I/O failure and deserves
+                    // warn-level visibility.
+                    if e.kind::<gio::IOErrorEnum>() == Some(gio::IOErrorEnum::Cancelled) {
+                        tracing::debug!("FileDialog cancelled by user");
+                    } else {
+                        tracing::warn!(error = %e, "FileDialog failed");
+                    }
+                }
+            },
+        );
+    });
+}
+
 fn wire_enum(
     drop: &gtk::DropDown,
     variants: &'static [&'static str],
@@ -337,6 +436,10 @@ fn dispatch(commit: CommitStrategy, path: String, value: Value, ctx: &DispatchCt
     );
     let DispatchCtx { debouncer, sender } = ctx;
     let sender = sender.clone();
+    #[allow(
+        clippy::single_match_else,
+        reason = "wildcard arm exists solely to satisfy non_exhaustive CommitStrategy"
+    )]
     match commit {
         CommitStrategy::Live { debounce_ms } => {
             let path_for_send = path.clone();
@@ -351,7 +454,9 @@ fn dispatch(commit: CommitStrategy, path: String, value: Value, ctx: &DispatchCt
                 },
             );
         }
-        CommitStrategy::OnCommit | CommitStrategy::Instant => {
+        // `CommitStrategy` is `#[non_exhaustive]`; treat unknown
+        // variants like `OnCommit` (flush immediately).
+        CommitStrategy::OnCommit | CommitStrategy::Instant | _ => {
             let path_for_send = path.clone();
             debouncer.flush(&path, || {
                 let _ = sender.send(AppMsg::SetParam {

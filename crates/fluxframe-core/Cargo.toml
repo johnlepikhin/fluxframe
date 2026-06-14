@@ -9,6 +9,7 @@ rust-version.workspace = true
 description = "Core types, traits and error model for FluxFrame. No GStreamer/ONNX dependencies."
 
 [dependencies]
+parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -16,9 +16,19 @@ path = "src/main.rs"
 # Forward features from `fluxframe-effects` so the CLI binary
 # default-builds the full effect catalogue. Slim builds opt out per
 # feature, mirroring the layering in `fluxframe-effects` itself.
-default = ["ml", "image-fill"]
+#
+# `wgpu` and `openvino` must be forwarded explicitly: the workspace
+# pulls `fluxframe-effects` with `default-features = false`, so the
+# effects crate's own `default = [..., "wgpu", "openvino", ...]` is
+# inert from the CLI's perspective. Without these forwards the
+# `fluxframe` binary would ship without the GPU blur backend and the
+# OpenVINO inference backend despite both being default-on inside the
+# effects crate.
+default = ["ml", "image-fill", "wgpu", "openvino"]
 ml = ["fluxframe-effects/ml"]
 image-fill = ["fluxframe-effects/image-fill"]
+wgpu = ["fluxframe-effects/wgpu"]
+openvino = ["fluxframe-effects/openvino"]
 
 [dependencies]
 fluxframe-core = { workspace = true }
@@ -39,6 +49,12 @@ ctrlc = { workspace = true }
 # for the kernel's USB-isoc soft-IRQs — without that, the UVC driver
 # silently drops packets under load and emits torn camera frames.
 rayon = { workspace = true }
+
+[dev-dependencies]
+# Used by the `control_socket_e2e` integration test to bind a unique
+# UNIX socket path per run without colliding with other tests or with
+# a real daemon running on the developer's machine.
+tempfile = "3"
 
 [lints]
 workspace = true

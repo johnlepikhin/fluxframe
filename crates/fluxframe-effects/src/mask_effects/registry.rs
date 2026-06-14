@@ -4,39 +4,20 @@
 //! Each entry pairs a build closure with a `&'static EffectMetadata`
 //! reference. Metadata is registry-only (no method on the trait) so a
 //! caller introspecting the inventory never has to build an instance.
-
-use std::collections::BTreeMap;
+//!
+//! Storage and lookup are delegated to the generic
+//! [`crate::registry_common::Registry`]. This newtype wrapper exists
+//! to give the public API a concrete, self-documenting type.
 
 use fluxframe_core::EffectMetadata;
 use fluxframe_core::error::EffectError;
 use fluxframe_core::plane::MaskEffect;
 
-/// Factory closure producing a fresh [`MaskEffect`] instance.
-pub trait MaskEffectFactory: Send + Sync {
-    /// Build a brand-new effect.
-    fn build(&self) -> Box<dyn MaskEffect>;
-}
-
-impl<F> MaskEffectFactory for F
-where
-    F: Fn() -> Box<dyn MaskEffect> + Send + Sync,
-{
-    fn build(&self) -> Box<dyn MaskEffect> {
-        self()
-    }
-}
-
-/// One row of the registry: factory + descriptor.
-struct Entry {
-    factory: Box<dyn MaskEffectFactory>,
-    metadata: &'static EffectMetadata,
-}
+use crate::registry_common::Registry;
 
 /// Name-keyed map of mask-effect factories.
 #[derive(Default)]
-pub struct MaskEffectRegistry {
-    entries: BTreeMap<&'static str, Entry>,
-}
+pub struct MaskEffectRegistry(pub(crate) Registry<dyn MaskEffect>);
 
 impl MaskEffectRegistry {
     /// Create an empty registry.
@@ -50,51 +31,51 @@ impl MaskEffectRegistry {
     pub fn register(
         &mut self,
         name: &'static str,
-        factory: Box<dyn MaskEffectFactory>,
+        factory: Box<dyn Fn() -> Box<dyn MaskEffect> + Send + Sync>,
         metadata: &'static EffectMetadata,
     ) {
-        self.entries.insert(name, Entry { factory, metadata });
+        self.0.register(name, factory, metadata);
     }
 
-    /// Look up a factory.
+    /// Build a fresh effect by name.
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<&dyn MaskEffectFactory> {
-        self.entries.get(name).map(|e| e.factory.as_ref())
+    pub fn build(&self, name: &str) -> Option<Box<dyn MaskEffect>> {
+        self.0.build(name)
     }
 
     /// Look up the metadata for a registered name.
     #[must_use]
     pub fn metadata(&self, name: &str) -> Option<&'static EffectMetadata> {
-        self.entries.get(name).map(|e| e.metadata)
+        self.0.metadata(name)
     }
 
     /// Iterate every registered effect's metadata, in name order.
     pub fn iter_metadata(&self) -> impl Iterator<Item = &'static EffectMetadata> + '_ {
-        self.entries.values().map(|e| e.metadata)
+        self.0.iter_metadata()
     }
 
     /// Sorted list of registered effect names.
     #[must_use]
     pub fn names(&self) -> Vec<&'static str> {
-        self.entries.keys().copied().collect()
+        self.0.names()
     }
 
     /// Number of registered factories.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.0.len()
     }
 
     /// Returns `true` if no factory has been registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.0.is_empty()
     }
 
     /// Returns `true` if a factory is registered under `name`.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
-        self.entries.contains_key(name)
+        self.0.contains(name)
     }
 
     /// Build a chain from a list of effect names.
@@ -106,19 +87,11 @@ impl MaskEffectRegistry {
         &self,
         names: &[S],
     ) -> Result<Vec<Box<dyn MaskEffect>>, EffectError> {
-        names
-            .iter()
-            .map(|name| {
-                let n = name.as_ref();
-                self.get(n).map(MaskEffectFactory::build).ok_or_else(|| {
-                    EffectError::InvalidConfig {
-                        name: n.to_string(),
-                        reason: "unknown mask effect: not registered".into(),
-                        hint: Some("known names: see fluxframe_effects::mask_effects".into()),
-                    }
-                })
-            })
-            .collect()
+        self.0.build_chain(
+            names,
+            "mask",
+            "known names: see fluxframe_effects::mask_effects",
+        )
     }
 }
 

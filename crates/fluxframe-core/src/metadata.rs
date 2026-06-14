@@ -68,6 +68,7 @@ pub struct ParamDescriptor {
 /// `PathBuf`, named enums. Any new variant has to plumb through the
 /// GUI's `param_row.rs` as well.
 #[derive(Debug, Clone, Copy, Serialize)]
+#[non_exhaustive]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ParamKind {
     /// A continuous floating-point parameter.
@@ -134,6 +135,7 @@ pub enum ParamKind {
 /// Linear vs logarithmic mapping for [`ParamKind::Float`] and
 /// [`ParamKind::Integer`].
 #[derive(Debug, Clone, Copy, Serialize)]
+#[non_exhaustive]
 #[serde(rename_all = "snake_case")]
 pub enum Scale {
     /// Default: GUI slider tracks value linearly.
@@ -150,6 +152,7 @@ pub enum Scale {
 /// dragging a slider. `CommitStrategy` lets each parameter declare
 /// its own batching cadence.
 #[derive(Debug, Clone, Copy, Serialize)]
+#[non_exhaustive]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum CommitStrategy {
     /// Live updates, throttled to one command per `debounce_ms`

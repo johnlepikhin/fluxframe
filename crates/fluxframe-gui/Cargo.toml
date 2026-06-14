@@ -23,6 +23,13 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[dev-dependencies]
+# Used by `persistence` tests to isolate XDG_CONFIG_HOME per test in
+# unique scratch dirs. Pinned to the same major as `fluxframe-effects`
+# / `fluxframe-cli`; not promoted to workspace.dependencies until a
+# third consumer appears.
+tempfile = "3"
+
 [[bin]]
 name = "fluxframe-gui"
 path = "src/main.rs"

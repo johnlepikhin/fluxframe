@@ -26,6 +26,7 @@ use fluxframe_core::error::PipelineError;
 use fluxframe_core::frame::{PixelFormat, VideoFrame};
 use gstreamer::prelude::*;
 use gstreamer_app::AppSrc;
+use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
 
 use crate::util::{build_caps, check_v4l2_output_access, make_element};
@@ -178,9 +179,9 @@ pub struct OutputPipeline {
     /// Latest composite from the effect chain.  Cloned cheaply (the
     /// inner `Arc` is bumped, not the pixel bytes) by the writer thread
     /// every tick.
-    latest: Arc<std::sync::Mutex<Option<LatestComposite>>>,
+    latest: Arc<Mutex<Option<LatestComposite>>>,
     /// Writer thread handle.  Joined on `stop`.
-    writer_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    writer_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 // Writer tick rate equals the configured output `fps`.  Empirical
@@ -286,8 +287,8 @@ impl OutputPipeline {
             started: Arc::new(AtomicBool::new(false)),
             fps: fps.max(1),
             _fd_guard: fd_guard,
-            latest: Arc::new(std::sync::Mutex::new(None)),
-            writer_handle: std::sync::Mutex::new(None),
+            latest: Arc::new(Mutex::new(None)),
+            writer_handle: Mutex::new(None),
         })
     }
 
@@ -325,7 +326,7 @@ impl OutputPipeline {
             .map_err(|e| PipelineError::Runtime {
                 reason: format!("writer thread spawn failed: {e}"),
             })?;
-        *self.writer_handle.lock().expect("writer_handle poisoned") = Some(handle);
+        *self.writer_handle.lock() = Some(handle);
         Ok(())
     }
 
@@ -353,7 +354,7 @@ impl OutputPipeline {
             fluxframe_core::frame::FrameBuffer::Shared(arc) => arc,
         };
         let composite = LatestComposite { bytes, seq };
-        *self.latest.lock().expect("latest poisoned") = Some(composite);
+        *self.latest.lock() = Some(composite);
         trace!(seq, "published composite to writer thread");
         Ok(())
     }
@@ -376,11 +377,7 @@ impl OutputPipeline {
         //   3. send EOS so downstream drains cleanly;
         //   4. tear the pipeline down to Null.
         let was_started = self.started.swap(false, Ordering::AcqRel);
-        if let Some(handle) = self
-            .writer_handle
-            .lock()
-            .expect("writer_handle poisoned")
-            .take()
+        if let Some(handle) = self.writer_handle.lock().take()
             && let Err(e) = handle.join()
         {
             warn!(?e, "writer thread panicked while joining");
@@ -691,6 +688,11 @@ fn build_v4l2_direct_chain(
 /// v4l2 fourcc — the helper stays `infallible` rather than
 /// `Result` because there's no failure mode at this level.
 fn pixel_format_to_v4l_fourcc(fmt: PixelFormat) -> v4l::FourCC {
+    #[allow(
+        clippy::match_same_arms,
+        reason = "wildcard arm exists only because PixelFormat is #[non_exhaustive]; \
+                  it intentionally aliases the YUYV mapping as the safest fallback"
+    )]
     let code: &[u8; 4] = match fmt {
         PixelFormat::Yuy2 => b"YUYV",
         PixelFormat::Nv12 => b"NV12",
@@ -698,6 +700,7 @@ fn pixel_format_to_v4l_fourcc(fmt: PixelFormat) -> v4l::FourCC {
         PixelFormat::Bgr => b"BGR3",
         PixelFormat::Rgba => b"RGB4",
         PixelFormat::Gray8 => b"GREY",
+        _ => b"YUYV",
     };
     v4l::FourCC::new(code)
 }
@@ -731,7 +734,7 @@ fn build_pipewire_sink(node_name: Option<&str>) -> Result<gstreamer::Element, Pi
 /// `appsrc`.  Exits when `started` flips to `false`.
 fn writer_loop(
     started: &Arc<AtomicBool>,
-    latest: &Arc<std::sync::Mutex<Option<LatestComposite>>>,
+    latest: &Arc<Mutex<Option<LatestComposite>>>,
     appsrc: &AppSrc,
     interval: Duration,
 ) {
@@ -758,7 +761,6 @@ fn writer_loop(
         // a single refcount bump regardless of buffer size.
         let snapshot = latest
             .lock()
-            .expect("latest poisoned")
             .as_ref()
             .map(|c| (Arc::clone(&c.bytes), c.seq));
         let Some((bytes, seq)) = snapshot else {

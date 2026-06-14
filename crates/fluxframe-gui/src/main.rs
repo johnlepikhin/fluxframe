@@ -4,10 +4,13 @@
 //! the relm4 application loop.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 mod app;
 mod debounce;
 mod ipc;
+mod persistence;
+mod shortcuts;
 mod state;
 mod components {
     pub mod chain_page;

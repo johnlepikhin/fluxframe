@@ -35,6 +35,10 @@ mod pixel_format_serde {
             PixelFormat::Yuy2 => "YUY2",
             PixelFormat::Nv12 => "NV12",
             PixelFormat::Gray8 => "GRAY8",
+            // `PixelFormat` is `#[non_exhaustive]`; tag any future
+            // variant with an opaque string so serde round-trip
+            // surfaces the gap instead of silently dropping it.
+            _ => "UNKNOWN",
         };
         ser.serialize_str(tag)
     }

@@ -12,6 +12,7 @@ use std::time::Duration;
 /// MVP processing path operates on `Rgb`/`Rgba`; the other variants are
 /// reserved for capture/output negotiation and future zero-copy paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum PixelFormat {
     /// 24-bit packed RGB, 8 bits per channel, R-G-B byte order.
     Rgb,
@@ -282,6 +283,16 @@ impl VideoFrame {
     /// plane of `Planar` strides against the format, only the primary
     /// plane and the plane count.  Deeper validation belongs in
     /// format-specific helpers.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(&'static str)` if any of the documented invariants
+    /// is violated:
+    /// - `width` or `height` is `0`;
+    /// - `stride.plane_count()` does not match `format` (1 plane for
+    ///   packed formats, 2 planes for `Nv12`);
+    /// - `data.len()` is less than `stride.primary() * height` (the
+    ///   primary plane is not fully addressable).
     #[allow(clippy::result_unit_err)]
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.width == 0 || self.height == 0 {

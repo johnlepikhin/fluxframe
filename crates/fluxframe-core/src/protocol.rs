@@ -29,6 +29,7 @@ use crate::SubchainKind;
 /// {"cmd":"set_chain","section":"background","chain":["blur","vignette"]}
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[non_exhaustive]
 #[serde(tag = "cmd", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     /// List the names of every preset defined in the loaded config.
@@ -93,6 +94,7 @@ pub enum Command {
 /// discriminator on `ok` keeps the wire format scriptable from shell
 /// without parsing nested error variants.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 #[serde(tag = "ok")]
 pub enum Response {
     /// Successful response. `data` may be `Null`/an object/an array

@@ -31,6 +31,11 @@ pub mod plane_effects;
 #[cfg(feature = "ml")]
 pub mod post_effects;
 pub mod processing;
+// Generic registry shared by the three effect-section registries.
+// Crate-private: each section exposes its own newtype wrapper to keep
+// the public API self-documenting (a `MaskEffectRegistry` is a more
+// obvious type signature than `Registry<dyn MaskEffect>`).
+pub(crate) mod registry_common;
 
 pub use chain::EffectChain;
 #[cfg(feature = "ml")]
