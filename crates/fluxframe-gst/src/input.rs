@@ -226,6 +226,36 @@ impl InputPipeline {
     /// Returns [`PipelineError::StateChangeFailed`] on teardown failure.
     pub fn stop(&self) -> Result<(), PipelineError> {
         self.slot.close();
+        self.pipeline_to_null()
+    }
+
+    /// Drop the pipeline to `Null` without closing the frame slot.
+    ///
+    /// Stage 15 idle mode uses this to release the V4L2 device (and
+    /// turn the camera LED off on most UVC cameras) while keeping the
+    /// worker loop running for placeholder pushes. The pipeline can
+    /// later be resumed via [`Self::start`]; the slot stays open so a
+    /// resumed pipeline finds the worker ready to receive frames.
+    ///
+    /// Distinct from [`Self::stop`], which signals supervisor shutdown
+    /// by closing the slot. Calling `set_state_null` followed by
+    /// `start` is reversible — both transitions are GStreamer
+    /// internal state changes, no underlying I/O fan-out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::StateChangeFailed`] if GStreamer
+    /// refuses the state change.
+    pub fn set_state_null(&self) -> Result<(), PipelineError> {
+        self.pipeline_to_null()
+    }
+
+    /// Transition the underlying GStreamer pipeline to `Null`.
+    ///
+    /// Shared helper for [`Self::stop`] and [`Self::set_state_null`];
+    /// only the implementation deduplicates, the two callers carry
+    /// distinct semantic contracts (shutdown vs idle-mode pause).
+    fn pipeline_to_null(&self) -> Result<(), PipelineError> {
         self.pipeline
             .set_state(gstreamer::State::Null)
             .map(|_| ())

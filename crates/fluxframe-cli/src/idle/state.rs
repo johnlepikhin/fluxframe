@@ -49,7 +49,11 @@ use fluxframe_core::IdleConfig;
 ///   write never panics the worker.
 /// - The Step 3 detector → worker channel is single-producer /
 ///   single-consumer and carries advisory data only, so `Relaxed`
-///   atomic ordering is sufficient for both the store and the load.
+///   ordering would suffice in principle. The detector publishes
+///   with `Release` and the worker loads with `Acquire` as a
+///   defensive default: cost on x86_64 is identical to `Relaxed`,
+///   and the stronger ordering simplifies correctness proofs if
+///   future state is ever piggybacked on the status atomic.
 /// - [`IdleStateMachine`] is owned exclusively by the worker thread.
 ///   The atomic only crosses the detector → worker boundary; the
 ///   state machine itself never sees concurrent access.
@@ -83,10 +87,6 @@ impl ConsumerStatus {
     }
 
     /// Encode for the `AtomicU8`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Stage 15 Step 4 wires the supervisor")
-    )]
     pub(crate) fn as_u8(self) -> u8 {
         self as u8
     }

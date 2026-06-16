@@ -11,12 +11,17 @@
 //!   transitions; no I/O. Wired into the worker loop in
 //!   `runtime::run_process_loop`.
 //! * `detector` (Step 3) — sysfs `state` poller thread that publishes
-//!   the observed consumer status into an `Arc<AtomicU8>`.
+//!   the observed consumer status into an `Arc<AtomicU8>`. Linux-only:
+//!   v4l2loopback exposes the sysfs `state` attribute only on Linux,
+//!   so the module is `cfg`-gated and the supervisor (Step 4)
+//!   consults the same gate when wiring it.
 //! * `placeholder` (Step 2) — pre-rendered frame cache.
 //! * `managed_composite` (Step 2) — lifecycle wrapper around
 //!   `CompositeEffect` that owns the engine slot.
 //! * `reload` (Step 4) — off-worker reload thread.
 
+#[cfg(target_os = "linux")]
+pub(crate) mod detector;
 // `managed_composite` wraps `CompositeEffect` + ONNX engine
 // lifecycle, both of which are gated behind the `ml` feature in
 // fluxframe-effects. Without `ml` there is no engine to manage and
@@ -28,9 +33,15 @@ pub(crate) mod managed_composite;
 pub(crate) mod placeholder;
 pub(crate) mod state;
 
-// Re-exports forwarded for downstream Step 3/4 wiring. Marked
+// Re-exports forwarded for downstream Step 4 wiring. Marked
 // `dead_code` until the supervisor consumes them; without the
 // allow Rust 2024 surfaces them as unused-imports.
+#[cfg(target_os = "linux")]
+#[allow(
+    unused_imports,
+    reason = "Stage 15 Step 4 consumes these from runtime::run_process_loop"
+)]
+pub(crate) use detector::{ConsumerDetector, sysfs_state_path};
 #[cfg(feature = "ml")]
 #[allow(
     unused_imports,
