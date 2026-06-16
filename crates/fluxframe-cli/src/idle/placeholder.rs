@@ -1,20 +1,3 @@
-// Stage 15 Step 2 lands the placeholder API; Step 4 wires the call
-// sites from `runtime::run_process_loop`. Until then every public
-// item here looks dead from the binary's perspective. Use
-// `expect(dead_code)` so the moment Step 4 starts consuming the
-// module the expectation fires and forces the attribute removal,
-// which makes "Step 4 not yet plumbed in" impossible to miss.
-//
-// The `cfg_attr(not(test), ...)` form keeps the test target free of
-// the lint suppression — every item is exercised by tests below.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Stage 15 Step 4 wires the placeholder into the supervisor"
-    )
-)]
-
 //! Idle-mode placeholder frame source.
 //!
 //! When the supervisor is in `Idle` or `DeepIdle` it stops pulling

@@ -74,10 +74,6 @@ pub(crate) enum ConsumerStatus {
 impl ConsumerStatus {
     /// Decode an `AtomicU8` value. Unknown numeric values fall back to
     /// [`ConsumerStatus::Unknown`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Stage 15 Step 4 wires the supervisor")
-    )]
     pub(crate) fn from_u8(raw: u8) -> Self {
         match raw {
             0 => ConsumerStatus::Absent,
@@ -184,10 +180,6 @@ impl IdleStateMachine {
     ///
     /// `now` is injected so unit tests can fix the initial baseline.
     /// The production caller passes `Instant::now()` once at startup.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Stage 15 Step 4 wires the supervisor")
-    )]
     pub(crate) fn new(now: Instant) -> Self {
         Self {
             state: IdleState::Active,
@@ -216,10 +208,6 @@ impl IdleStateMachine {
     /// Cooldown/deep-idle thresholds come from `cfg` so a runtime
     /// `reload` of the config picks them up on the next tick without
     /// reconstructing the machine.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Stage 15 Step 4 wires the supervisor")
-    )]
     pub(crate) fn tick(
         &mut self,
         status: ConsumerStatus,

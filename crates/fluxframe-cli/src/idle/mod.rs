@@ -31,6 +31,7 @@ pub(crate) mod detector;
 #[cfg(feature = "ml")]
 pub(crate) mod managed_composite;
 pub(crate) mod placeholder;
+pub(crate) mod reload;
 pub(crate) mod state;
 
 // Re-exports forwarded for downstream Step 4 wiring. Marked

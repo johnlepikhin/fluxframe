@@ -1,16 +1,3 @@
-// Stage 15 Step 4 wires the detector into the supervisor; until then
-// every item here is dead code from the binary target's perspective.
-// The `cfg_attr(not(test), expect(...))` form keeps tests warning-free
-// while the binary build's expectation fires the moment Step 4 starts
-// consuming the module.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Stage 15 Step 4 wires the detector into the supervisor"
-    )
-)]
-
 //! Sysfs-based v4l2loopback consumer presence detector.
 //!
 //! Linux-only — v4l2loopback exposes the sysfs `state` attribute only

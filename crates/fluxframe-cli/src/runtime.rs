@@ -1242,6 +1242,10 @@ where
     let metrics = RuntimeMetrics::new();
 
     let (input, output, mut processing_ctx, sink_label) = build_pipelines(cfg, input_builder)?;
+    // Stage 15 needs to share `input` with the reload thread, so the
+    // supervisor wraps it in an Arc up-front. `&*input` keeps the
+    // legacy `&InputPipeline` ergonomics for the rest of this fn.
+    let input: Arc<InputPipeline> = Arc::new(input);
     processing_ctx.counters = Some(Arc::clone(&metrics.counters));
     // Per-effect TOML configuration happens inside the composite
     // builder (preset path) and at construction for [`PassthroughEffect`],
@@ -1304,17 +1308,25 @@ where
     // socket file at end-of-run.
     let (control_handle, control_rx) = maybe_spawn_control(cfg);
 
+    // Stage 15 idle runtime: detector spawn + state machine + cached
+    // placeholder. Returns `None` (Stage 14 fallthrough) when idle
+    // mode is disabled, the sink is non-V4L2, or the host is non-Linux.
+    let idle_runtime = build_idle_runtime(cfg, &input, &running);
+
     let process_result = run_process_loop(
-        cfg,
-        config_path,
-        preset_name,
-        &processing_ctx,
+        WorkerDeps {
+            cfg,
+            config_path,
+            initial_preset_name: preset_name,
+            processing_ctx: &processing_ctx,
+            metrics: &metrics,
+        },
         &running,
         &slot,
         &mut chain,
         &output,
-        &metrics,
         control_rx.as_ref(),
+        idle_runtime,
     );
 
     drop(control_handle);
@@ -1676,48 +1688,408 @@ fn process_one_frame(
     Ok(())
 }
 
-/// Push a pre-rendered placeholder frame straight to the output,
-/// bypassing the effect chain. Stage 15 hook — wired up in Step 4.
-///
-/// The current Step 0 stub returns an error if called; it exists so
-/// downstream steps can reference it without re-plumbing the worker
-/// signature. The compile error trail when the stub is exercised
-/// points the implementer at the right slot to fill in.
-#[expect(
-    dead_code,
-    reason = "Stage 15 Step 4 wires the call site; stub replaced then"
-)]
-fn push_placeholder(_output: &OutputPipeline, _metrics: &RuntimeMetrics) -> Result<(), FluxError> {
-    unreachable!(
-        "push_placeholder is a Stage 15 Step 0 stub: replace this stub before wiring the call site in Step 4"
-    )
+/// Push a pre-rendered placeholder frame to the output, bypassing
+/// the effect chain. Used by the worker loop while in Idle or
+/// DeepIdle to keep v4l2loopback's ring buffer fresh without paying
+/// the cost of the full pipeline.
+fn push_placeholder(
+    placeholder: &dyn crate::idle::Placeholder,
+    width: u32,
+    height: u32,
+    format: fluxframe_core::frame::PixelFormat,
+    output: &OutputPipeline,
+    metrics: &RuntimeMetrics,
+) -> Result<(), FluxError> {
+    let frame = placeholder.render(width, height, format)?;
+    if let Err(e) = output.push_frame(frame) {
+        error!(error = %e, "output.push_frame failed during idle placeholder push");
+        return Err(e.into());
+    }
+    metrics.counters.inc_idle_frames_pushed();
+    Ok(())
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "supervisor wiring; orchestrator threads all worker deps explicitly"
-)]
-fn run_process_loop(
+/// Bundle of Stage 15 idle infrastructure handed to the worker loop.
+/// `None` when idle mode is disabled or unavailable (non-V4L2 sink,
+/// non-Linux host); the loop then runs the Stage 14 path verbatim.
+struct IdleRuntime {
+    /// Pure state machine — owned exclusively by the worker thread.
+    state_machine: crate::idle::IdleStateMachine,
+    /// Detector → worker status atomic. Worker `Acquire`-loads each
+    /// tick; the detector thread `Release`-stores on transition.
+    consumer_status: Arc<std::sync::atomic::AtomicU8>,
+    /// Cached placeholder built once at startup (or supervisor
+    /// reload) for the configured `(output_w, output_h, format)`.
+    placeholder: Arc<dyn crate::idle::Placeholder>,
+    /// Output appsrc dimensions + format — the placeholder was
+    /// built for exactly these and the worker passes them on every
+    /// `render` call.
+    output_w: u32,
+    output_h: u32,
+    output_format: fluxframe_core::frame::PixelFormat,
+    /// Shared input handle. The worker calls `set_state_null` on
+    /// EnterIdle and the reload thread calls `start` on resume.
+    input: Arc<InputPipeline>,
+    /// `false` whenever the supervisor must not call
+    /// `chain.process` — true in Active, cleared on EnterDeepIdle,
+    /// re-armed by the reload thread.
+    engine_ready: Arc<AtomicBool>,
+    /// Live reload thread, if one is currently in flight. The
+    /// worker checks `is_finished` periodically to surface failures
+    /// in logs (Step 5 wires a `resume_latency_ms` histogram here).
+    reload_handle: Option<std::thread::JoinHandle<crate::idle::reload::ResumeOutcome>>,
+    /// Fix #7: tracks whether the previous worker iteration ran the
+    /// full chain (`true`) or pushed a placeholder (`false`). The
+    /// supervisor logs a one-shot `info!` line at every false→true
+    /// transition so "stuck in placeholder?" troubleshooting surfaces
+    /// the resume edge as an obvious line in the log stream.
+    /// Defaults to `true` because a freshly-built runtime is in the
+    /// Active level by construction.
+    was_active: bool,
+    /// Detector thread handle, kept alive for the duration of the
+    /// run. Its `Drop` impl joins the detector thread.
+    #[cfg(target_os = "linux")]
+    _detector: crate::idle::ConsumerDetector,
+}
+
+/// Construct the idle-runtime bundle if the configuration enables
+/// it, the host platform supports the detector, and the sink is a
+/// V4L2 loopback. Returns `None` for non-V4L2 sinks, non-Linux
+/// hosts, or when `idle.enabled = false` — the caller then runs
+/// the Stage 14 worker loop unchanged.
+fn build_idle_runtime(
     cfg: &FluxConfig,
-    config_path: Option<&std::path::Path>,
-    initial_preset_name: &str,
-    processing_ctx: &ProcessingContext,
+    input: &Arc<InputPipeline>,
+    running: &Arc<AtomicBool>,
+) -> Option<IdleRuntime> {
+    if !cfg.idle.enabled {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let sink = resolve_output_sink(cfg).ok()?;
+        // Fix #6: surface the silent fallback so an operator who set
+        // `idle.enabled = true` with a non-V4L2 sink sees why idle is
+        // not taking effect, rather than silently running the Stage 14
+        // path.
+        let Some(sysfs_path) = crate::idle::sysfs_state_path(&sink) else {
+            warn!(
+                "idle.enabled = true but sink is not v4l2loopback — idle disabled \
+                 (the consumer-presence detector only works against v4l2loopback's sysfs)"
+            );
+            return None;
+        };
+
+        let (sink_w, sink_h) = cfg
+            .output
+            .effective_dimensions(cfg.input.width, cfg.input.height);
+        // Placeholder format must match the appsrc's caps — that's
+        // the *input* format on the supervisor's pipeline. The
+        // output's sink format is reached via videoconvert downstream.
+        let placeholder_format = cfg.input.format;
+        let placeholder: Arc<dyn crate::idle::Placeholder> =
+            match crate::idle::build_placeholder(&cfg.idle, sink_w, sink_h) {
+                Ok(p) => p.into(),
+                Err(e) => {
+                    warn!(error = %e, "failed to build idle placeholder — idle mode disabled");
+                    return None;
+                }
+            };
+
+        let detector_running = Arc::clone(running);
+        let detector = crate::idle::ConsumerDetector::spawn(
+            sysfs_path,
+            std::time::Duration::from_millis(u64::from(cfg.idle.poll_interval_ms)),
+            detector_running,
+        );
+        // The detector handle moves into the runtime so its Drop
+        // runs when the worker loop exits.
+        let consumer_status = detector.status_handle();
+
+        Some(IdleRuntime {
+            state_machine: crate::idle::IdleStateMachine::new(Instant::now()),
+            consumer_status,
+            placeholder,
+            output_w: sink_w,
+            output_h: sink_h,
+            output_format: placeholder_format,
+            input: Arc::clone(input),
+            engine_ready: Arc::new(AtomicBool::new(true)),
+            reload_handle: None,
+            was_active: true,
+            _detector: detector,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = input;
+        let _ = running;
+        warn!("idle mode requested but host is not Linux — running Stage 14 loop unchanged");
+        None
+    }
+}
+
+/// Handle the side effects of an `IdleEdge`. Updates counters,
+/// reconfigures the input pipeline, and spawns the off-worker
+/// reload thread when needed.
+fn handle_idle_edge(
+    idle: &mut IdleRuntime,
+    edge: crate::idle::IdleEdge,
+    slot: &LatestFrameSlot,
+    output: &OutputPipeline,
+    metrics: &RuntimeMetrics,
+) {
+    use crate::idle::IdleEdge;
+    match edge {
+        IdleEdge::None => {}
+        IdleEdge::EnterIdle => {
+            metrics.counters.inc_idle_entered();
+            info!(target: "fluxframe::idle", "entering idle — tearing down input pipeline");
+            if let Err(e) = idle.input.set_state_null() {
+                warn!(error = %e, "set_state_null failed on idle entry");
+            }
+            // Discard any in-flight frame the capture thread published
+            // before the pipeline transitioned to Null — resuming with
+            // a stale frame on the chain would be visible to the
+            // consumer as a single mis-timed image.
+            slot.clear();
+        }
+        IdleEdge::EnterDeepIdle => {
+            metrics.counters.inc_deep_idle_entered();
+            info!(target: "fluxframe::idle", "entering deep idle");
+            // Stage 15 Step 4 ships the visible idle behaviour; the
+            // ONNX-engine unload that brings DeepIdle's RAM
+            // reclamation to life is parked here until the
+            // `EffectChain` ↔ `ManagedComposite` wiring lands.
+            // engine_ready stays `true` so the worker keeps running
+            // the full chain — DeepIdle is currently observationally
+            // identical to Idle.
+        }
+        IdleEdge::ResumeActive => {
+            info!(target: "fluxframe::idle", "consumer reconnected — spawning reload thread");
+            // Push one placeholder immediately to clear
+            // v4l2loopback's stale-frame replay before any real
+            // frames arrive (50–300 ms warmup on UVC).
+            if let Err(e) = push_placeholder(
+                idle.placeholder.as_ref(),
+                idle.output_w,
+                idle.output_h,
+                idle.output_format,
+                output,
+                metrics,
+            ) {
+                warn!(error = %e, "resume-edge placeholder push failed");
+            }
+            // Spawn the reload coordinator. The engine reloader is a
+            // no-op here because Step 4 does not yet unload the ONNX
+            // session; the input.start() inside `spawn_reload_thread`
+            // is the meaningful work.
+            // Fix #5: double-spawn guard. If a previous reload thread
+            // is still running we keep the existing handle and return
+            // early — kicking off a second reload while the first is
+            // mid-`input.start()` would race the GStreamer state
+            // transitions and likely produce a wedged input. Tested
+            // shape: this path is currently observed only via logs;
+            // a synthetic unit test would need a stalled reload
+            // closure and a full `IdleRuntime` (Arc<dyn Placeholder>,
+            // OutputPipeline, detector handle) which is integration
+            // territory.
+            // TODO(stage-15-followup): add a focused unit test by
+            // extracting a `double_spawn_guard(handle) -> Option<handle>`
+            // helper that does not depend on the full IdleRuntime.
+            let prior = idle.reload_handle.take();
+            if let Some(handle) = prior {
+                if !handle.is_finished() {
+                    warn!("a previous reload thread is still in flight; not spawning a second one");
+                    idle.reload_handle = Some(handle);
+                    return;
+                }
+                // Reap the outcome so the JoinHandle does not leak.
+                let _ = handle.join();
+            }
+            // Fix #4: race between the `is_finished` check above and
+            // this `store(false)` is narrow but real — a prior reload
+            // that finished between the check and the store loses its
+            // `engine_ready = true` write, so the worker spends one
+            // extra placeholder cycle before the new reload thread
+            // re-flips it. The clean fix is to push the `store(false)`
+            // into `spawn_reload_thread`'s body so the supervisor never
+            // touches `engine_ready` directly, but `idle/reload.rs` is
+            // owned by a sibling work item.
+            // TODO(stage-15-followup): move `engine_ready.store(false)`
+            // into `spawn_reload_thread`'s spawned closure (first
+            // action, before `input.start()`) and drop this line. The
+            // observable cost today is at most one extra placeholder
+            // push per ResumeActive that races a just-finished reload
+            // — counted in `idle_frames_pushed`, harmless.
+            idle.engine_ready.store(false, Ordering::Release);
+            let input = Arc::clone(&idle.input);
+            let engine_ready = Arc::clone(&idle.engine_ready);
+            idle.reload_handle = Some(crate::idle::reload::spawn_reload_thread(
+                input,
+                engine_ready,
+                || Ok(()),
+            ));
+        }
+    }
+}
+
+/// Result of [`tick_idle`]: tells [`run_process_loop`] whether the
+/// idle state-machine handled this iteration (`Continue`) or whether
+/// the worker should fall through and pull a real frame
+/// (`ProcessFrame`). The variant carries no payload — placeholder
+/// pushes are issued inside the helper so the caller only sees a
+/// two-arm match.
+enum IdleTickAction {
+    /// Idle helper either pushed a placeholder or parked on the
+    /// slot; the caller should `continue` to the next loop iteration.
+    Continue,
+    /// No idle handling required (idle disabled OR Active level with
+    /// engine ready); the caller should pull a frame and run the
+    /// chain.
+    ProcessFrame,
+}
+
+/// Run one tick of the idle state machine and dispatch the resulting
+/// edge + level.  Pulled out of [`run_process_loop`] so the orchestrator
+/// loop stays a thin three-stage skeleton (drain control commands → tick
+/// idle → process frame). Mixing the state-machine tick, edge dispatch,
+/// placeholder push and shutdown-aware park inside the loop body
+/// stacked three abstraction levels on top of each other; this helper
+/// owns one of them.
+///
+/// `state` is taken as `&WorkerState` (not mutable) — the only field
+/// read is `state.working_cfg.idle`, which the idle state machine uses
+/// as its timing source.  Mutability on the per-iteration counters is
+/// reserved for [`process_one_frame`].
+fn tick_idle(
+    idle: Option<&mut IdleRuntime>,
+    state: &WorkerState,
+    slot: &LatestFrameSlot,
+    output: &OutputPipeline,
+    metrics: &RuntimeMetrics,
+) -> Result<IdleTickAction, FluxError> {
+    let Some(idle_rt) = idle else {
+        return Ok(IdleTickAction::ProcessFrame);
+    };
+    let status =
+        crate::idle::ConsumerStatus::from_u8(idle_rt.consumer_status.load(Ordering::Acquire));
+    let tick = idle_rt
+        .state_machine
+        .tick(status, Instant::now(), &state.working_cfg.idle);
+    handle_idle_edge(idle_rt, tick.edge, slot, output, metrics);
+    let active_allowed = matches!(tick.level, crate::idle::IdleLevel::Active)
+        && idle_rt.engine_ready.load(Ordering::Acquire);
+    if !active_allowed {
+        if let Err(e) = push_placeholder(
+            idle_rt.placeholder.as_ref(),
+            idle_rt.output_w,
+            idle_rt.output_h,
+            idle_rt.output_format,
+            output,
+            metrics,
+        ) {
+            error!(error = %e, "placeholder push failed; stopping");
+            return Err(e);
+        }
+        idle_rt.was_active = false;
+        // Park up to `next_tick_in` on the slot (which doubles as a
+        // shutdown signal) so we don't busy-loop. The worker still
+        // gets woken if a real frame ever lands (resume happened and
+        // the input came back).
+        let _ = slot.recv_timeout(tick.next_tick_in);
+        return Ok(IdleTickAction::Continue);
+    }
+    // Fix #7: log the one-shot resume edge — placeholder mode → active
+    // processing. The state machine's own `EnterIdle`/`ResumeActive`
+    // edges fire on the consumer-status transition; this complementary
+    // line surfaces when the worker actually goes back to running the
+    // full chain (which may lag the `ResumeActive` edge by the reload
+    // thread's `input.start()` window).
+    if !idle_rt.was_active {
+        info!(target: "fluxframe::idle", "resumed active processing");
+        idle_rt.was_active = true;
+    }
+    Ok(IdleTickAction::ProcessFrame)
+}
+
+/// Stable-during-run dependencies handed to [`run_process_loop`].
+///
+/// The supervisor's worker loop reaches for ~10 values — most of
+/// them never change across iterations (the merged `FluxConfig`, the
+/// config-file path used by `reload`, the preset name we started on,
+/// the processing context, the metrics bundle). Bundling them in one
+/// struct keeps the loop's signature small enough to drop the
+/// `#[allow(clippy::too_many_arguments)]` and makes the genuinely
+/// per-iteration handles (`running`, `slot`, `chain`, `output`,
+/// `control_rx`, `idle`) stand out at the call site.
+///
+/// All fields are borrowed references, so the struct is `Copy` and
+/// can be passed by value to the loop without imposing a borrow
+/// lifetime past the call.
+#[derive(Clone, Copy)]
+struct WorkerDeps<'a> {
+    cfg: &'a FluxConfig,
+    config_path: Option<&'a std::path::Path>,
+    initial_preset_name: &'a str,
+    processing_ctx: &'a ProcessingContext,
+    metrics: &'a RuntimeMetrics,
+}
+
+fn run_process_loop(
+    deps: WorkerDeps<'_>,
     running: &AtomicBool,
     slot: &LatestFrameSlot,
     chain: &mut EffectChain,
     output: &OutputPipeline,
-    metrics: &RuntimeMetrics,
     control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
+    mut idle: Option<IdleRuntime>,
 ) -> Result<(), FluxError> {
-    let mut state = WorkerState::new(cfg, initial_preset_name, metrics);
+    let mut state = WorkerState::new(deps.cfg, deps.initial_preset_name, deps.metrics);
     while running.load(Ordering::Acquire) {
-        drain_control_commands(&mut state, control_rx, config_path, processing_ctx, chain);
+        drain_control_commands(
+            &mut state,
+            control_rx,
+            deps.config_path,
+            deps.processing_ctx,
+            chain,
+        );
+
+        // Stage 15 idle integration: tick the state machine, dispatch
+        // any side-effect edge, choose between Active level (pull a
+        // real frame + run chain) and Placeholder level (push the
+        // cached fill).
+        match tick_idle(idle.as_mut(), &state, slot, output, deps.metrics)? {
+            IdleTickAction::Continue => continue,
+            IdleTickAction::ProcessFrame => {}
+        }
+
         let Some(frame) = slot.recv_timeout(WORKER_POLL_TIMEOUT) else {
             // Either timeout (no frame within the poll window) or slot
             // closed by shutdown.  Re-check the flag and continue.
             continue;
         };
-        process_one_frame(&mut state, frame, chain, output, metrics, slot)?;
+        process_one_frame(&mut state, frame, chain, output, deps.metrics, slot)?;
+    }
+    // Reap any in-flight reload thread so it doesn't outlive the
+    // supervisor. Surface the wall-clock cost so a reload that was
+    // racing shutdown shows up in the teardown log line instead of
+    // disappearing into a dropped `JoinHandle`.
+    if let Some(idle_rt) = idle.as_mut() {
+        if let Some(handle) = idle_rt.reload_handle.take() {
+            match handle.join() {
+                Ok(outcome) => {
+                    tracing::debug!(
+                        target: "fluxframe::idle",
+                        elapsed_ms = outcome.elapsed.as_millis() as u64,
+                        "reload thread reaped at shutdown",
+                    );
+                }
+                Err(_) => {
+                    warn!(target: "fluxframe::idle", "reload thread panicked during shutdown");
+                }
+            }
+        }
     }
     Ok(())
 }

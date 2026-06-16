@@ -105,6 +105,16 @@ impl LatestFrameSlot {
         self.inner.state.lock().dropped
     }
 
+    /// Discard any pending frame without affecting the drop counter or
+    /// the closed flag. Used by Stage 15 idle entry to drop the last
+    /// frame the capture thread published before the input pipeline
+    /// transitioned to `Null` — without this, resuming the worker
+    /// would process one stale frame from before the idle window.
+    pub fn clear(&self) {
+        let mut state = self.inner.state.lock();
+        state.frame = None;
+    }
+
     /// Mark the slot closed and wake any waiting consumer.  Subsequent
     /// pushes are no-ops; subsequent receives return `None` once the
     /// buffered frame (if any) has been drained.

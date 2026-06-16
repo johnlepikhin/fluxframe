@@ -57,6 +57,15 @@ pub struct Counters {
     // counter shape rather than encoding the source as a string.
     inference_runtime_fallback_gpu_to_cpu: AtomicU64,
     blur_runtime_fallback_gpu_to_cpu: AtomicU64,
+    // Stage 15 idle-mode counters. `idle_entered_total` increments
+    // on every Active → Idle edge; `deep_idle_entered_total` on every
+    // Idle → DeepIdle edge; `idle_frames_pushed_total` is the count
+    // of placeholder frames emitted to the output during idle/deep
+    // idle steady state. The supervisor's teardown summary surfaces
+    // all three.
+    idle_entered_total: AtomicU64,
+    deep_idle_entered_total: AtomicU64,
+    idle_frames_pushed_total: AtomicU64,
 }
 
 impl Counters {
@@ -71,6 +80,9 @@ impl Counters {
             effect_error_count: AtomicU64::new(0),
             inference_runtime_fallback_gpu_to_cpu: AtomicU64::new(0),
             blur_runtime_fallback_gpu_to_cpu: AtomicU64::new(0),
+            idle_entered_total: AtomicU64::new(0),
+            deep_idle_entered_total: AtomicU64::new(0),
+            idle_frames_pushed_total: AtomicU64::new(0),
         }
     }
 
@@ -130,6 +142,28 @@ impl Counters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment `idle_entered_total` — fires on the supervisor's
+    /// Active → Idle transition.
+    #[inline]
+    pub fn inc_idle_entered(&self) {
+        self.idle_entered_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `deep_idle_entered_total` — fires on the
+    /// supervisor's Idle → DeepIdle transition.
+    #[inline]
+    pub fn inc_deep_idle_entered(&self) {
+        self.deep_idle_entered_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `idle_frames_pushed_total` — fires every placeholder
+    /// frame the worker emits while in Idle or DeepIdle.
+    #[inline]
+    pub fn inc_idle_frames_pushed(&self) {
+        self.idle_frames_pushed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot the counter values.  Each load is independent — there
     /// is no cross-counter atomicity guarantee.
     #[must_use]
@@ -146,6 +180,9 @@ impl Counters {
             blur_runtime_fallback_gpu_to_cpu: self
                 .blur_runtime_fallback_gpu_to_cpu
                 .load(Ordering::Relaxed),
+            idle_entered_total: self.idle_entered_total.load(Ordering::Relaxed),
+            deep_idle_entered_total: self.deep_idle_entered_total.load(Ordering::Relaxed),
+            idle_frames_pushed_total: self.idle_frames_pushed_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -174,6 +211,12 @@ pub struct CounterValues {
     pub inference_runtime_fallback_gpu_to_cpu: u64,
     /// See [`Counters::inc_blur_runtime_fallback_gpu_to_cpu`].
     pub blur_runtime_fallback_gpu_to_cpu: u64,
+    /// See [`Counters::inc_idle_entered`].
+    pub idle_entered_total: u64,
+    /// See [`Counters::inc_deep_idle_entered`].
+    pub deep_idle_entered_total: u64,
+    /// See [`Counters::inc_idle_frames_pushed`].
+    pub idle_frames_pushed_total: u64,
 }
 
 /// Bounded ring of latency samples in microseconds.
