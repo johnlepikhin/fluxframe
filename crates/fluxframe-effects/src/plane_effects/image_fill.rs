@@ -23,18 +23,7 @@ use image::imageops::FilterType;
 use serde::Deserialize;
 
 use crate::processing::fit::{fit_contain_rgb, fit_cover_rgb};
-
-/// Hard upper bound on the source image dimensions accepted by
-/// `ImageReader::limits`.  Picked to cover typical UHD/4K background
-/// stills (8192 wide) without letting a malicious or accidental
-/// gigapixel input run the decoder out of memory.
-const MAX_IMAGE_DIM: u32 = 8192;
-
-/// Hard upper bound on the in-flight allocation the decoder is allowed
-/// to make while decoding.  256 MiB is enough for an 8192×8192 RGBA
-/// frame (~256 MB) but stops the typical "decompression bomb" PNG
-/// from claiming gigabytes of memory.
-const MAX_IMAGE_ALLOC_BYTES: u64 = 256 * 1024 * 1024;
+use crate::processing::image_loader::{ImageLoadError, decode_rgb_bounded};
 
 /// How to fit the loaded image into the negotiated frame dimensions.
 ///
@@ -168,21 +157,6 @@ impl Default for ImageFillEffect {
     }
 }
 
-/// Walk an error chain via `Error::source()` and join every link with
-/// ": " separators.  `image::ImageError`'s `Display` impl reports only
-/// the top-level message; the IO/format error that caused the failure
-/// lives one level deeper and is invisible to a plain `format!("{e}")`.
-fn full_error_chain(err: &dyn std::error::Error) -> String {
-    let mut s = err.to_string();
-    let mut src = err.source();
-    while let Some(inner) = src {
-        s.push_str(": ");
-        s.push_str(&inner.to_string());
-        src = inner.source();
-    }
-    s
-}
-
 fn prepare_err(reason: impl Into<String>) -> EffectError {
     EffectError::PrepareFailed {
         name: ImageFillEffect::NAME.to_string(),
@@ -208,51 +182,26 @@ fn load_and_resize(
     if width == 0 || height == 0 {
         return Ok(Vec::new());
     }
-
-    let mut reader = image::ImageReader::open(path)
-        .map_err(|e| prepare_err(format!("failed to open image {}: {}", path.display(), e)))?
-        .with_guessed_format()
-        .map_err(|e| {
-            prepare_err(format!(
-                "failed to guess format for {}: {}",
-                path.display(),
-                e
-            ))
-        })?;
-
-    // `image::Limits` is `#[non_exhaustive]`, so we cannot use a
-    // struct-literal expression to construct it from outside the
-    // `image` crate.  Mutate the default-constructed instance instead.
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_IMAGE_DIM);
-    limits.max_image_height = Some(MAX_IMAGE_DIM);
-    limits.max_alloc = Some(MAX_IMAGE_ALLOC_BYTES);
-    reader.limits(limits);
-
-    let img = reader.decode().map_err(|e| {
-        prepare_err(format!(
-            "failed to decode image {}: {}",
-            path.display(),
-            full_error_chain(&e)
-        ))
-    })?;
-    let rgb = img.into_rgb8();
-    let (src_w, src_h) = rgb.dimensions();
-    if src_w == 0 || src_h == 0 {
-        return Err(prepare_err(format!(
-            "image {} has zero-sized dimension",
-            path.display()
-        )));
-    }
-
+    let decoded =
+        decode_rgb_bounded(path).map_err(|e: ImageLoadError| prepare_err(e.to_string()))?;
+    let src_w = decoded.width;
+    let src_h = decoded.height;
     match fit {
         FitMode::Stretch => {
-            let resized = image::imageops::resize(&rgb, width, height, FilterType::Triangle);
+            // `decode_rgb_bounded`'s contract guarantees
+            // `data.len() == width * height * 3` and non-zero dims,
+            // so `RgbImage::from_raw` cannot return `None` here.
+            // The `expect` only catches a future regression in the
+            // decoder contract — not user input.
+            let src = image::RgbImage::from_raw(src_w, src_h, decoded.data).expect(
+                "decode_rgb_bounded guarantees data.len() == width * height * 3 and non-zero dims",
+            );
+            let resized = image::imageops::resize(&src, width, height, FilterType::Triangle);
             Ok(resized.into_raw())
         }
-        FitMode::Cover => Ok(fit_cover_rgb(rgb.as_raw(), src_w, src_h, width, height)),
+        FitMode::Cover => Ok(fit_cover_rgb(&decoded.data, src_w, src_h, width, height)),
         FitMode::Contain => Ok(fit_contain_rgb(
-            rgb.as_raw(),
+            &decoded.data,
             src_w,
             src_h,
             width,
@@ -440,7 +389,7 @@ fit = "weird"
             .expect_err("missing file must surface PrepareFailed");
         match err {
             EffectError::PrepareFailed { reason, .. } => {
-                assert!(reason.contains("failed to open image"), "reason: {reason}");
+                assert!(reason.contains("failed to open"), "reason: {reason}");
             }
             other => panic!("unexpected error: {other:?}"),
         }

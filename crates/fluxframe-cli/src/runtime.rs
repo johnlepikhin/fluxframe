@@ -1529,9 +1529,173 @@ fn spawn_metrics_reporter(
     }
 }
 
+/// Mutable per-iteration state of the worker thread.
+///
+/// Carved out of [`run_process_loop`] so the orchestration skeleton
+/// stays a thin wrapper while per-frame and control-drain logic each
+/// live in their own helpers. Stage 15 idle wiring is grafted onto
+/// the same struct without bloating the loop body.
+///
+/// Both `working_cfg` and `active_preset` are owned working copies,
+/// not references into the caller's config: `reload` rebinds
+/// `working_cfg` to a freshly-read `FluxConfig`, and Stage 13
+/// `Set`/`SetChain` commands mutate `active_preset` alongside the live
+/// chain so `current_config`/introspection stay consistent and chain
+/// composition changes have a stable rebuild source.
+struct WorkerState {
+    frame_context: FrameContext,
+    /// Track fallback edges so a single-frame visual artefact
+    /// ("flicker") caused by an inference miss surfaces as a warn line
+    /// tied to the exact frame_seq, instead of being lost in the
+    /// per-frame debug noise.
+    prev_fallback: bool,
+    frames_seen: u64,
+    active_preset_name: String,
+    /// Owned config used for per-command lookups.
+    working_cfg: FluxConfig,
+    /// Working copy of the currently active preset.
+    active_preset: Preset,
+}
+
+impl WorkerState {
+    fn new(cfg: &FluxConfig, initial_preset_name: &str, metrics: &RuntimeMetrics) -> Self {
+        let working_cfg: FluxConfig = cfg.clone();
+        let active_preset = working_cfg
+            .presets
+            .get(initial_preset_name)
+            .cloned()
+            .unwrap_or_default();
+        Self {
+            frame_context: FrameContext {
+                telemetry: metrics.effect_telemetry(),
+                ..FrameContext::default()
+            },
+            prev_fallback: false,
+            frames_seen: 0,
+            active_preset_name: initial_preset_name.to_string(),
+            working_cfg,
+            active_preset,
+        }
+    }
+}
+
+/// Drain any pending control commands before processing the next
+/// frame. Each command is fully applied (or rejected) before the
+/// worker reads from the slot, so the swap is atomic with respect to
+/// frame boundaries.
+fn drain_control_commands(
+    state: &mut WorkerState,
+    control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
+    config_path: Option<&std::path::Path>,
+    processing_ctx: &ProcessingContext,
+    chain: &mut EffectChain,
+) {
+    let Some(rx) = control_rx else {
+        return;
+    };
+    while let Ok(envelope) = rx.try_recv() {
+        // Capture variant label BEFORE the move into
+        // `apply_control_command`. Slow control commands silently eat
+        // frame budget (~33 ms at 30 fps), so surface elapsed_us per
+        // command for diagnosis.
+        let cmd_kind = command_label(&envelope.cmd);
+        let start = Instant::now();
+        let response = apply_control_command(
+            &mut state.working_cfg,
+            config_path,
+            processing_ctx,
+            chain,
+            &mut state.active_preset_name,
+            &mut state.active_preset,
+            envelope.cmd,
+        );
+        tracing::debug!(
+            command = cmd_kind,
+            elapsed_us = start.elapsed().as_micros() as u64,
+            "control command applied",
+        );
+        // Best-effort: if the listener already dropped the reply
+        // receiver, the client has disconnected and we simply move on.
+        let _ = envelope.reply_tx.send(response);
+    }
+}
+
+/// Run the effect chain on a single frame and forward it to the
+/// output sink. Returns `Err` only on unrecoverable failure — the
+/// caller stops the worker loop.
+fn process_one_frame(
+    state: &mut WorkerState,
+    mut frame: fluxframe_core::frame::VideoFrame,
+    chain: &mut EffectChain,
+    output: &OutputPipeline,
+    metrics: &RuntimeMetrics,
+    slot: &LatestFrameSlot,
+) -> Result<(), FluxError> {
+    let recv_at = Instant::now();
+    metrics.counters.inc_frames_in();
+    state.frames_seen += 1;
+
+    state.frame_context.frame_sequence = frame.meta.sequence;
+    state.frame_context.frame_timestamp = frame.meta.timestamp;
+    state.frame_context.fallback_active = false;
+
+    let pre_process = Instant::now();
+    if let Err(e) = chain.process(&mut frame, &mut state.frame_context) {
+        metrics.counters.inc_effect_error();
+        error!(error = %e, "effect chain failed; stopping");
+        return Err(FluxError::from(e));
+    }
+    metrics.processing.record_duration(pre_process.elapsed());
+
+    if state.frame_context.fallback_active != state.prev_fallback {
+        warn!(
+            frame_seq = state.frame_context.frame_sequence,
+            fallback_active = state.frame_context.fallback_active,
+            "effect-chain fallback state changed (passthrough frame)"
+        );
+        if state.frame_context.fallback_active {
+            // Count edges into fallback only — a steady passthrough
+            // run would otherwise inflate the counter every frame.
+            metrics.counters.inc_fallback();
+        }
+        state.prev_fallback = state.frame_context.fallback_active;
+    }
+
+    let pre_push = Instant::now();
+    if let Err(e) = output.push_frame(frame) {
+        error!(error = %e, "output.push_frame failed; stopping");
+        return Err(e.into());
+    }
+    metrics.output.record_duration(pre_push.elapsed());
+    metrics.end_to_end.record_duration(recv_at.elapsed());
+    metrics.counters.inc_frames_out();
+
+    if state.frames_seen % DROPPED_SYNC_INTERVAL == 0 {
+        metrics.sync_dropped(slot.dropped_count());
+    }
+    Ok(())
+}
+
+/// Push a pre-rendered placeholder frame straight to the output,
+/// bypassing the effect chain. Stage 15 hook — wired up in Step 4.
+///
+/// The current Step 0 stub returns an error if called; it exists so
+/// downstream steps can reference it without re-plumbing the worker
+/// signature. The compile error trail when the stub is exercised
+/// points the implementer at the right slot to fill in.
+#[expect(
+    dead_code,
+    reason = "Stage 15 Step 4 wires the call site; stub replaced then"
+)]
+fn push_placeholder(_output: &OutputPipeline, _metrics: &RuntimeMetrics) -> Result<(), FluxError> {
+    unreachable!(
+        "push_placeholder is a Stage 15 Step 0 stub: replace this stub before wiring the call site in Step 4"
+    )
+}
+
 #[allow(
     clippy::too_many_arguments,
-    reason = "supervisor wiring; refactor deferred"
+    reason = "supervisor wiring; orchestrator threads all worker deps explicitly"
 )]
 fn run_process_loop(
     cfg: &FluxConfig,
@@ -1545,114 +1709,15 @@ fn run_process_loop(
     metrics: &RuntimeMetrics,
     control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
 ) -> Result<(), FluxError> {
-    let mut frame_context = FrameContext {
-        // Hand the supervisor's inference histogram to every effect
-        // via the per-frame telemetry sink.  Cheap `Arc` clone, set
-        // once before the loop.
-        telemetry: metrics.effect_telemetry(),
-        ..FrameContext::default()
-    };
-    // Track fallback edges so a single-frame visual artefact ("flicker")
-    // caused by an inference miss surfaces as a warn line tied to the
-    // exact frame_seq, instead of being lost in the per-frame debug noise.
-    let mut prev_fallback = false;
-    let mut frames_seen: u64 = 0;
-    let mut active_preset_name = initial_preset_name.to_string();
-    // Owned config copy. `reload` replaces it with a freshly-read
-    // version; per-command lookups go through `&working_cfg`. This
-    // lets the worker stay self-contained across config reloads
-    // without rethreading lifetimes.
-    let mut working_cfg: FluxConfig = cfg.clone();
-    // Working copy of the active preset. Stage 13 `Set`/`SetChain`
-    // commands mutate this in addition to applying changes to the
-    // live chain; the copy keeps `current_config`/introspection
-    // consistent and serves as the rebuild source for chain
-    // composition changes.
-    let mut active_preset: Preset = working_cfg
-        .presets
-        .get(initial_preset_name)
-        .cloned()
-        .unwrap_or_default();
+    let mut state = WorkerState::new(cfg, initial_preset_name, metrics);
     while running.load(Ordering::Acquire) {
-        // Drain any pending control commands before processing the
-        // next frame. Each command is fully applied (or rejected)
-        // before the worker reads from the slot, so the swap is
-        // atomic with respect to frame boundaries.
-        if let Some(rx) = control_rx {
-            while let Ok(envelope) = rx.try_recv() {
-                // Capture variant label BEFORE the move into
-                // `apply_control_command`. Slow control commands
-                // silently eat frame budget (~33 ms at 30 fps), so
-                // surface elapsed_us per command for diagnosis.
-                let cmd_kind = command_label(&envelope.cmd);
-                let start = Instant::now();
-                let response = apply_control_command(
-                    &mut working_cfg,
-                    config_path,
-                    processing_ctx,
-                    chain,
-                    &mut active_preset_name,
-                    &mut active_preset,
-                    envelope.cmd,
-                );
-                tracing::debug!(
-                    command = cmd_kind,
-                    elapsed_us = start.elapsed().as_micros() as u64,
-                    "control command applied",
-                );
-                // Best-effort: if the listener already dropped the
-                // reply receiver, the client has disconnected and we
-                // simply move on.
-                let _ = envelope.reply_tx.send(response);
-            }
-        }
-        let Some(mut frame) = slot.recv_timeout(WORKER_POLL_TIMEOUT) else {
+        drain_control_commands(&mut state, control_rx, config_path, processing_ctx, chain);
+        let Some(frame) = slot.recv_timeout(WORKER_POLL_TIMEOUT) else {
             // Either timeout (no frame within the poll window) or slot
             // closed by shutdown.  Re-check the flag and continue.
             continue;
         };
-        let recv_at = Instant::now();
-        metrics.counters.inc_frames_in();
-        frames_seen += 1;
-
-        frame_context.frame_sequence = frame.meta.sequence;
-        frame_context.frame_timestamp = frame.meta.timestamp;
-        frame_context.fallback_active = false;
-
-        let pre_process = Instant::now();
-        if let Err(e) = chain.process(&mut frame, &mut frame_context) {
-            metrics.counters.inc_effect_error();
-            error!(error = %e, "effect chain failed; stopping");
-            return Err(FluxError::from(e));
-        }
-        metrics.processing.record_duration(pre_process.elapsed());
-
-        if frame_context.fallback_active != prev_fallback {
-            warn!(
-                frame_seq = frame_context.frame_sequence,
-                fallback_active = frame_context.fallback_active,
-                "effect-chain fallback state changed (passthrough frame)"
-            );
-            if frame_context.fallback_active {
-                // Count edges into fallback only — a steady passthrough
-                // run would otherwise inflate the counter every frame.
-                metrics.counters.inc_fallback();
-            }
-            prev_fallback = frame_context.fallback_active;
-        }
-
-        let pre_push = Instant::now();
-        if let Err(e) = output.push_frame(frame) {
-            error!(error = %e, "output.push_frame failed; stopping");
-            return Err(e.into());
-        }
-        metrics.output.record_duration(pre_push.elapsed());
-        metrics.end_to_end.record_duration(recv_at.elapsed());
-        metrics.counters.inc_frames_out();
-
-        if frames_seen % DROPPED_SYNC_INTERVAL == 0 {
-            metrics.sync_dropped(slot.dropped_count());
-        }
+        process_one_frame(&mut state, frame, chain, output, metrics, slot)?;
     }
     Ok(())
 }

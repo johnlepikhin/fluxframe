@@ -8,6 +8,8 @@ pub mod blur;
 pub mod compose;
 #[cfg(feature = "image-fill")]
 pub mod fit;
+#[cfg(feature = "image-fill")]
+pub mod image_loader;
 pub mod mask;
 pub mod resize;
 

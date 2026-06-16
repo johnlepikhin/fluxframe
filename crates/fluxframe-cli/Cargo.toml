@@ -49,6 +49,11 @@ ctrlc = { workspace = true }
 # for the kernel's USB-isoc soft-IRQs — without that, the UVC driver
 # silently drops packets under load and emits torn camera frames.
 rayon = { workspace = true }
+# Stage 15 idle mode: ImagePlaceholder loads a PNG/JPEG once at
+# startup and resizes it to the output dimensions. Same crate /
+# version as `fluxframe-effects::image_fill`; pulled directly so the
+# placeholder path stays cleanly in the CLI layer.
+image = { workspace = true }
 
 [dev-dependencies]
 # Used by the `control_socket_e2e` integration test to bind a unique

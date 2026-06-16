@@ -522,6 +522,7 @@ dependencies = [
  "fluxframe-core",
  "fluxframe-effects",
  "fluxframe-gst",
+ "image",
  "rayon",
  "serde",
  "serde_json",

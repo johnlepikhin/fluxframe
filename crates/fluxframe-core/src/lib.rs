@@ -20,8 +20,9 @@ pub mod protocol;
 pub mod traits;
 
 pub use config::{
-    AutoInputConfig, BackendKind, ControlConfig, FluxConfig, InputConfig, InputDevice,
-    LoggingConfig, OutputConfig, OutputScale, PipelineSection, Preset, RealtimeConfig,
+    AutoInputConfig, BackendKind, ControlConfig, FluxConfig, IdleConfig, IdlePlaceholderKind,
+    InputConfig, InputDevice, LoggingConfig, OutputConfig, OutputScale, PipelineSection, Preset,
+    RealtimeConfig,
 };
 pub use context::{FrameContext, ProcessingContext, RuntimeState};
 pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineError};
@@ -124,6 +125,126 @@ device = "/dev/video1"
         cfg.realtime.metrics_interval_secs = 0;
         cfg.validate()
             .expect("0 must be accepted as the disabled sentinel");
+    }
+
+    #[test]
+    fn idle_default_is_off_and_validates() {
+        let cfg = FluxConfig::default();
+        assert!(!cfg.idle.enabled, "Stage 15 default is opt-in");
+        assert!(cfg.idle.is_off());
+        cfg.validate()
+            .expect("default IdleConfig must validate cleanly");
+    }
+
+    #[test]
+    fn idle_validation_rejects_zero_fps() {
+        let mut cfg = FluxConfig::default();
+        cfg.idle.fps = 0;
+        let err = cfg.validate().expect_err("fps=0 must be rejected");
+        assert!(format!("{err}").contains("idle.fps"));
+    }
+
+    #[test]
+    fn idle_validation_rejects_excessive_fps() {
+        let mut cfg = FluxConfig::default();
+        cfg.idle.fps = 200;
+        let err = cfg.validate().expect_err("fps>60 must be rejected");
+        assert!(format!("{err}").contains("60"));
+    }
+
+    #[test]
+    fn idle_validation_rejects_deep_le_teardown() {
+        let mut cfg = FluxConfig::default();
+        cfg.idle.teardown_secs = 10;
+        cfg.idle.deep_idle_secs = 10;
+        let err = cfg
+            .validate()
+            .expect_err("deep_idle_secs == teardown_secs must be rejected (strict >)");
+        assert!(format!("{err}").contains("deep_idle_secs"));
+    }
+
+    #[test]
+    fn idle_validation_rejects_zero_deep_idle_secs() {
+        let mut cfg = FluxConfig::default();
+        cfg.idle.deep_idle_secs = 0;
+        let err = cfg
+            .validate()
+            .expect_err("deep_idle_secs=0 must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("deep_idle_secs"),
+            "error must mention the field, got: {msg}"
+        );
+        assert!(
+            msg.contains("> 0") || msg.contains("must be > 0"),
+            "error must point at the > 0 requirement, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn idle_validation_rejects_poll_interval_below_min() {
+        let mut cfg = FluxConfig::default();
+        cfg.idle.poll_interval_ms = 50;
+        let err = cfg
+            .validate()
+            .expect_err("poll_interval_ms<100 must be rejected");
+        assert!(format!("{err}").contains("poll_interval_ms"));
+    }
+
+    #[test]
+    fn idle_validation_requires_path_when_image_kind() {
+        let mut cfg = FluxConfig::default();
+        cfg.idle.placeholder = config::IdlePlaceholderKind::Image;
+        let err = cfg
+            .validate()
+            .expect_err("image kind without path must be rejected");
+        assert!(format!("{err}").contains("placeholder_path"));
+    }
+
+    #[test]
+    fn idle_serializes_only_when_enabled() {
+        // Disabled (default) → no `idle` key in the serialised TOML.
+        let cfg = FluxConfig::default();
+        let dumped = toml::to_string(&cfg).expect("serialise default");
+        assert!(
+            !dumped.contains("[idle]"),
+            "default config must not emit an [idle] table; got:\n{dumped}"
+        );
+
+        // Enabled → `idle` table is emitted.
+        let mut cfg = FluxConfig::default();
+        cfg.idle.enabled = true;
+        let dumped = toml::to_string(&cfg).expect("serialise enabled");
+        assert!(
+            dumped.contains("[idle]"),
+            "enabled config must emit an [idle] table; got:\n{dumped}"
+        );
+        assert!(
+            dumped.contains("enabled = true"),
+            "enabled flag must be emitted"
+        );
+    }
+
+    #[test]
+    fn idle_round_trips_through_toml() {
+        let toml_text = r#"
+[idle]
+enabled = true
+placeholder = "color"
+placeholder_rgb = [200, 30, 30]
+fps = 5
+teardown_secs = 3
+deep_idle_secs = 20
+poll_interval_ms = 500
+"#;
+        let cfg = FluxConfig::from_toml_str(toml_text).expect("parses");
+        cfg.validate().expect("validates");
+        assert!(cfg.idle.enabled);
+        assert_eq!(cfg.idle.placeholder_rgb, [200, 30, 30]);
+        assert_eq!(cfg.idle.fps, 5);
+        assert_eq!(cfg.idle.teardown_secs, 3);
+        assert_eq!(cfg.idle.deep_idle_secs, 20);
+        assert_eq!(cfg.idle.poll_interval_ms, 500);
     }
 
     #[test]

@@ -224,6 +224,59 @@ impl SegmentationBase {
         &mut self.mask_raw
     }
 
+    // ----- Stage 15 engine-lifecycle hooks -------------------------
+    //
+    // The Stage 15 supervisor wraps `CompositeEffect` in a
+    // `ManagedComposite` that drops the engine after a deep-idle
+    // window and rebuilds it on consumer resume. These accessors are
+    // the minimal API surface that lets the wrapper drive the engine
+    // slot without forcing every `VideoEffect` to gain lifecycle
+    // methods. The wrapper itself lives in the CLI crate
+    // (`cli::idle::managed_composite`).
+
+    /// Move the loaded engine out of `self`. Subsequent
+    /// [`Self::process`] calls return [`SegmentationOutcome::Fatal`]
+    /// until [`Self::install_engine`] runs. Idempotent: returns
+    /// `None` if no engine is currently held.
+    #[must_use]
+    pub fn take_engine(&mut self) -> Option<Box<dyn InferenceEngine + Send>> {
+        self.engine.take()
+    }
+
+    /// Install a freshly built engine. Any previously held engine is
+    /// dropped on assignment — the caller does not need to call
+    /// [`Self::take_engine`] first. Use the explicit pair
+    /// (`take_engine` + `install_engine`) when the caller needs to
+    /// observe the old engine (e.g. for telemetry or staged teardown).
+    pub fn install_engine(&mut self, engine: Box<dyn InferenceEngine + Send>) {
+        self.engine = Some(engine);
+    }
+
+    /// `true` when an engine is currently loaded; `false` after
+    /// [`Self::take_engine`] until the next [`Self::install_engine`].
+    #[must_use]
+    pub fn engine_loaded(&self) -> bool {
+        self.engine.is_some()
+    }
+
+    /// Path to the ONNX model file. Comes from the original
+    /// [`SegmentationConfig`] and is stable for the lifetime of this
+    /// base, including across engine unload/reload.
+    #[must_use]
+    pub fn model_path(&self) -> &Path {
+        &self.config.model
+    }
+
+    /// Model-config sidecar that was loaded by the most recent
+    /// [`Self::prepare`]. `None` before the first `prepare` call.
+    /// The lifecycle wrapper needs this to call
+    /// [`build_inference_engine`] when rebuilding the engine after a
+    /// deep-idle drop.
+    #[must_use]
+    pub fn model_config(&self) -> Option<&ModelConfig> {
+        self.model_config.as_ref()
+    }
+
     /// Load model + sidecar, build the inference engine and allocate
     /// scratch.
     ///

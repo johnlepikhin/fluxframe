@@ -603,6 +603,164 @@ pub struct ControlConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Section: idle (consumer-aware lifecycle)
+// ---------------------------------------------------------------------------
+
+/// Placeholder kind for the idle frame. `"color"` paints a solid RGB
+/// fill, `"image"` loads a static image file from `placeholder_path`.
+///
+/// Lowercase serde tag keeps the TOML form ergonomic and matches the
+/// surrounding conventions (`pixel_format`, `backend`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum IdlePlaceholderKind {
+    /// Solid RGB fill (`placeholder_rgb`).
+    #[default]
+    Color,
+    /// Static image loaded from `placeholder_path`.
+    Image,
+}
+
+/// Idle-mode configuration (`[idle]` table).
+///
+/// Stage 15 introduces consumer-aware lifecycle management for the
+/// v4l2loopback sink: when no reader is attached to the output device,
+/// the supervisor tears down the input pipeline and publishes a cheap
+/// placeholder at `fps` instead of running the full effect chain. After
+/// `deep_idle_secs` of continued idleness the ONNX session is also
+/// dropped from memory, reclaiming ~150 MB.
+///
+/// Stage 15 ships with `enabled = false` so existing deployments are
+/// unaffected by the upgrade — operators opt in explicitly. A future
+/// stage may flip the default once the feature has time in the field.
+///
+/// `deny_unknown_fields` keeps typos loud.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdleConfig {
+    /// Master switch. `false` (default in Stage 15) keeps Stage 14
+    /// behaviour exactly: no detector thread, no state machine. The
+    /// detector additionally refuses to spawn when the output sink is
+    /// not a `/dev/videoN` (V4L2) device.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Placeholder kind — `Color` paints a solid fill, `Image` loads
+    /// a static file. Defaults to `Color` because a config without
+    /// `placeholder_path` should still produce a working placeholder.
+    #[serde(default)]
+    pub placeholder: IdlePlaceholderKind,
+
+    /// RGB triplet for [`IdlePlaceholderKind::Color`]. Each component is
+    /// `0..=255`. Defaults to a neutral dark grey that is unambiguously
+    /// "not live video" without being attention-grabbing.
+    #[serde(default = "default_placeholder_rgb")]
+    pub placeholder_rgb: [u8; 3],
+
+    /// Path to a static image file for [`IdlePlaceholderKind::Image`].
+    /// Ignored when `placeholder = "color"`. Currently passed verbatim
+    /// to [`image::ImageReader::open`] — operators should use an
+    /// absolute path. Stage 15 Step 4 (supervisor wiring) will resolve
+    /// relative paths against the config-file directory.
+    #[serde(default)]
+    pub placeholder_path: Option<PathBuf>,
+
+    /// Frame rate (frames per second) during idle. 1 Hz is enough to
+    /// keep v4l2loopback's ring buffer fresh; higher values cost CPU
+    /// without observable consumer benefit.
+    #[serde(default = "default_idle_fps")]
+    pub fps: u32,
+
+    /// Seconds of "no consumer" observed before the supervisor flips
+    /// from Active to Idle. The 5 s default absorbs the usual reopen
+    /// storm from Zoom/OBS startup without flapping the camera LED.
+    #[serde(default = "default_idle_teardown_secs")]
+    pub teardown_secs: u32,
+
+    /// Seconds of continued idleness before the supervisor flips from
+    /// Idle to DeepIdle (ONNX session dropped). Strictly greater than
+    /// `teardown_secs`. The 30 s default avoids paying the ONNX reload
+    /// cost during short "step away from desk" intervals.
+    #[serde(default = "default_idle_deep_secs")]
+    pub deep_idle_secs: u32,
+
+    /// Sysfs `state` poll cadence in milliseconds. Lower = faster
+    /// wake on consumer reconnect; higher = cheaper steady-state. The
+    /// 250 ms default hits a ≤ 500 ms wake budget from Idle.
+    #[serde(default = "default_idle_poll_interval_ms")]
+    pub poll_interval_ms: u32,
+}
+
+impl Default for IdleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            placeholder: IdlePlaceholderKind::default(),
+            placeholder_rgb: default_placeholder_rgb(),
+            placeholder_path: None,
+            fps: default_idle_fps(),
+            teardown_secs: default_idle_teardown_secs(),
+            deep_idle_secs: default_idle_deep_secs(),
+            poll_interval_ms: default_idle_poll_interval_ms(),
+        }
+    }
+}
+
+impl IdleConfig {
+    /// `true` when the configuration is equivalent to "idle disabled".
+    ///
+    /// Used by the serde adapter on [`FluxConfig`] to skip emitting an
+    /// `[idle]` table when the user has not opted in. This keeps
+    /// `current_config` JSON byte-identical to the Stage 14 shape for
+    /// configs that never touch idle mode.
+    #[must_use]
+    pub fn is_off(&self) -> bool {
+        !self.enabled
+    }
+}
+
+/// Upper bound on `idle.teardown_secs` — 1 h is well past any
+/// realistic operator setting; the cap exists to catch typos.
+pub const MAX_IDLE_TEARDOWN_SECS: u32 = 3600;
+
+/// Upper bound on `idle.deep_idle_secs` — same rationale as
+/// [`MAX_IDLE_TEARDOWN_SECS`]; deep-idle thresholds beyond an hour
+/// negate the memory-reclaim payoff.
+pub const MAX_IDLE_DEEP_SECS: u32 = 3600;
+
+/// Lower inclusive bound on `idle.poll_interval_ms`. Below ~100 ms
+/// the sysfs poller starts to show on `top`; the wake budget gains
+/// nothing because the kernel only flips `state` on reader STREAMON.
+pub const MIN_IDLE_POLL_INTERVAL_MS: u32 = 100;
+
+/// Upper inclusive bound on `idle.poll_interval_ms`. Past 5 s the
+/// wake latency dominates the 5 s cooldown and the user-visible
+/// reconnect feels broken.
+pub const MAX_IDLE_POLL_INTERVAL_MS: u32 = 5000;
+
+/// Upper inclusive bound on `idle.fps`. v4l2loopback does not benefit
+/// from placeholder fps above the input fps; capping at the input fps
+/// upper bound matches operator expectations.
+pub const MAX_IDLE_FPS: u32 = 60;
+
+fn default_placeholder_rgb() -> [u8; 3] {
+    [16, 16, 16]
+}
+fn default_idle_fps() -> u32 {
+    1
+}
+fn default_idle_teardown_secs() -> u32 {
+    5
+}
+fn default_idle_deep_secs() -> u32 {
+    30
+}
+fn default_idle_poll_interval_ms() -> u32 {
+    250
+}
+
+// ---------------------------------------------------------------------------
 // Section: logging
 // ---------------------------------------------------------------------------
 
@@ -654,6 +812,12 @@ pub struct FluxConfig {
     /// surface (Stage 13). Disabled by default — opt-in feature.
     #[serde(default)]
     pub control: ControlConfig,
+    /// `[idle]` section. Stage 15 consumer-aware lifecycle. Disabled
+    /// by default — operators opt in. The `skip_serializing_if` arm
+    /// keeps `current_config` JSON byte-identical to Stage 14 when
+    /// idle is off, so existing GUI clients are unaffected.
+    #[serde(default, skip_serializing_if = "IdleConfig::is_off")]
+    pub idle: IdleConfig,
 }
 
 impl FluxConfig {
@@ -719,6 +883,54 @@ impl FluxConfig {
                 "input.auto.poll_interval_secs must be in 1..={MAX_POLL_INTERVAL_SECS}, got {}",
                 self.input.auto.poll_interval_secs
             )));
+        }
+
+        // Idle-mode bounds. Validated even when `enabled = false` so a
+        // future toggle does not surface a stale invalid value at
+        // runtime — fail fast at config-load.
+        if self.idle.fps == 0 || self.idle.fps > MAX_IDLE_FPS {
+            return Err(config_err(format!(
+                "idle.fps must be in 1..={MAX_IDLE_FPS}, got {}",
+                self.idle.fps
+            )));
+        }
+        if self.idle.teardown_secs == 0 || self.idle.teardown_secs > MAX_IDLE_TEARDOWN_SECS {
+            return Err(config_err(format!(
+                "idle.teardown_secs must be in 1..={MAX_IDLE_TEARDOWN_SECS}, got {}",
+                self.idle.teardown_secs
+            )));
+        }
+        if self.idle.deep_idle_secs == 0 {
+            return Err(config_err("idle.deep_idle_secs must be > 0, got 0".into()));
+        }
+        if self.idle.deep_idle_secs > MAX_IDLE_DEEP_SECS {
+            return Err(config_err(format!(
+                "idle.deep_idle_secs must be <= {MAX_IDLE_DEEP_SECS}, got {}",
+                self.idle.deep_idle_secs
+            )));
+        }
+        // Strict `>` rejects the same-value case where DeepIdle would
+        // fire on the same observation as Idle entry.
+        if self.idle.deep_idle_secs <= self.idle.teardown_secs {
+            return Err(config_err(format!(
+                "idle.deep_idle_secs ({}) must be strictly greater than idle.teardown_secs ({})",
+                self.idle.deep_idle_secs, self.idle.teardown_secs
+            )));
+        }
+        if self.idle.poll_interval_ms < MIN_IDLE_POLL_INTERVAL_MS
+            || self.idle.poll_interval_ms > MAX_IDLE_POLL_INTERVAL_MS
+        {
+            return Err(config_err(format!(
+                "idle.poll_interval_ms must be in {MIN_IDLE_POLL_INTERVAL_MS}..={MAX_IDLE_POLL_INTERVAL_MS}, got {}",
+                self.idle.poll_interval_ms
+            )));
+        }
+        if self.idle.placeholder == IdlePlaceholderKind::Image
+            && self.idle.placeholder_path.is_none()
+        {
+            return Err(config_err(
+                "idle.placeholder = \"image\" requires idle.placeholder_path".into(),
+            ));
         }
 
         Ok(())

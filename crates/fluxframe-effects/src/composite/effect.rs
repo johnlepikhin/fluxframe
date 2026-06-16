@@ -131,6 +131,25 @@ impl CompositeEffect {
         self.processing_ctx.as_ref()
     }
 
+    /// Borrow the underlying [`SegmentationBase`]. Used by the
+    /// Stage 15 supervisor's lifecycle wrapper (`ManagedComposite`
+    /// in the CLI crate) to drive engine unload/reload — see
+    /// [`SegmentationBase::take_engine`] /
+    /// [`SegmentationBase::install_engine`]. Not part of the normal
+    /// effect lifecycle; production effects should never need it.
+    #[must_use]
+    pub fn segmentation_mut(&mut self) -> &mut SegmentationBase {
+        &mut self.segmentation
+    }
+
+    /// Read-only counterpart to [`Self::segmentation_mut`]. Used by
+    /// `ManagedComposite` to query [`SegmentationBase::engine_loaded`]
+    /// without taking a mutable borrow across the worker loop.
+    #[must_use]
+    pub fn segmentation(&self) -> &SegmentationBase {
+        &self.segmentation
+    }
+
     /// Replace one of the composite's sub-chains. New effects must
     /// already have been `configure()`d by the caller. This call
     /// drives `prepare()` on each new effect against the stored

@@ -261,6 +261,32 @@ pub enum FluxError {
     },
 }
 
+/// Walk an error chain via [`std::error::Error::source`] and join
+/// every link with `": "` separators.
+///
+/// Standard `Display` impls (e.g. `image::ImageError`,
+/// `std::io::Error` wrappers) report only the top-level message; the
+/// underlying IO/format/parse error that caused the failure lives one
+/// (or more) `source()` calls deeper and is invisible to a plain
+/// `format!("{e}")`. This helper renders the full chain so the §27
+/// "Reason:" line shows the operator the actual root cause.
+///
+/// Lives in `fluxframe-core::error` because it is generic over
+/// `dyn std::error::Error` and used by callers in multiple crates
+/// (effects, CLI). Originally introduced for the image-decode
+/// pipeline but is not image-specific.
+#[must_use]
+pub fn full_error_chain(err: &dyn std::error::Error) -> String {
+    let mut s = err.to_string();
+    let mut src = err.source();
+    while let Some(inner) = src {
+        s.push_str(": ");
+        s.push_str(&inner.to_string());
+        src = inner.source();
+    }
+    s
+}
+
 impl FluxError {
     /// Construct an [`FluxError::Io`] from a path and the underlying
     /// [`std::io::Error`].
