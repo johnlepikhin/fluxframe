@@ -71,6 +71,10 @@ openvino = { version = "0.11", default-features = false, features = ["runtime-li
 # support; we only need `jpeg` + `png` for typical corporate brand
 # backgrounds.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# Stage 15 inotify-driven idle-mode consumer detector. `default-features
+# = false` drops the optional `stream` (async/futures) feature — we run
+# the detector on a dedicated synchronous thread with a NONBLOCK fd.
+inotify = { version = "0.11", default-features = false }
 # GTK 4 + libadwaita stack lives in `fluxframe-gui/Cargo.toml` directly
 # because the `package = "..."` rename does not interact cleanly with
 # `workspace.dependencies` inheritance. Version pins documented there.

@@ -335,6 +335,130 @@ DMA-BUF zero-copy, …).  Slim builds without GPU support compile
 with `cargo build -p fluxframe-effects --no-default-features` (or
 add only the `ml` feature).
 
+## Idle mode (Stage 15)
+
+When no application is reading from `/dev/video10`, FluxFrame can drop
+the camera, stop running effects and publish a cheap placeholder frame
+instead. Re-attaching a reader (Zoom, Meet, OBS, browser) resumes the
+full pipeline automatically. On a laptop this saves a CPU core,
+~150 MB of ONNX session RAM (deferred — see follow-ups below) and the
+webcam LED.
+
+Opt in via `[idle] enabled = true` in `fluxframe.toml`. The defaults
+match the typical "step away from desk" use case:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Master switch. `false` runs the Stage 14 path verbatim. |
+| `placeholder` | `"color"` | `"color"` or `"image"`. |
+| `placeholder_rgb` | `[16, 16, 16]` | Dark grey fill for `placeholder = "color"`. |
+| `placeholder_path` | — | Required when `placeholder = "image"`. PNG or JPEG, absolute path (relative-path resolution is a Stage 15 follow-up). |
+| `fps` | `1` | Placeholder frame rate. 1 Hz is enough to keep v4l2loopback's ring buffer fresh. |
+| `teardown_secs` | `5` | "No consumer" grace window before the camera drops. Absorbs Zoom / OBS reopen storms. |
+| `deep_idle_secs` | `30` | Idle → DeepIdle threshold. *(Currently a no-op stub; see follow-ups.)* |
+| `poll_interval_ms` | `250` | Polling-fallback walk cadence. The default path is event-driven via `inotify`, which ignores this knob; it only kicks in when `inotify` is unavailable (sandbox, watch-limit exhaustion). |
+
+A consumer disconnect triggers this lifecycle:
+
+```
+                 t = 0 s        t = 5 s              t = 35 s
+consumer drops ─────► Cooldown ─────► Idle ──────────────► DeepIdle
+                       (LED on)       (LED off,            (placeholder
+                                       placeholder @ 1 Hz)  + future ONNX
+                                                            unload)
+```
+
+Re-attaching at any depth fires `ResumeActive`: the supervisor pushes
+one placeholder immediately to clear v4l2loopback's stale-frame
+replay, then spawns a reload thread that brings the input pipeline
+back to `Playing`. Steady-state cold-start budget on UVC cameras is
+≤ ~300 ms; the placeholder keeps flowing for the entire warmup.
+
+### How "no consumer" is detected
+
+The supervisor's detector thread watches `/dev/videoN` via
+`inotify` for `IN_OPEN` / `IN_CLOSE_NOWRITE` / `IN_CLOSE_WRITE`.
+In steady-state idle the per-event cost is zero — the kernel only
+wakes the thread when somebody opens or closes the device. The
+shutdown-poll window costs one nonblocking `read(2)` returning
+`EAGAIN` every ~50 ms (so the worker honours Ctrl-C within that
+budget), which is sub-microsecond and orders of magnitude cheaper
+than the prior `/proc` polling. On a real wake, the detector walks
+`/proc/[0-9]+/fd/`, reading each symlink and checking whether any
+external process (`pid != fluxframe`) holds a file descriptor
+whose target matches `/dev/videoN`. One or more → `Present`. Zero →
+`Absent`. Per-pid permission errors are skipped silently
+(steady-state expected on a multi-user system).
+
+The walk on event is necessary because `inotify` cannot tell us
+*which* process opened the device — fluxframe itself opens and
+closes the v4l2 sink during pipeline state transitions, and we
+have to distinguish those self-events from external ones.
+
+If `inotify::init` or `inotify::watches::add` fails (the device
+node doesn't exist, the user is at
+`/proc/sys/fs/inotify/max_user_watches`, or a sandbox blocks
+`inotify_init`), the detector falls back to walking
+`/proc/[0-9]+/fd/` every `idle.poll_interval_ms`. Behaviour is
+identical; only the wake mechanism differs (and the steady-state
+CPU cost climbs from ~0 % to ~5 % on a typical desktop).
+
+**Limitation: root-owned consumers are invisible.** An unprivileged
+fluxframe cannot read `/proc/<root-pid>/fd`, so a root-owned process
+consuming `/dev/video10` looks identical to "no consumer". If you
+run a root-owned consumer alongside fluxframe, idle mode may tear
+down the input pipeline while a real consumer is reading. The
+pragmatic workaround is to run fluxframe as the same user as the
+consumer.
+
+### Compatibility notes
+
+- **Linux-only.** `/proc/[0-9]+/fd/` walking is a Linux-specific
+  interface; the detector module is `#[cfg(target_os = "linux")]`-gated.
+  On non-Linux hosts idle mode falls through to the Stage 14 path with
+  a one-shot `warn!` line.
+- **V4L2 loopback sinks only.** Idle mode requires
+  `OutputSink::V4l2Loopback`; `fakesink`, `autovideosink` and
+  `pipewiresink` fall through with a `warn!` line explaining the
+  reason.
+- **Webcam LED quirks.** Most UVC cameras cut the LED within ~1 s of
+  the pipeline transitioning to `Null`. A few Logitech models (C920,
+  C922, Brio) firmware-keep the LED lit for 1–3 s; this is
+  upstream-known and not actionable from FluxFrame.
+
+### Observability
+
+Idle transitions are logged at `info!` with `target =
+"fluxframe::idle"`. Counters surface in the teardown summary log:
+
+- `idle_entered_total` — Active → Idle transitions.
+- `deep_idle_entered_total` — Idle → DeepIdle transitions.
+- `idle_frames_pushed_total` — placeholder frames emitted.
+
+Status changes (`Present ↔ Absent` from the detector) also log at
+`info!` so a `RUST_LOG=info` operator sees consumer attach/detach
+without enabling debug-level globally.
+
+### Stage 15 follow-ups
+
+- **DeepIdle ONNX drop.** Currently a counter-only stub — DeepIdle is
+  observationally identical to Idle. The real RAM reclamation
+  (~150 MB) needs `EffectChain` ↔ `ManagedComposite` integration
+  (`SegmentationBase::take_engine` / `install_engine` accessors are
+  already in place; the chain refactor is the missing piece).
+- **`engine_ready` race tightening** — currently survivable (one
+  unnecessary placeholder push per resume race) but worth moving
+  `store(false)` into `spawn_reload_thread`'s body to close the
+  window.
+- **`double_spawn_guard` unit test** — extract a helper from the
+  current inline guard in `handle_idle_edge::ResumeActive` for
+  focused testing.
+- **Relative `placeholder_path` resolution** against the config-file
+  directory.
+- **`resume_latency_ms` histogram.** The reload thread already
+  returns `ResumeOutcome.elapsed`; a histogram on top is the
+  natural next step.
+
 ## Roadmap
 
 | Stage | Status |
@@ -353,6 +477,8 @@ add only the `ml` feature).
 | 11. Plane-effects suite (sharpen, vignette, exposure_correct, image_fill) | done |
 | 12. Post-composite mask-aware chain + `auto_frame` | done |
 | 13. Live reconfiguration via UNIX control socket | done |
+| 14. GTK4 GUI client over the control socket | done |
+| 15. Idle mode (consumer-aware lifecycle) | done (DeepIdle ONNX drop deferred) |
 
 ## License
 

@@ -10,11 +10,12 @@
 //! * [`state`] — pure state machine driving [`IdleEdge`]/[`IdleLevel`]
 //!   transitions; no I/O. Wired into the worker loop in
 //!   `runtime::run_process_loop`.
-//! * `detector` (Step 3) — sysfs `state` poller thread that publishes
-//!   the observed consumer status into an `Arc<AtomicU8>`. Linux-only:
-//!   v4l2loopback exposes the sysfs `state` attribute only on Linux,
-//!   so the module is `cfg`-gated and the supervisor (Step 4)
-//!   consults the same gate when wiring it.
+//! * `detector` — inotify-driven consumer presence detector with a
+//!   `/proc/*/fd/` walk on every open/close event; polling fallback
+//!   for environments where inotify is unavailable. Linux-only —
+//!   `/proc/*/fd/` and `inotify` are both Linux interfaces; the
+//!   module is `cfg`-gated and the supervisor consults the same
+//!   gate when wiring it.
 //! * `placeholder` (Step 2) — pre-rendered frame cache.
 //! * `managed_composite` (Step 2) — lifecycle wrapper around
 //!   `CompositeEffect` that owns the engine slot.
@@ -42,7 +43,7 @@ pub(crate) mod state;
     unused_imports,
     reason = "Stage 15 Step 4 consumes these from runtime::run_process_loop"
 )]
-pub(crate) use detector::{ConsumerDetector, sysfs_state_path};
+pub(crate) use detector::{ConsumerDetector, device_path};
 #[cfg(feature = "ml")]
 #[allow(
     unused_imports,

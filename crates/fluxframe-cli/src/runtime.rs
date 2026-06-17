@@ -1772,13 +1772,15 @@ fn build_idle_runtime(
         // `idle.enabled = true` with a non-V4L2 sink sees why idle is
         // not taking effect, rather than silently running the Stage 14
         // path.
-        let Some(sysfs_path) = crate::idle::sysfs_state_path(&sink) else {
+        let Some(device_path) = crate::idle::device_path(&sink) else {
             warn!(
                 "idle.enabled = true but sink is not v4l2loopback — idle disabled \
-                 (the consumer-presence detector only works against v4l2loopback's sysfs)"
+                 (the consumer-presence detector needs a /dev/videoN device path for the \
+                 inotify watch + /proc/*/fd walk)"
             );
             return None;
         };
+        let my_pid = std::process::id();
 
         let (sink_w, sink_h) = cfg
             .output
@@ -1798,7 +1800,8 @@ fn build_idle_runtime(
 
         let detector_running = Arc::clone(running);
         let detector = crate::idle::ConsumerDetector::spawn(
-            sysfs_path,
+            device_path,
+            my_pid,
             std::time::Duration::from_millis(u64::from(cfg.idle.poll_interval_ms)),
             detector_running,
         );
@@ -1822,9 +1825,11 @@ fn build_idle_runtime(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = input;
-        let _ = running;
-        warn!("idle mode requested but host is not Linux — running Stage 14 loop unchanged");
+        let _ = (input, running);
+        warn!(
+            target: "fluxframe::idle",
+            "idle mode requested but host is not Linux — idle disabled (the /proc/*/fd consumer detector is Linux-only)"
+        );
         None
     }
 }

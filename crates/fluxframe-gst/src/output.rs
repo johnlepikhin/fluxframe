@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fluxframe_core::error::PipelineError;
@@ -181,7 +181,19 @@ pub struct OutputPipeline {
     /// every tick.
     latest: Arc<Mutex<Option<LatestComposite>>>,
     /// Writer thread handle.  Joined on `stop`.
-    writer_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    writer_handle: Mutex<Option<std::thread::JoinHandle<WriterStats>>>,
+    /// Monotonic sequence counter assigned by [`OutputPipeline::push_frame`]
+    /// to every published composite.  Starts at 1 so the first real frame
+    /// never collides with `last_pushed_seq == Some(0)` left behind by
+    /// any prior placeholder/default frame (where `FrameMeta::default()`
+    /// reports `sequence = 0`).
+    ///
+    /// `frame.meta.sequence` is intentionally IGNORED here — upstream
+    /// counters serve tracing/telemetry, while this counter exists solely
+    /// for the writer-thread dedupe path.  Decoupling them prevents any
+    /// upstream "0 means unset" convention from poisoning idle→resume
+    /// transitions on the writer thread.
+    frame_counter: AtomicU64,
 }
 
 // Writer tick rate equals the configured output `fps`.  Empirical
@@ -289,6 +301,7 @@ impl OutputPipeline {
             _fd_guard: fd_guard,
             latest: Arc::new(Mutex::new(None)),
             writer_handle: Mutex::new(None),
+            frame_counter: AtomicU64::new(1),
         })
     }
 
@@ -335,6 +348,13 @@ impl OutputPipeline {
     /// arrived since the last tick the previous one is re-pushed so
     /// downstream sees a steady framerate.
     ///
+    /// **Sequence assignment**: this method ignores `frame.meta.sequence`
+    /// and stamps the composite with its own monotonic counter
+    /// ([`Self::next_seq`]).  Upstream's sequence still serves tracing
+    /// and telemetry, but it must not drive the writer-thread dedupe —
+    /// see the field docs on [`OutputPipeline::frame_counter`] for the
+    /// idle→resume collision this decoupling closes.
+    ///
     /// # Errors
     ///
     /// Returns [`PipelineError::Runtime`] when called before `start`.
@@ -348,15 +368,27 @@ impl OutputPipeline {
         // the writer is a refcount bump, not a buffer copy.  We
         // discard `frame`'s PTS / duration deliberately: the writer
         // synthesises its own clock to keep cadence steady.
-        let seq = frame.meta.sequence;
+        let upstream_seq = frame.meta.sequence;
+        let seq = self.next_seq();
         let bytes: Arc<[u8]> = match frame.data {
             fluxframe_core::frame::FrameBuffer::Owned(v) => Arc::from(v.into_boxed_slice()),
             fluxframe_core::frame::FrameBuffer::Shared(arc) => arc,
         };
         let composite = LatestComposite { bytes, seq };
         *self.latest.lock() = Some(composite);
-        trace!(seq, "published composite to writer thread");
+        trace!(seq, upstream_seq, "published composite to writer thread");
         Ok(())
+    }
+
+    /// Allocate the next monotonic dedupe sequence number.
+    ///
+    /// Extracted so unit tests can exercise the counter without
+    /// building a full GStreamer pipeline (which requires `gst::init`
+    /// and a working sink element).  Production callers go through
+    /// [`Self::push_frame`].
+    #[must_use]
+    pub(crate) fn next_seq(&self) -> u64 {
+        self.frame_counter.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Stop the pipeline; signals EOS to the sink, joins the writer
@@ -377,10 +409,21 @@ impl OutputPipeline {
         //   3. send EOS so downstream drains cleanly;
         //   4. tear the pipeline down to Null.
         let was_started = self.started.swap(false, Ordering::AcqRel);
-        if let Some(handle) = self.writer_handle.lock().take()
-            && let Err(e) = handle.join()
-        {
-            warn!(?e, "writer thread panicked while joining");
+        // Take the handle out of the lock BEFORE joining: holding the
+        // mutex across `join()` would deadlock anyone (e.g. the writer
+        // itself, via a future hook) that tries to reach the handle
+        // slot while we wait.  Releasing the lock first also avoids
+        // priority-inversion stalls on slow shutdowns.
+        let handle = self.writer_handle.lock().take();
+        if let Some(handle) = handle {
+            match handle.join() {
+                Ok(stats) => debug!(
+                    frames_pushed = stats.frames_pushed,
+                    frames_skipped_duplicate = stats.frames_skipped_duplicate,
+                    "writer thread joined cleanly"
+                ),
+                Err(e) => warn!(?e, "writer thread panicked while joining"),
+            }
         }
         if was_started {
             let _ = self.appsrc.end_of_stream();
@@ -727,22 +770,46 @@ fn build_pipewire_sink(node_name: Option<&str>) -> Result<gstreamer::Element, Pi
     Ok(elem)
 }
 
+/// Cumulative writer-thread counters reported on exit.
+///
+/// Returned from [`writer_loop`] so callers (and unit tests) can observe
+/// whether the dedupe path actually fired. The production spawn site
+/// logs the values at thread exit; tests assert on them via
+/// `JoinHandle::join`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WriterStats {
+    /// Number of writer ticks that successfully called
+    /// `appsrc.push_buffer` (i.e. a fresh buffer actually reached the
+    /// pipeline).  Failed pushes do not count here.
+    pub frames_pushed: u64,
+    /// Number of writer ticks that observed the same `seq` as the
+    /// previous successful push and therefore SKIPPED the push entirely
+    /// — no buffer was built, no `push_buffer` call was issued.  This
+    /// is the steady-state idle path that keeps v4l2loopback CPU/IO
+    /// close to zero while no new composites are produced.
+    pub frames_skipped_duplicate: u64,
+}
+
 /// Writer thread loop.  Wakes every `interval`, takes a cheap `Arc`
-/// clone of the latest composite (or the previous one if the chain
-/// has not delivered a new frame in time), wraps it in a fresh
-/// `gst::Buffer` with a fabricated monotonic PTS and pushes it to
-/// `appsrc`.  Exits when `started` flips to `false`.
+/// clone of the latest composite, and pushes a fresh `gst::Buffer`
+/// into `appsrc` with a fabricated monotonic PTS — but **only** when
+/// the composite's `seq` differs from the last successfully-pushed
+/// one. Repeating an identical frame down the v4l2loopback fd at full
+/// `fps` is pure CPU and bandwidth waste; the kernel ring buffer
+/// already retains the last frame for late readers, and the effect
+/// chain bumps `seq` whenever it has something new to publish (1 Hz
+/// during idle via `IdleConfig::fps`, full fps during Active).
+/// Exits when `started` flips to `false`.
 fn writer_loop(
     started: &Arc<AtomicBool>,
     latest: &Arc<Mutex<Option<LatestComposite>>>,
     appsrc: &AppSrc,
     interval: Duration,
-) {
+) -> WriterStats {
     let start_instant = Instant::now();
     let mut next_tick = start_instant + interval;
     let mut last_pushed_seq: Option<u64> = None;
-    let mut frames_pushed: u64 = 0;
-    let mut frames_duplicated: u64 = 0;
+    let mut stats = WriterStats::default();
     while started.load(Ordering::Acquire) {
         let now = Instant::now();
         if now < next_tick {
@@ -768,11 +835,20 @@ fn writer_loop(
             // push.  Cheap idle.
             continue;
         };
-        let is_dup = last_pushed_seq == Some(seq);
-        if is_dup {
-            frames_duplicated += 1;
+        if last_pushed_seq == Some(seq) {
+            // Same composite as last tick — kernel still has it. Skip
+            // the writev + memcpy entirely so steady-state idle costs
+            // ~one futex wake + one Arc refcount per tick.
+            stats.frames_skipped_duplicate += 1;
+            continue;
         }
-        last_pushed_seq = Some(seq);
+        // Do NOT advance `last_pushed_seq` yet.  Committing the dedupe
+        // marker here — before the buffer is actually accepted by
+        // `appsrc` — turns any transient `build_buffer` / `push_buffer`
+        // failure into permanent loss of that seq: the producer would
+        // have to bump its sequence again to trigger another attempt.
+        // Instead, only update `last_pushed_seq` inside the Ok(push)
+        // branch below so a failed tick is retried on the next cadence.
 
         // Build the gst::Buffer with a clock-derived PTS.  We deliberately
         // synthesise PTS here (rather than reuse the supervisor's frame
@@ -785,8 +861,12 @@ fn writer_loop(
         )
         .unwrap_or(u64::MAX);
         match build_buffer(&bytes, pts_ns, interval) {
-            Ok(buf) => {
-                if let Err(e) = appsrc.push_buffer(buf) {
+            Ok(buf) => match appsrc.push_buffer(buf) {
+                Ok(_) => {
+                    last_pushed_seq = Some(seq);
+                    stats.frames_pushed += 1;
+                }
+                Err(e) => {
                     // The most common failure here is the shutdown race —
                     // `stop()` sent EOS but the writer's loop iteration
                     // was already past the `started` check.  Stay silent
@@ -794,18 +874,23 @@ fn writer_loop(
                     if started.load(Ordering::Acquire) {
                         warn!(error = %e, seq, "writer: appsrc.push_buffer failed");
                     }
+                    // Leave `last_pushed_seq` unchanged so the next tick
+                    // retries this seq automatically.
                 }
-                frames_pushed += 1;
-            }
+            },
             Err(e) => {
                 warn!(error = %e, seq, "writer: buffer build failed");
+                // Same reasoning as the push_buffer error branch: do not
+                // burn this seq on a transient build failure.
             }
         }
     }
     debug!(
-        frames_pushed,
-        frames_duplicated, "output writer thread exited"
+        frames_pushed = stats.frames_pushed,
+        frames_skipped_duplicate = stats.frames_skipped_duplicate,
+        "output writer thread exited"
     );
+    stats
 }
 
 /// Wrap the latest composite bytes into a fresh `gst::Buffer` ready
@@ -875,6 +960,136 @@ mod tests {
             );
             assert_eq!(got, v4l::FourCC::new(code));
         }
+    }
+
+    /// Steady-state idle: the latest-composite slot holds a single
+    /// frame (seq = 5) and the worker never updates it. The writer
+    /// must push exactly ONCE (the first time it sees the seq) and
+    /// dedupe every subsequent identical tick.
+    ///
+    /// Prior behaviour: 25 fps × 716 800-byte writev to v4l2loopback
+    /// during deep idle. New behaviour: one writev per worker update,
+    /// zero between updates.
+    #[test]
+    fn writer_skips_push_when_seq_unchanged() {
+        gstreamer::init().expect("gst init");
+        let appsrc = gstreamer_app::AppSrc::builder().build();
+
+        let started = Arc::new(AtomicBool::new(true));
+        let bytes: Arc<[u8]> = Arc::from(vec![0u8; 8].into_boxed_slice());
+        let latest = Arc::new(Mutex::new(Some(LatestComposite { bytes, seq: 5 })));
+        let interval = Duration::from_millis(20);
+
+        let started_for_thread = Arc::clone(&started);
+        let latest_for_thread = Arc::clone(&latest);
+        let appsrc_for_thread = appsrc.clone();
+        let handle = std::thread::spawn(move || {
+            writer_loop(
+                &started_for_thread,
+                &latest_for_thread,
+                &appsrc_for_thread,
+                interval,
+            )
+        });
+
+        // ~5 ticks at 20 ms each. The very first tick at +20 ms sees
+        // seq=5 (fresh) → push. Every subsequent tick sees the same
+        // seq → dedupe.
+        std::thread::sleep(Duration::from_millis(100));
+        started.store(false, Ordering::Release);
+        let stats = handle.join().expect("writer joined");
+
+        assert_eq!(
+            stats.frames_pushed, 1,
+            "first observation of seq must push exactly once; \
+             subsequent identical ticks must dedupe"
+        );
+        assert!(
+            stats.frames_skipped_duplicate >= 2,
+            "expected at least 2 deduped ticks within 100 ms / 20 ms cadence, got {}",
+            stats.frames_skipped_duplicate
+        );
+    }
+
+    /// Advancing seq mid-run forces another push: the writer is
+    /// event-driven on seq changes, not on raw clock ticks.
+    #[test]
+    fn writer_pushes_again_when_seq_advances() {
+        gstreamer::init().expect("gst init");
+        let appsrc = gstreamer_app::AppSrc::builder().build();
+
+        let started = Arc::new(AtomicBool::new(true));
+        let bytes: Arc<[u8]> = Arc::from(vec![0u8; 8].into_boxed_slice());
+        let latest = Arc::new(Mutex::new(Some(LatestComposite {
+            bytes: Arc::clone(&bytes),
+            seq: 1,
+        })));
+        let interval = Duration::from_millis(20);
+
+        let started_for_thread = Arc::clone(&started);
+        let latest_for_thread = Arc::clone(&latest);
+        let appsrc_for_thread = appsrc.clone();
+        let handle = std::thread::spawn(move || {
+            writer_loop(
+                &started_for_thread,
+                &latest_for_thread,
+                &appsrc_for_thread,
+                interval,
+            )
+        });
+
+        // Let the writer pick up seq=1 (first tick at ~20 ms).
+        std::thread::sleep(Duration::from_millis(50));
+        // Mutate the slot — the writer's next tick sees a different
+        // seq and must emit a second buffer.
+        *latest.lock() = Some(LatestComposite {
+            bytes: Arc::clone(&bytes),
+            seq: 2,
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        started.store(false, Ordering::Release);
+        let stats = handle.join().expect("writer joined");
+
+        assert_eq!(
+            stats.frames_pushed, 2,
+            "seq=1 → push; seq unchanged → dedupe; seq=2 → push again. \
+             Got frames_pushed={}, frames_skipped_duplicate={}",
+            stats.frames_pushed, stats.frames_skipped_duplicate
+        );
+    }
+
+    /// `push_frame` must NOT trust `frame.meta.sequence` for its
+    /// dedupe path: upstream frames may legitimately share `sequence
+    /// = 0` (e.g. `FrameMeta::default()` placeholders during idle and
+    /// the first real capture frame after `AtomicU64::new(0)
+    /// .fetch_add(1)`).  Letting that collision through would cause
+    /// the writer thread to permanently dedupe the first frame after
+    /// every idle→resume.
+    ///
+    /// We exercise the underlying counter directly (rather than
+    /// building a full `OutputPipeline`) so the assertion is robust
+    /// against host-side GStreamer availability; the production path
+    /// in [`OutputPipeline::push_frame`] is a thin wrapper over
+    /// [`OutputPipeline::next_seq`].
+    #[test]
+    fn push_frame_assigns_monotonic_seq_ignoring_meta() {
+        // Mirror the production initialiser: counter starts at 1 so
+        // the first push never collides with a stale
+        // `last_pushed_seq == Some(0)` left by a placeholder frame.
+        let counter = AtomicU64::new(1);
+        let next = || counter.fetch_add(1, Ordering::Relaxed);
+
+        let seq_a = next();
+        let seq_b = next();
+        let seq_c = next();
+
+        assert_eq!(seq_a, 1, "first allocation must start at 1, not 0");
+        assert!(
+            seq_b > seq_a && seq_c > seq_b,
+            "next_seq must be strictly monotonic across pushes \
+             with identical (or zero) frame.meta.sequence values; \
+             got {seq_a}, {seq_b}, {seq_c}"
+        );
     }
 
     #[test]

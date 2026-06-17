@@ -55,6 +55,12 @@ rayon = { workspace = true }
 # placeholder path stays cleanly in the CLI layer.
 image = { workspace = true }
 
+# Stage 15 idle-mode consumer detector — Linux-only (the rest of the
+# `idle::detector` module is already cfg-gated). inotify-driven event
+# loop replaces /proc polling for ~zero-syscall steady-state idle.
+[target.'cfg(target_os = "linux")'.dependencies]
+inotify = { workspace = true }
+
 [dev-dependencies]
 # Used by the `control_socket_e2e` integration test to bind a unique
 # UNIX socket path per run without colliding with other tests or with
