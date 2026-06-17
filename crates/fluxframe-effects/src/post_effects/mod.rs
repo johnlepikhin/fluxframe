@@ -4,10 +4,12 @@
 //! the frame-resolution mask.
 
 mod auto_frame;
+mod mirror;
 mod passthrough;
 mod registry;
 
 pub use auto_frame::AutoFrameEffect;
+pub use mirror::MirrorEffect;
 pub use passthrough::PassthroughPostEffect;
 pub use registry::{PostEffectRegistry, default_registry};
 

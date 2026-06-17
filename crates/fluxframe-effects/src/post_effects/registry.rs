@@ -100,7 +100,7 @@ impl PostEffectRegistry {
 /// Build a registry pre-populated with the built-in post effects.
 #[must_use]
 pub fn default_registry() -> PostEffectRegistry {
-    use crate::post_effects::{AutoFrameEffect, PassthroughPostEffect};
+    use crate::post_effects::{AutoFrameEffect, MirrorEffect, PassthroughPostEffect};
     let mut registry = PostEffectRegistry::new();
     registry.register(
         PassthroughPostEffect::NAME,
@@ -111,6 +111,11 @@ pub fn default_registry() -> PostEffectRegistry {
         AutoFrameEffect::NAME,
         Box::new(|| -> Box<dyn PostEffect> { Box::new(AutoFrameEffect::new()) }),
         &AutoFrameEffect::METADATA,
+    );
+    registry.register(
+        MirrorEffect::NAME,
+        Box::new(|| -> Box<dyn PostEffect> { Box::new(MirrorEffect::new()) }),
+        &MirrorEffect::METADATA,
     );
     registry
 }
@@ -125,6 +130,7 @@ mod tests {
         let names = reg.names();
         assert!(names.contains(&"passthrough"));
         assert!(names.contains(&"auto_frame"));
+        assert!(names.contains(&"mirror"));
     }
 
     #[test]
