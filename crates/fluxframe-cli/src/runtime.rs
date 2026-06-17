@@ -119,6 +119,9 @@ fn command_label(cmd: &ControlCommand) -> &'static str {
         ControlCommand::Set { .. } => "set",
         ControlCommand::SetChain { .. } => "set_chain",
         ControlCommand::Reload => "reload",
+        ControlCommand::SavePreset => "save_preset",
+        ControlCommand::SavePresetAs { .. } => "save_preset_as",
+        ControlCommand::ConfigPath => "config_path",
         // `ControlCommand` is `#[non_exhaustive]` for forward-compat
         // with future wire variants. Tag unknowns explicitly so log
         // queries surface "we received something we cannot label yet".
@@ -201,6 +204,13 @@ fn apply_control_command(
             active_preset,
         ),
         ControlCommand::ListEffects => apply_list_effects_command(),
+        ControlCommand::SavePreset => {
+            apply_save_preset_command(cfg, config_path, active_preset_name, active_preset)
+        }
+        ControlCommand::SavePresetAs { name } => {
+            apply_save_preset_as_command(cfg, config_path, active_preset, &name)
+        }
+        ControlCommand::ConfigPath => apply_config_path_command(config_path),
         // `ControlCommand` is `#[non_exhaustive]`; a future variant
         // that this build does not yet handle gets a structured
         // error rather than panicking the worker thread.
@@ -208,6 +218,99 @@ fn apply_control_command(
             "unknown command — daemon was built without support for this wire variant",
             Some("update the daemon, or check the client is not ahead of the daemon".into()),
         ),
+    }
+}
+
+/// Persist the in-memory active preset back into the operator's
+/// TOML config file. The runtime mirror in `cfg.presets` is refreshed
+/// so a subsequent `Reload` sees consistent state (otherwise a Reload
+/// right after a Save would silently revert the unsaved in-memory
+/// edits that landed via `Set` since the last load).
+fn apply_save_preset_command(
+    cfg: &mut FluxConfig,
+    config_path: Option<&std::path::Path>,
+    active_preset_name: &str,
+    active_preset: &Preset,
+) -> ControlResponse {
+    let Some(path) = config_path else {
+        return ControlResponse::err(
+            "daemon has no writable config path",
+            Some(
+                "restart the daemon with --config <PATH> or without --no-default-config to enable Save"
+                    .into(),
+            ),
+        );
+    };
+    if let Err(e) = crate::persist::save_preset(path, active_preset_name, active_preset) {
+        return ControlResponse::err(
+            format!("save failed: {e}"),
+            Some(format!("path: {}", path.display())),
+        );
+    }
+    cfg.presets
+        .insert(active_preset_name.to_string(), active_preset.clone());
+    info!(
+        path = %path.display(),
+        preset = %active_preset_name,
+        "control: saved active preset to disk",
+    );
+    ControlResponse::ok()
+}
+
+/// Persist the active preset under a new name. Inserts the new
+/// preset into the in-memory `cfg.presets` mirror so a follow-up
+/// `ListPresets` reflects the new entry immediately.
+fn apply_save_preset_as_command(
+    cfg: &mut FluxConfig,
+    config_path: Option<&std::path::Path>,
+    active_preset: &Preset,
+    new_name: &str,
+) -> ControlResponse {
+    let Some(path) = config_path else {
+        return ControlResponse::err(
+            "daemon has no writable config path",
+            Some(
+                "restart the daemon with --config <PATH> or without --no-default-config to enable Save"
+                    .into(),
+            ),
+        );
+    };
+    // Race with the in-memory mirror: a preset that already exists in
+    // the running daemon (e.g. one defined in the TOML at startup, or
+    // created earlier via another SavePresetAs) must not be silently
+    // overwritten. `persist::save_preset_as` already checks the
+    // on-disk file, but we mirror that check against the in-memory
+    // state so the operator gets the same answer when the file was
+    // edited externally between the load and this command.
+    if cfg.presets.contains_key(new_name) {
+        return ControlResponse::err(
+            format!("preset '{new_name}' already exists"),
+            Some("pick a different name or use Save to overwrite the active preset".into()),
+        );
+    }
+    if let Err(e) = crate::persist::save_preset_as(path, new_name, active_preset) {
+        return ControlResponse::err(
+            format!("save-as failed: {e}"),
+            Some(format!("path: {}", path.display())),
+        );
+    }
+    cfg.presets
+        .insert(new_name.to_string(), active_preset.clone());
+    info!(
+        path = %path.display(),
+        preset = %new_name,
+        "control: saved active preset under new name",
+    );
+    ControlResponse::ok()
+}
+
+/// Report the daemon's writable config path (or `null`) so the GUI
+/// can show "Saves to: …" and grey out the Save button when the
+/// daemon was started without a resolvable config target.
+fn apply_config_path_command(config_path: Option<&std::path::Path>) -> ControlResponse {
+    match config_path {
+        Some(p) => ControlResponse::ok_with(serde_json::json!({ "path": p })),
+        None => ControlResponse::ok_with(serde_json::Value::Null),
     }
 }
 
@@ -645,6 +748,21 @@ fn apply_set_chain_command(
                 }
             };
             section_data.chain = new_names.to_vec();
+            // Prune per-effect tables for effects no longer in the
+            // chain. Without this, GUI flow "add → tune → remove"
+            // would leave an orphan `[<section>.<effect>]` table in
+            // `active_preset`, which then (a) survives Save into the
+            // TOML file, (b) trips the composite builder's
+            // `reject_unknown_table_keys` validation next time the
+            // preset is loaded (the operator sees "sub-table has no
+            // matching entry in chain"). Reserved keys (`model`,
+            // `model_config`, `fallback_threshold`) are not effect
+            // names but the `Set` handler could conceivably put them
+            // into `per_effect`; keep them so a future Set on a mask
+            // sub-section stays intact.
+            section_data.per_effect.retain(|key, _| {
+                new_names.iter().any(|n| n == key) || is_reserved_per_effect_key(key)
+            });
             info!(section = %section, chain = ?new_names, "control: replaced sub-chain");
             ControlResponse::ok()
         }
@@ -656,6 +774,18 @@ fn apply_set_chain_command(
             )
         }
     }
+}
+
+/// Mirror of `composite::builder::PIPELINE_RESERVED_KEYS`: keys that
+/// are NOT effect names but may legitimately appear in `per_effect`
+/// (e.g. `model` for the mask section). Pruning logic in
+/// [`apply_set_chain_command`] keeps these even when they are not in
+/// the active chain so a future Set on a mask field is preserved.
+fn is_reserved_per_effect_key(key: &str) -> bool {
+    matches!(
+        key,
+        "chain" | "model" | "model_config" | "fallback_threshold"
+    )
 }
 
 /// Whether the given sub-section of `preset` is currently `None`.

@@ -74,6 +74,11 @@ pub struct InitialState {
     /// Active preset's full configuration, as returned by
     /// `get_config { path: None }`. Consumed by the chain editor.
     pub active_config: serde_json::Value,
+    /// Writable TOML path the daemon will Save into, or `None` when
+    /// the daemon was started with no resolvable config. Surfaced by
+    /// the GUI's Save button tooltip and used to grey the button out
+    /// when `None`.
+    pub config_path: Option<PathBuf>,
 }
 
 /// Read timeout applied to the socket so a wedged daemon does not
@@ -208,12 +213,50 @@ fn handshake(stream: &mut BufferedStream) -> Result<InitialState, String> {
             .ok_or_else(|| format!("current_preset payload is not a string: {d}"))
     })?;
     let active_config = one(stream, &Command::GetConfig { path: None }, "get_config", Ok)?;
+    // Optional handshake step — older daemons that do not yet expose
+    // `ConfigPath` reply with `Err(unknown command)`. Surface that as
+    // "no writable path" instead of failing the whole handshake, so
+    // the GUI gracefully degrades to read-only mode and the operator
+    // still sees the editor.
+    let config_path = match stream.round_trip(&Command::ConfigPath) {
+        Ok(Response::Ok { data }) => parse_config_path(&data),
+        Ok(Response::Err { error, hint }) => {
+            tracing::warn!(
+                error,
+                ?hint,
+                "config_path command refused; Save will be disabled"
+            );
+            None
+        }
+        Ok(_) => None,
+        Err(reason) => return Err(format!("config_path failed: {reason}")),
+    };
     Ok(InitialState {
         inventory,
         presets,
         active_preset,
         active_config,
+        config_path,
     })
+}
+
+/// Decode the `ConfigPath` payload: `{"path":"…"}` → `Some(path)`,
+/// JSON `null` → `None`. Anything else is treated as `None` with a
+/// debug-level breadcrumb so a daemon shape change does not silently
+/// hide a real path.
+fn parse_config_path(data: &serde_json::Value) -> Option<PathBuf> {
+    if data.is_null() {
+        return None;
+    }
+    if let Some(p) = data.get("path").and_then(serde_json::Value::as_str) {
+        Some(PathBuf::from(p))
+    } else {
+        tracing::debug!(
+            ?data,
+            "config_path: unexpected payload shape; treating as None"
+        );
+        None
+    }
 }
 
 /// Execute one handshake step: round-trip the command, then either

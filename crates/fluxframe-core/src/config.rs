@@ -511,7 +511,7 @@ impl Default for RealtimeConfig {
 /// `per_effect` map collects every key that is not one of the
 /// reserved control fields. The composite builder rejects unknown
 /// effect names against the active registry.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct PipelineSection {
     /// Ordered list of effect names to apply within this sub-pipeline.
     #[serde(default)]
@@ -552,7 +552,7 @@ pub struct PipelineSection {
 /// `deny_unknown_fields` keeps typos in the section name surfaced
 /// loudly. The inner [`PipelineSection`] cannot use it because of
 /// `#[serde(flatten)]` on `per_effect`, but the wrapper has no flatten.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Preset {
     /// Mask sub-pipeline: segmentation model plus the chain of

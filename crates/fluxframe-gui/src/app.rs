@@ -94,6 +94,16 @@ pub enum AppMsg {
         /// Position to move (0-indexed).
         index: usize,
     },
+    /// User clicked Save — persist the current preset back into the
+    /// daemon's TOML config file.
+    Save,
+    /// User clicked "Save as…" — open the name-prompt dialog.
+    SaveAsPrompt,
+    /// User confirmed the "Save as…" dialog with a non-empty name.
+    SaveAs(String),
+    /// User clicked Revert — refetch the active preset from the
+    /// daemon, discarding any in-memory edits since the last sync.
+    Revert,
 }
 
 /// Record of an in-flight `Command::Set` correlated by request tag.
@@ -123,12 +133,28 @@ struct PendingSet {
 enum PendingKind {
     /// A `Command::Set` issued by a widget change.
     SetParam(PendingSet),
-    /// A `Command::GetConfig { path: None }` issued after Connected or
-    /// Reload — the `Ok` payload is the full preset tree.
+    /// A `Command::GetConfig { path: None }` issued after Connected,
+    /// Reload, or Revert — the `Ok` payload is the full preset tree.
     GetConfig,
+    /// Like [`GetConfig`](Self::GetConfig), but emitted as the
+    /// follow-up to a Revert — on `Ok` the AppModel re-syncs the
+    /// baseline so the dirty marker clears.
+    GetConfigForRevert,
     /// A `Command::CurrentPreset` issued after SetPreset or Reload —
     /// the `Ok` payload is a JSON string with the active preset name.
     CurrentPreset,
+    /// A `Command::SavePreset` issued by the Save button — on `Ok`,
+    /// baseline is re-synced from `active_config` so the dirty marker
+    /// clears without another `GetConfig` round-trip.
+    Save,
+    /// A `Command::SavePresetAs` issued by the Save-as dialog — on
+    /// `Ok`, the new preset name is added to the dropdown and the
+    /// baseline is re-synced.
+    SaveAs {
+        /// New preset name; needed by the Ok handler to update the
+        /// presets list and switch the dropdown.
+        new_name: String,
+    },
     /// Anything else we send (Reload, SetPreset, SetChain, …). Tracked
     /// for completeness so unknown-tag warnings stay meaningful.
     Other,
@@ -215,6 +241,9 @@ impl Component for AppModel {
         let bar_sender = sender.input_sender().clone();
         let reload_sender = sender.input_sender().clone();
         let preview_sender = sender.input_sender().clone();
+        let save_sender = sender.input_sender().clone();
+        let save_as_sender = sender.input_sender().clone();
+        let revert_sender = sender.input_sender().clone();
         let bar = preset_bar::build(preset_bar::PresetBarCallbacks {
             on_preset_change: Box::new(move |name| {
                 let _ = bar_sender.send(AppMsg::SetPreset(name));
@@ -224,6 +253,15 @@ impl Component for AppModel {
             }),
             on_preview: Box::new(move || {
                 let _ = preview_sender.send(AppMsg::OpenPreview);
+            }),
+            on_save: Box::new(move || {
+                let _ = save_sender.send(AppMsg::Save);
+            }),
+            on_save_as: Box::new(move || {
+                let _ = save_as_sender.send(AppMsg::SaveAsPrompt);
+            }),
+            on_revert: Box::new(move || {
+                let _ = revert_sender.send(AppMsg::Revert);
             }),
         });
 
@@ -368,6 +406,24 @@ impl Component for AppModel {
                     }
                 });
             }
+            AppMsg::Save => {
+                self.send_kind(Command::SavePreset, PendingKind::Save);
+            }
+            AppMsg::SaveAsPrompt => {
+                self.open_save_as_dialog();
+            }
+            AppMsg::SaveAs(name) => {
+                self.send_kind(
+                    Command::SavePresetAs { name: name.clone() },
+                    PendingKind::SaveAs { new_name: name },
+                );
+            }
+            AppMsg::Revert => {
+                self.send_kind(
+                    Command::GetConfig { path: None },
+                    PendingKind::GetConfigForRevert,
+                );
+            }
         }
     }
 }
@@ -440,7 +496,11 @@ impl AppModel {
                 self.state.presets = initial.presets;
                 self.state.active_preset = Some(initial.active_preset.clone());
                 self.state.inventory = initial.inventory;
+                // Synchronise both pointers — handshake is the clean
+                // baseline, so dirty starts at false.
+                self.state.baseline_config = initial.active_config.clone();
                 self.state.active_config = initial.active_config;
+                self.state.config_path = initial.config_path;
 
                 preset_bar::set_presets(
                     &self.preset_bar,
@@ -450,6 +510,7 @@ impl AppModel {
                 if let Some(active) = self.state.active_preset.as_deref() {
                     preset_bar::set_active_preset(&self.preset_bar, active);
                 }
+                self.refresh_dirty_indicator();
                 self.rebuild_chain_page();
             }
             WorkerOutput::Disconnected { reason } => {
@@ -474,17 +535,58 @@ impl AppModel {
                         // rollback target for future Sets on this path.
                         set_config_value(&mut self.state.active_config, &set.path, set.new.clone());
                         self.last_known_good.insert(set.path, set.new);
+                        // Any successful Set creates a delta against
+                        // the daemon's persisted baseline.
+                        self.refresh_dirty_indicator();
                     }
                     Some(PendingKind::CurrentPreset) => {
                         if let Some(name) = data.as_str() {
                             self.state.active_preset = Some(name.to_string());
                             preset_bar::set_active_preset(&self.preset_bar, name);
+                            self.refresh_dirty_indicator();
                         }
                     }
                     Some(PendingKind::GetConfig) => {
-                        // Full preset tree — refresh and rebuild.
-                        self.state.active_config = data;
+                        // Full preset tree — refresh and rebuild. A
+                        // GetConfig that follows SetPreset / Reload
+                        // pulls a fresh daemon snapshot, so the
+                        // baseline tracks active_config and the
+                        // dirty marker clears.
+                        self.state.active_config = data.clone();
+                        self.state.baseline_config = data;
+                        self.refresh_dirty_indicator();
                         self.rebuild_chain_page();
+                    }
+                    Some(PendingKind::GetConfigForRevert) => {
+                        // Revert pulls the canonical state, then
+                        // discards the in-memory edits.
+                        self.state.active_config = data.clone();
+                        self.state.baseline_config = data;
+                        self.last_known_good.clear();
+                        self.refresh_dirty_indicator();
+                        self.rebuild_chain_page();
+                    }
+                    Some(PendingKind::Save) => {
+                        // Daemon persisted the active preset; the
+                        // current in-memory state IS the new
+                        // baseline.
+                        self.state.baseline_config = self.state.active_config.clone();
+                        self.refresh_dirty_indicator();
+                    }
+                    Some(PendingKind::SaveAs { new_name }) => {
+                        // Daemon created the new preset block in
+                        // TOML; mirror in the local preset list so
+                        // the dropdown picks it up immediately. The
+                        // active preset is unchanged (Save-as does
+                        // NOT switch), so dirty stays as it was.
+                        if !self.state.presets.iter().any(|p| p == &new_name) {
+                            self.state.presets.push(new_name);
+                            preset_bar::set_presets(
+                                &self.preset_bar,
+                                &self.state.presets,
+                                self.state.active_preset.as_deref(),
+                            );
+                        }
                     }
                     Some(PendingKind::Other) | None => {
                         // Reload / SetPreset / SetChain or an
@@ -506,12 +608,19 @@ impl AppModel {
                         self.show_error_toast(&error, hint.as_deref());
                         self.rebuild_chain_page();
                     }
-                    Some(PendingKind::Other) => {
-                        // Reload / SetPreset / SetChain — no widget
-                        // rollback, but the user still deserves to
-                        // know the daemon refused the request (e.g.
-                        // "preset does not have a [post] sub-section"
-                        // on AddEffect into an absent section).
+                    Some(
+                        PendingKind::Other
+                        | PendingKind::Save
+                        | PendingKind::SaveAs { .. }
+                        | PendingKind::GetConfigForRevert,
+                    ) => {
+                        // Reload / SetPreset / SetChain / Save /
+                        // SaveAs / Revert: no widget rollback, but
+                        // the user still deserves to know the daemon
+                        // refused the request (e.g. "no writable
+                        // config path" on Save under
+                        // --no-default-config, or "preset already
+                        // exists" on SaveAs).
                         self.show_error_toast(&error, hint.as_deref());
                     }
                     Some(PendingKind::CurrentPreset | PendingKind::GetConfig) | None => {
@@ -526,6 +635,66 @@ impl AppModel {
                 tracing::warn!(tag, "unrecognised Response variant");
             }
         }
+    }
+
+    /// Push the AppState's dirty flag + writable config path into the
+    /// preset bar so the Save / Save as / Revert buttons and the
+    /// title-bar marker stay in sync with the in-memory delta.
+    fn refresh_dirty_indicator(&self) {
+        preset_bar::set_dirty_state(
+            &self.preset_bar,
+            self.state.is_dirty(),
+            self.state.config_path.as_deref(),
+            self.state.active_preset.as_deref(),
+        );
+    }
+
+    /// Show a small modal asking the operator for a new preset name.
+    /// On OK with a non-empty trimmed name, sends [`AppMsg::SaveAs`]
+    /// back into the AppModel. On Cancel or empty input, no-op.
+    ///
+    /// Uses [`adw::AlertDialog`] (the GTK 4.10+ replacement for
+    /// [`gtk::Dialog`]) so the dialog stays inside the application
+    /// window as a transient overlay rather than spawning a separate
+    /// OS-level window.
+    fn open_save_as_dialog(&self) {
+        let entry = gtk::Entry::builder()
+            .placeholder_text("Preset name")
+            .activates_default(true)
+            .build();
+
+        let dialog = adw::AlertDialog::new(
+            Some("Save preset as…"),
+            Some("Choose a name for the new preset."),
+        );
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("save", "Save");
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("save"));
+        dialog.set_close_response("cancel");
+        dialog.set_extra_child(Some(&entry));
+
+        // `activates_default = true` on the entry combined with
+        // `set_default_response("save")` on the dialog makes Enter
+        // commit the dialog without a separate signal handler.
+
+        let entry_for_response = entry.clone();
+        let sender = self.input_sender.clone();
+        dialog.connect_response(None, move |_dlg, response| {
+            if response == "save" {
+                let name = entry_for_response.text().to_string().trim().to_string();
+                if !name.is_empty() {
+                    let _ = sender.send(AppMsg::SaveAs(name));
+                }
+            }
+        });
+
+        // `AlertDialog::present` walks up the widget tree to find
+        // the toplevel; passing the headerbar (already parented into
+        // the application window) is enough to anchor the dialog
+        // transient over the right window — no need to plumb the
+        // root reference through AppModel.
+        dialog.present(Some(&self.preset_bar.root));
     }
 
     /// Surface a daemon error as a 5-second `AdwToast` overlay banner.

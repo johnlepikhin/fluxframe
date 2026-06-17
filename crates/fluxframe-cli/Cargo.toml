@@ -41,6 +41,14 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+# Edit a TOML document in place without losing comments or
+# formatting. Used by `persist::save_preset` to write GUI-modified
+# preset values back into the operator's config file: the
+# `toml_edit::DocumentMut` model preserves whitespace, comments, and
+# the relative order of sections we did not touch. Pinned to the same
+# minor as the version bundled inside `toml 0.8` so both crates agree
+# on the on-disk vocabulary.
+toml_edit = "0.22"
 crossbeam-channel = { workspace = true }
 ctrlc = { workspace = true }
 # Rayon's global thread pool defaults to `available_parallelism()`,

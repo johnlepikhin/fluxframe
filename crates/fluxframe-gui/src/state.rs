@@ -62,6 +62,17 @@ pub(crate) struct AppState {
     /// chain editor walks (`background.chain`,
     /// `background.per_effect.<name>.<field>`).
     pub(crate) active_config: serde_json::Value,
+    /// Last snapshot of `active_config` known to match what the
+    /// daemon has on disk (after Save) or in its TOML mirror (after
+    /// a fresh `GetConfig`). [`is_dirty`](Self::is_dirty) compares
+    /// `active_config` against this snapshot to drive the Save /
+    /// Revert button sensitivity and the title-bar dirty marker.
+    pub(crate) baseline_config: serde_json::Value,
+    /// Writable TOML path reported by the daemon's `ConfigPath`
+    /// command, or `None` when the daemon was started with no
+    /// resolvable config (e.g. `--no-default-config` and no
+    /// `--config`). The Save button is greyed out in that case.
+    pub(crate) config_path: Option<PathBuf>,
 }
 
 impl AppState {
@@ -76,7 +87,19 @@ impl AppState {
             active_preset: None,
             inventory: EffectInventory::default(),
             active_config: serde_json::Value::Null,
+            baseline_config: serde_json::Value::Null,
+            config_path: None,
         }
+    }
+
+    /// `true` when [`active_config`](Self::active_config) has diverged
+    /// from [`baseline_config`](Self::baseline_config) — i.e. the
+    /// operator changed something via the GUI that has not been
+    /// persisted (or reverted) yet. Drives the Save / Revert button
+    /// sensitivity.
+    #[must_use]
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.active_config != self.baseline_config
     }
 
     /// Look up a single per-effect parameter in the active config.

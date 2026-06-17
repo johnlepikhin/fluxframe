@@ -17,7 +17,7 @@ use fluxframe_core::{FluxConfig, FluxError, InputDevice};
 use tracing::{info, warn};
 
 use crate::cli::RunArgs;
-use crate::config_merge::{CliOverrides, apply, load};
+use crate::config_merge::{CliOverrides, apply, load, resolve_load_path, resolve_writable_path};
 use crate::preset;
 use crate::runtime::{
     InputSpec, OutputSpec, classify_input, classify_output, ensure_ctrlc_handler,
@@ -41,7 +41,17 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
         fps: args.fps,
     };
 
-    let cfg = load(args.common.config.as_deref())?;
+    // Two paths derived from the same flags:
+    //   - load_path: what to open at startup (None on a fresh install
+    //     with no XDG file → daemon boots from built-in defaults
+    //     silently);
+    //   - writable_path: where Save / Reload will target later (the
+    //     resolved XDG default even when the file does not yet exist,
+    //     so the GUI's first Save can bootstrap it).
+    let load_path = resolve_load_path(args.common.config.as_deref(), args.common.no_default_config);
+    let writable_path =
+        resolve_writable_path(args.common.config.as_deref(), args.common.no_default_config);
+    let cfg = load(load_path.as_deref())?;
     let cfg = apply(cfg, &overrides);
     cfg.validate()?;
 
@@ -60,12 +70,13 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
         height = cfg.input.height,
         fps = cfg.input.fps,
         preset = %preset_name,
+        config = ?writable_path,
         "merged configuration"
     );
 
     match &cfg.input.device {
-        InputDevice::Auto => run_auto(&cfg, &preset_name, args.common.config.as_deref()),
-        _ => run_once(&cfg, &preset_name, args.common.config.as_deref()),
+        InputDevice::Auto => run_auto(&cfg, &preset_name, writable_path.as_deref()),
+        _ => run_once(&cfg, &preset_name, writable_path.as_deref()),
     }
 }
 

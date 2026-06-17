@@ -18,6 +18,7 @@ mod control;
 mod idle;
 mod logging;
 mod metrics_reporter;
+mod persist;
 mod preset;
 mod runtime;
 mod runtime_metrics;

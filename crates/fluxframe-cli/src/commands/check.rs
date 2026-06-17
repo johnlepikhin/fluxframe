@@ -14,7 +14,7 @@ use fluxframe_gst::{V4l2DeviceKind, enumerate_devices};
 use tracing::{info, warn};
 
 use crate::cli::CheckArgs;
-use crate::config_merge::{CliOverrides, apply, load};
+use crate::config_merge::{CliOverrides, apply, load, resolve_load_path};
 use crate::preset;
 use crate::runtime::{InputSpec, OutputSpec, classify_input, classify_output};
 
@@ -32,7 +32,8 @@ pub fn run(args: CheckArgs) -> Result<(), FluxError> {
         height: None,
         fps: None,
     };
-    let cfg = load(args.common.config.as_deref())?;
+    let load_path = resolve_load_path(args.common.config.as_deref(), args.common.no_default_config);
+    let cfg = load(load_path.as_deref())?;
     let cfg = apply(cfg, &overrides);
     cfg.validate()?;
 

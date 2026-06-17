@@ -78,3 +78,67 @@ fn response_err_serialises_with_hint() {
         other => panic!("non-exhaustive Response variant: {other:?}"),
     }
 }
+
+/// `Command::SavePreset` is wire-stable: parameterless, encoded as
+/// the canonical `{"cmd":"save_preset"}` line.
+#[test]
+fn save_preset_command_round_trips() {
+    let cmd = Command::SavePreset;
+    let payload = serde_json::to_string(&cmd).expect("serialise");
+    assert_eq!(payload, r#"{"cmd":"save_preset"}"#);
+    let parsed: Command = serde_json::from_str(&payload).expect("parse");
+    assert_eq!(parsed, cmd);
+}
+
+/// `Command::SavePresetAs` carries a `name` field on the wire.
+#[test]
+fn save_preset_as_command_round_trips() {
+    let cmd = Command::SavePresetAs {
+        name: "experimental".into(),
+    };
+    let payload = serde_json::to_string(&cmd).expect("serialise");
+    let parsed: Command = serde_json::from_str(&payload).expect("parse");
+    assert_eq!(parsed, cmd);
+}
+
+/// `Command::SavePresetAs` rejects payloads without the `name`
+/// field — `deny_unknown_fields` on the enum keeps the GUI from
+/// accidentally sending a typo'd field name that the daemon would
+/// otherwise silently default.
+#[test]
+fn save_preset_as_rejects_missing_name() {
+    let res: Result<Command, _> = serde_json::from_str(r#"{"cmd":"save_preset_as"}"#);
+    assert!(res.is_err(), "missing `name` field must be rejected");
+}
+
+/// `Command::ConfigPath` is parameterless on the wire and round-trips
+/// cleanly through the typed enum.
+#[test]
+fn config_path_command_round_trips() {
+    let cmd = Command::ConfigPath;
+    let payload = serde_json::to_string(&cmd).expect("serialise");
+    assert_eq!(payload, r#"{"cmd":"config_path"}"#);
+    let parsed: Command = serde_json::from_str(&payload).expect("parse");
+    assert_eq!(parsed, cmd);
+}
+
+/// `ConfigPath` reply shape: `{"ok":"true","data":{"path":"…"}}` or
+/// `{"ok":"true","data":null}`. The GUI's `parse_config_path` helper
+/// is the authoritative parser; this test pins the JSON shape so a
+/// daemon-side refactor cannot silently break the GUI handshake.
+#[test]
+fn config_path_response_shapes_are_stable() {
+    let with_path = Response::ok_with(serde_json::json!({ "path": "/tmp/cfg.toml" }));
+    let payload = serde_json::to_string(&with_path).expect("serialise");
+    assert_eq!(
+        payload, r#"{"ok":"true","data":{"path":"/tmp/cfg.toml"}}"#,
+        "with-path payload shape regressed",
+    );
+
+    let null = Response::ok_with(serde_json::Value::Null);
+    let payload = serde_json::to_string(&null).expect("serialise");
+    assert_eq!(
+        payload, r#"{"ok":"true","data":null}"#,
+        "null payload shape regressed",
+    );
+}

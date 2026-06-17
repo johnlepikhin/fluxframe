@@ -50,6 +50,67 @@ fn parse_input_device(s: &str) -> InputDevice {
 /// configs are typically a few kilobytes.
 const MAX_CONFIG_BYTES: u64 = 1 << 20; // 1 MiB hard ceiling.
 
+/// Default sub-path under `$XDG_CONFIG_HOME` (or `$HOME/.config`)
+/// where the daemon looks for an operator-managed config when
+/// `--config` is omitted. Same path the GUI's Save button writes to
+/// for the first time, so the resolver answer is symmetric on read
+/// and write.
+const XDG_CONFIG_SUBPATH: &[&str] = &["fluxframe", "fluxframe.toml"];
+
+/// Compute the default config path under XDG conventions. The path
+/// is purely derived from environment variables — no filesystem
+/// access happens here, so the same answer is safe to use for both
+/// "where would I read from?" and "where would I write to?".
+fn default_xdg_path() -> PathBuf {
+    let base = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
+        PathBuf::from(xdg)
+    } else {
+        let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
+        let mut p = PathBuf::from(home);
+        p.push(".config");
+        p
+    };
+    let mut p = base;
+    for component in XDG_CONFIG_SUBPATH {
+        p.push(component);
+    }
+    p
+}
+
+/// Resolve the path the daemon will use as the source of truth for
+/// Save / Reload. Returns `None` only when the operator explicitly
+/// opted out of default-path lookup (`--no-default-config`) AND did
+/// not provide `--config`. The returned path is **not** required to
+/// exist on disk — the GUI's first Save bootstraps it.
+#[must_use]
+pub fn resolve_writable_path(explicit: Option<&Path>, no_default: bool) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        return Some(p.to_path_buf());
+    }
+    if no_default {
+        return None;
+    }
+    Some(default_xdg_path())
+}
+
+/// Resolve the path to open at daemon startup. Differs from
+/// [`resolve_writable_path`] only in returning `None` when the
+/// resolved default path is not yet on disk — fresh installs should
+/// boot from built-in defaults without surfacing an `Io` error.
+/// Explicit `--config` paths still error out if the file is missing
+/// (handled by [`load`]); the silent-fallback is XDG-default-only.
+#[must_use]
+pub fn resolve_load_path(explicit: Option<&Path>, no_default: bool) -> Option<PathBuf> {
+    if explicit.is_some() {
+        return explicit.map(Path::to_path_buf);
+    }
+    if no_default {
+        return None;
+    }
+    let p = default_xdg_path();
+    if p.exists() { Some(p) } else { None }
+}
+
 /// Load a config file if present, otherwise start from defaults.
 ///
 /// The file is opened once and its `metadata` is fetched from the same
@@ -203,5 +264,39 @@ fps = 15
         assert_eq!(cfg.input.width, 1280);
         assert_eq!(cfg.input.height, 720);
         assert_eq!(cfg.input.fps, 30);
+    }
+
+    #[test]
+    fn explicit_config_path_passes_through_resolver() {
+        let p = PathBuf::from("/tmp/explicit.toml");
+        assert_eq!(
+            resolve_writable_path(Some(p.as_path()), false),
+            Some(p.clone())
+        );
+        assert_eq!(
+            resolve_writable_path(Some(p.as_path()), true),
+            Some(p.clone()),
+            "explicit --config wins over --no-default-config"
+        );
+        assert_eq!(resolve_load_path(Some(p.as_path()), true), Some(p));
+    }
+
+    #[test]
+    fn no_default_returns_none_when_no_explicit() {
+        assert_eq!(resolve_writable_path(None, true), None);
+        assert_eq!(resolve_load_path(None, true), None);
+    }
+
+    #[test]
+    fn default_xdg_writable_path_is_returned_even_when_missing() {
+        // resolve_writable_path is environment-derived; we just check
+        // the shape rather than asserting a specific path (the test
+        // host's $XDG_CONFIG_HOME / $HOME drives the answer).
+        let path = resolve_writable_path(None, false).expect("path resolvable");
+        assert!(
+            path.ends_with("fluxframe/fluxframe.toml"),
+            "unexpected default writable path: {}",
+            path.display()
+        );
     }
 }

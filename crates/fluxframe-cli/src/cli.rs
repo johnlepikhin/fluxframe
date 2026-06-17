@@ -61,6 +61,14 @@ pub struct CommonRunArgs {
     /// Configuration file (TOML).
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
+    /// Skip the XDG default config lookup when `--config` is omitted.
+    /// Useful for CI / scripted runs that should never touch the
+    /// operator's `$XDG_CONFIG_HOME/fluxframe/fluxframe.toml`. Without
+    /// this flag (and without `--config`), the daemon will read from
+    /// the default path on startup if present, and the GUI's Save
+    /// button will write to it.
+    #[arg(long)]
+    pub no_default_config: bool,
     /// Override input device.
     #[arg(long, value_name = "PATH_OR_NAME")]
     pub input: Option<String>,

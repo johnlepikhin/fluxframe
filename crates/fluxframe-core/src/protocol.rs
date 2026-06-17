@@ -85,6 +85,27 @@ pub enum Command {
     /// preset against the freshly-parsed config. Equivalent to
     /// "edit the file then `set_preset <currently active>`".
     Reload,
+    /// Persist the currently-active preset back into the TOML config
+    /// file under its current name. Fails if the daemon was started
+    /// without a resolvable config path (e.g. `--no-default-config`
+    /// and no `--config`) — the GUI uses [`Command::ConfigPath`] up
+    /// front to grey out the Save button in that case.
+    SavePreset,
+    /// Persist the currently-active preset under a new name, creating
+    /// a fresh `[presets.NAME]` block in the TOML config file. Does
+    /// not switch the active preset; the GUI emits a follow-up
+    /// [`Command::SetPreset`] when "save and switch" is requested.
+    SavePresetAs {
+        /// New preset name. Identifier vocabulary: ASCII letters,
+        /// digits, underscores, dashes; non-empty.
+        name: String,
+    },
+    /// Report the TOML path the daemon will write to on Save. Returns
+    /// a JSON `{"path":"…"}` object when a writable path is
+    /// configured, or `null` when the daemon was started with no
+    /// resolvable config file. The GUI calls this once at handshake
+    /// time to decide whether to expose the Save button.
+    ConfigPath,
 }
 
 /// Response body returned for each command.
