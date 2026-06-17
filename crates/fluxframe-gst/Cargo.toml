@@ -10,10 +10,10 @@ description = "GStreamer + V4L2 capture/output integration for FluxFrame."
 
 [dependencies]
 fluxframe-core = { workspace = true }
-gstreamer = "0.23"
-gstreamer-app = "0.23"
-gstreamer-video = "0.23"
-glib = "0.20"
+gstreamer = { workspace = true }
+gstreamer-app = { workspace = true }
+gstreamer-video = { workspace = true }
+glib = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 libc = { workspace = true }

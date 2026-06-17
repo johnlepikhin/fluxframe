@@ -15,7 +15,7 @@ use gtk::glib;
 use relm4::prelude::{Component, ComponentParts, ComponentSender};
 use relm4::{Sender, WorkerController};
 
-use crate::components::{chain_page, preset_bar, status_page};
+use crate::components::{chain_page, preset_bar, preview, status_page};
 use crate::debounce::Debouncer;
 use crate::ipc::{IpcWorker, WorkerInput, WorkerOutput};
 use crate::state::{AppState, ConnectionStatus};
@@ -24,6 +24,11 @@ use crate::state::{AppState, ConnectionStatus};
 /// the operator to read but short enough to avoid stacking when a
 /// slider drags through several rejection cases.
 const TOAST_TIMEOUT_SECS: u32 = 5;
+
+// TODO(stage-15): pull `[output].device` from the daemon's `GetConfig`
+// round-trip instead of hardcoding /dev/video10. Same path used by both
+// the embedded preview and the detached gst-launch viewer.
+const DEFAULT_PREVIEW_DEVICE: &str = "/dev/video10";
 
 /// Messages the AppModel handles internally.
 #[derive(Debug)]
@@ -147,6 +152,13 @@ pub struct AppModel {
     /// Body container — we swap between a `StatusPage` (disconnected)
     /// and the chain editor (connected).
     body_container: gtk::Box,
+    /// Embedded live preview pane at the top of the window. Owns the
+    /// preview GStreamer pipeline; dropping it tears the pipeline
+    /// down. Kept as a field purely so its `Drop` runs at window
+    /// close — the widget itself is already parented into `outer`.
+    /// Underscore-prefixed so the compiler doesn't flag the
+    /// never-read field.
+    _preview: preview::Preview,
     /// Per-parameter debounce queue shared by all `param_row`
     /// instances on the chain page.
     debouncer: Debouncer,
@@ -173,6 +185,9 @@ impl Component for AppModel {
     type Widgets = ();
 
     fn init_root() -> Self::Root {
+        // Only sizing + maximisation here; the close-request handler is
+        // wired in `init()` once the `gtk::Paned` widget exists so we
+        // can persist its split position alongside the window geometry.
         let geometry = crate::persistence::load();
         let window = adw::ApplicationWindow::builder()
             .title("FluxFrame")
@@ -182,17 +197,6 @@ impl Component for AppModel {
         if geometry.maximized {
             window.maximize();
         }
-        // Persist geometry on close. `close-request` fires before
-        // teardown so the window's size is still queryable.
-        window.connect_close_request(|w| {
-            let state = crate::persistence::WindowState {
-                width: w.default_width(),
-                height: w.default_height(),
-                maximized: w.is_maximized(),
-            };
-            crate::persistence::save(&state);
-            glib::Propagation::Proceed
-        });
         window
     }
 
@@ -231,9 +235,54 @@ impl Component for AppModel {
         // `Connected` / `Disconnected`.
         body.append(&connecting_page("Talking to the FluxFrame daemon."));
 
+        let preview = preview::build(std::path::Path::new(DEFAULT_PREVIEW_DEVICE));
+
+        // `gtk::Paned` owns the split between preview (top) and the
+        // chain editor (bottom). The Paned takes the responsibility
+        // for the vertical allocation away from the outer Box, which
+        // means the Picture inside `preview.root` can use
+        // `content_fit = Contain` + `can_shrink = true` without
+        // fighting `gtk::Picture`'s aspect-ratio-derived natural
+        // size — the Paned tells the Picture exactly how tall it gets,
+        // and the Picture letterboxes inside that allocation.
+        //
+        // `resize_*_child = true` makes the divider track the parent
+        // size proportionally on resize; `shrink_*_child = false`
+        // stops the user from collapsing either half to zero by
+        // dragging the handle to an extreme.
+        let geometry = crate::persistence::load();
+        let paned = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .vexpand(true)
+            .hexpand(true)
+            .resize_start_child(true)
+            .resize_end_child(true)
+            .shrink_start_child(false)
+            .shrink_end_child(false)
+            .start_child(&preview.root)
+            .end_child(&body)
+            .position(geometry.resolved_preview_split())
+            .build();
+
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         outer.append(&bar.root);
-        outer.append(&body);
+        outer.append(&paned);
+
+        // Persist window geometry + Paned split on close. `close-request`
+        // fires before teardown so the window and paned are still
+        // queryable. `paned` is captured by move into the closure;
+        // the closure outlives `init()` because GTK holds the signal.
+        let paned_for_close = paned.clone();
+        root.connect_close_request(move |w| {
+            let state = crate::persistence::WindowState {
+                width: w.default_width(),
+                height: w.default_height(),
+                maximized: w.is_maximized(),
+                preview_split: Some(paned_for_close.position()),
+            };
+            crate::persistence::save(&state);
+            glib::Propagation::Proceed
+        });
 
         // Wrap the whole window body in a ToastOverlay so daemon
         // errors can fly over the chain page without disturbing the
@@ -256,6 +305,7 @@ impl Component for AppModel {
             next_tag: 0,
             preset_bar: bar,
             body_container: body,
+            _preview: preview,
             debouncer: Debouncer::new(),
             toast_overlay,
             last_known_good: HashMap::new(),
@@ -641,11 +691,10 @@ fn format_toast_error(error: &str, hint: Option<&str>) -> String {
 /// because the operation is best-effort.
 fn open_preview() {
     let mut cmd = ProcessCommand::new("gst-launch-1.0");
-    // TODO(stage-15): read [output].device from the daemon's active
-    // config instead of hardcoding /dev/video10.
+    let device_arg = format!("device={DEFAULT_PREVIEW_DEVICE}");
     cmd.args([
         "v4l2src",
-        "device=/dev/video10",
+        device_arg.as_str(),
         "!",
         "videoconvert",
         "!",

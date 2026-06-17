@@ -582,6 +582,10 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "fluxframe-core",
+ "glib 0.20.12",
+ "gstreamer",
+ "gstreamer-app",
+ "gstreamer-video",
  "gtk4",
  "libadwaita",
  "relm4",

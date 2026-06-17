@@ -17,6 +17,14 @@ fluxframe-core = { workspace = true }
 relm4 = { version = "0.10", default-features = false, features = ["macros", "libadwaita", "gnome_48"] }
 gtk = { package = "gtk4", version = "0.10", features = ["v4_18"] }
 adw = { package = "libadwaita", version = "0.8", features = ["v1_6", "gtk_v4_18"] }
+# Embedded preview pulls RGBA samples through `appsink` from a local
+# `v4l2src device=/dev/video10` pipeline and paints them into a
+# `gtk::Picture` via `gdk::MemoryTexture`. Pinned to the same minor
+# as `fluxframe-gst` so the workspace has one set of GStreamer ABIs.
+gstreamer = { workspace = true }
+gstreamer-app = { workspace = true }
+gstreamer-video = { workspace = true }
+glib = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

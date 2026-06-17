@@ -22,6 +22,9 @@ const MIN_HEIGHT: i32 = 150;
 const MAX_WIDTH: i32 = 8192;
 const MAX_HEIGHT: i32 = 8192;
 
+/// UI policy: preview occupies 1/N of the window height by default.
+const PREVIEW_SPLIT_DEFAULT_FRACTION: i32 = 3;
+
 /// Persisted window geometry — what we record between runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WindowState {
@@ -31,6 +34,14 @@ pub(crate) struct WindowState {
     pub height: i32,
     /// Whether the window was maximised when it last closed.
     pub maximized: bool,
+    /// Pixel offset of the `gtk::Paned` divider between the live
+    /// preview pane and the chain editor, measured from the top of
+    /// the Paned. `None` means "no preference recorded yet — compute
+    /// `height / PREVIEW_SPLIT_DEFAULT_FRACTION` at apply time".
+    /// `serde` defaults to `None` when the field is missing, which
+    /// makes old gui.json files (pre-Paned) still load cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_split: Option<i32>,
 }
 
 impl Default for WindowState {
@@ -39,6 +50,25 @@ impl Default for WindowState {
             width: 720,
             height: 540,
             maximized: false,
+            preview_split: None,
+        }
+    }
+}
+
+impl WindowState {
+    /// Resolve the initial `gtk::Paned::position` to apply.
+    ///
+    /// Persisted positive values are clamped to the current window
+    /// height so a tall-window-saved split doesn't push the preview
+    /// off-screen when the window opens at a smaller size. `None` and
+    /// any non-positive value fall back to one
+    /// `PREVIEW_SPLIT_DEFAULT_FRACTION`-th of the current window
+    /// height — matches the user's "upper third" expectation.
+    pub fn resolved_preview_split(&self) -> i32 {
+        match self.preview_split {
+            Some(p) if p > 0 => p.clamp(MIN_HEIGHT / PREVIEW_SPLIT_DEFAULT_FRACTION, self.height),
+            _ => (self.height / PREVIEW_SPLIT_DEFAULT_FRACTION)
+                .max(MIN_HEIGHT / PREVIEW_SPLIT_DEFAULT_FRACTION),
         }
     }
 }
@@ -49,6 +79,13 @@ impl Default for WindowState {
 fn sanitize(mut state: WindowState) -> WindowState {
     state.width = state.width.clamp(MIN_WIDTH, MAX_WIDTH);
     state.height = state.height.clamp(MIN_HEIGHT, MAX_HEIGHT);
+    // Defensive normalisation: a hand-edited non-positive value lands
+    // here as `Some(<=0)`. Collapse it to `None` so a round-trip
+    // through save/load doesn't preserve the absurd value, and so
+    // `resolved_preview_split` deals with a single "unset" shape.
+    if state.preview_split.is_some_and(|p| p <= 0) {
+        state.preview_split = None;
+    }
     state
 }
 
@@ -190,12 +227,83 @@ mod tests {
             width: 1024,
             height: 768,
             maximized: true,
+            preview_split: Some(256),
         };
         save_to(&path, &original);
         let loaded = load_from(&path);
         assert_eq!(loaded.width, original.width);
         assert_eq!(loaded.height, original.height);
         assert_eq!(loaded.maximized, original.maximized);
+        assert_eq!(loaded.preview_split, original.preview_split);
+    }
+
+    #[test]
+    fn missing_preview_split_loads_as_unset() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = config_path_in(tmp.path());
+        let dir = path.parent().expect("path has parent");
+        std::fs::create_dir_all(dir).expect("create fluxframe dir");
+        // Simulate a pre-Paned gui.json (no preview_split field).
+        std::fs::write(
+            &path,
+            r#"{"width": 800, "height": 600, "maximized": false}"#,
+        )
+        .expect("write json");
+        let state = load_from(&path);
+        assert_eq!(state.preview_split, None);
+        // height / PREVIEW_SPLIT_DEFAULT_FRACTION = 600 / 3 = 200
+        assert_eq!(state.resolved_preview_split(), 200);
+    }
+
+    #[test]
+    fn negative_preview_split_is_sanitized_to_unset() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = config_path_in(tmp.path());
+        let dir = path.parent().expect("path has parent");
+        std::fs::create_dir_all(dir).expect("create fluxframe dir");
+        std::fs::write(
+            &path,
+            r#"{"width": 800, "height": 600, "maximized": false, "preview_split": -42}"#,
+        )
+        .expect("write json");
+        let state = load_from(&path);
+        assert_eq!(state.preview_split, None);
+    }
+
+    #[test]
+    fn resolved_preview_split_clamps_above_height() {
+        let state = WindowState {
+            width: 800,
+            height: 600,
+            maximized: false,
+            preview_split: Some(9999),
+        };
+        assert_eq!(state.resolved_preview_split(), 600);
+    }
+
+    #[test]
+    fn resolved_preview_split_clamps_below_min() {
+        let state = WindowState {
+            width: 800,
+            height: 600,
+            maximized: false,
+            preview_split: Some(10),
+        };
+        assert_eq!(
+            state.resolved_preview_split(),
+            MIN_HEIGHT / PREVIEW_SPLIT_DEFAULT_FRACTION,
+        );
+    }
+
+    #[test]
+    fn resolved_preview_split_passes_through_valid_range() {
+        let state = WindowState {
+            width: 800,
+            height: 600,
+            maximized: false,
+            preview_split: Some(250),
+        };
+        assert_eq!(state.resolved_preview_split(), 250);
     }
 
     #[test]
@@ -251,6 +359,7 @@ mod tests {
             width: 800,
             height: 600,
             maximized: false,
+            preview_split: None,
         };
         save_to(&path, &state);
         let dir = path.parent().expect("path has parent");

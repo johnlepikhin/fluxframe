@@ -75,6 +75,13 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # = false` drops the optional `stream` (async/futures) feature — we run
 # the detector on a dedicated synchronous thread with a NONBLOCK fd.
 inotify = { version = "0.11", default-features = false }
+# GStreamer-rs stack shared by fluxframe-gst (capture/output) and
+# fluxframe-gui (embedded live preview). Pinned to the same minor
+# so the workspace has one ABI version; bump in lockstep.
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-video = "0.23"
+glib = "0.20"
 # GTK 4 + libadwaita stack lives in `fluxframe-gui/Cargo.toml` directly
 # because the `package = "..."` rename does not interact cleanly with
 # `workspace.dependencies` inheritance. Version pins documented there.

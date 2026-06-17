@@ -16,6 +16,7 @@ mod components {
     pub mod chain_page;
     pub mod param_row;
     pub mod preset_bar;
+    pub mod preview;
     pub mod status_page;
 }
 
@@ -49,6 +50,16 @@ fn main() {
                 .add_directive("info".parse().expect("static 'info' directive parses")),
         )
         .init();
+
+    // GStreamer is used by the embedded preview pane (see
+    // crates/fluxframe-gui/src/components/preview.rs). gst_init is
+    // idempotent; calling it once here guarantees the pipeline-
+    // construction sites can assume "GStreamer is up". Failure is
+    // logged but does not abort — the preview will be inert and the
+    // rest of the GUI keeps working.
+    if let Err(e) = gstreamer::init() {
+        tracing::warn!(error = %e, "gstreamer::init failed; embedded preview will be inert");
+    }
 
     let args = Args::parse();
     let socket_path = args.socket.unwrap_or_else(default_socket_path);
