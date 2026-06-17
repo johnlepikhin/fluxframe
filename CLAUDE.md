@@ -4,27 +4,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-Stage 1 complete: end-to-end pipeline runs synthetic video through the
-effect chain (passthrough only) and emits to fakesink/autovideosink.
-GStreamer integration lives in `fluxframe-gst` (capture, output, bus
-events, frame slot). Ctrl-C, basic logging and the latest-frame
-drop-old policy are wired.
+Stages 0–15 complete, plus GUI-initiated TOML persistence on top.
+End-to-end: V4L2 capture (or `videotestsrc`) → composite (mask + bg
++ fg sub-chains) → optional `[post]` chain → v4l2loopback /
+autovideosink / fakesink / pipewiresink. ONNX Runtime + OpenVINO
+inference backends, `wgpu` blur seam, named presets, UNIX control
+socket with live `set` / `set_chain` / `set_preset` / `reload` and
+write-back `save_preset` / `save_preset_as` / `config_path`.
+`fluxframe-gui` (GTK4 / libadwaita) is the slider-style editor with
+embedded preview pane, dirty marker and explicit Save / Save as /
+Revert. Idle mode drops the camera + publishes a placeholder when
+no consumer is reading from `/dev/video10`.
 
-Coming up: Stage 2 wires V4L2 capture and the `v4l2loopback` sink,
-plus `list` and `check` device probing. Implementation plan:
-`doc/plan/000-overview.md` and per-stage detail in `doc/plan/stage-*.md`.
-Original spec: `doc/ideas/001-mvp.md`.
+Per-stage detail: `doc/plan/000-overview.md` and `doc/plan/stage-*.md`.
+Original spec: `doc/ideas/001-mvp.md`. README.md is the operator-
+facing summary.
 
 ## Workspace layout
 
-Cargo workspace with four crates under `crates/`:
+Cargo workspace with five crates under `crates/`:
 
-- `fluxframe-core` — `VideoFrame`, traits (`VideoEffect`, `InferenceEngine`, `VideoSource`, `VideoSink`), error model, `FluxConfig`. Zero GStreamer/ONNX deps; `#![forbid(unsafe_code)]`.
-- `fluxframe-gst` — GStreamer init plus `bus`/`input`/`output`/`slot`/`frame_conv`/`util` modules wiring the Stage 1 pipeline; v4l2 enumeration remains a stub until Stage 2. Bus events arrive as a typed `BusEvent` enum via `BusListener::spawn`.
-- `fluxframe-effects` — effect registry, chain, built-in effects. ML and image-processing helpers live as modules here (no separate crates until a second consumer appears).
-- `fluxframe-cli` — `fluxframe` binary: clap subcommands, tracing init, config loader, CLI/file merge.
+- `fluxframe-core` — `VideoFrame`, traits (`VideoEffect`, `InferenceEngine`, `VideoSource`, `VideoSink`), error model, `FluxConfig`, control-socket wire types (`protocol::Command` / `Response`). Zero GStreamer/ONNX deps; `#![forbid(unsafe_code)]`.
+- `fluxframe-gst` — GStreamer init plus `bus`/`input`/`output`/`slot`/`frame_conv`/`util`/`v4l2_caps` modules. Bus events arrive as a typed `BusEvent` enum via `BusListener::spawn`. Owns the V4L2 capture + v4l2loopback / pipewiresink output paths.
+- `fluxframe-effects` — effect registry, chain, composite (mask + plane + post sub-chains), built-in effects (ML segmentation, blur, color_fill, image_fill, pixelate, sharpen, vignette, exposure_correct, auto_frame, mirror, …). ML, GPU-blur and image-processing helpers live as modules here.
+- `fluxframe-cli` — `fluxframe` binary: clap subcommands (`list`, `check`, `run`, `benchmark`), tracing init, config loader (`config_merge`: XDG default lookup + `--no-default-config`), supervisor (`runtime`), control listener (`control`), TOML write-back (`persist`), idle-mode supervisor (`idle`).
+- `fluxframe-gui` — `fluxframe-gui` binary: relm4 + GTK4 / libadwaita client over the UNIX control socket. Embedded live preview, chain editor, dirty tracking, Save / Save as / Revert.
 
-Spec §7 prescribes 9 crates; the 4-crate split is a deliberate scope decision documented in `doc/plan/000-overview.md`.
+Spec §7 prescribes 9 crates; the 5-crate split is a deliberate scope decision documented in `doc/plan/000-overview.md` — config / metrics live inside `fluxframe-cli`, v4l2 helpers inside `fluxframe-gst`, ML / processing inside `fluxframe-effects`.
 
 ## Dev environment (Guix)
 

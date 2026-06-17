@@ -6,15 +6,21 @@ The first production effect is `background_blur`. The architecture is deliberate
 
 ## Status
 
-**Stage 10 — named-preset config in place.** Pipeline runs synthetic
-video (testsrc) or V4L2 capture → segmented composite (mask + background +
-foreground sub-pipelines) → fakesink, v4l2loopback or autovideosink.
-`fluxframe list` / `fluxframe check` verify devices and the selected
-preset's pipeline. ONNX Runtime is wired through
-`fluxframe-effects::ml::OnnxEngine`; `fluxframe benchmark --model <path>`
-exercises the inference layer in isolation. Composite effects (mask
-post-processing + per-plane filters such as `blur`, `color_fill`,
-`pixelate`) are configured per preset.
+**Stage 15 + persistence — production-ready end-to-end loop.**
+Pipeline runs synthetic video (testsrc) or V4L2 capture → segmented
+composite (mask + background + foreground sub-pipelines) → fakesink,
+v4l2loopback, autovideosink, or `pipewiresink`. `fluxframe list` /
+`fluxframe check` verify devices and the selected preset's pipeline.
+ONNX Runtime (via `fluxframe-effects::ml::OnnxEngine`) and a slim
+OpenVINO backend are wired; `fluxframe benchmark --model <path>`
+exercises inference in isolation. A UNIX control socket exposes
+live reconfiguration (`set`, `set_chain`, `set_preset`, `reload`)
+and now write-back persistence (`save_preset`, `save_preset_as`)
+into the TOML config. A GTK4/libadwaita companion app
+(`fluxframe-gui`) drives the same surface with sliders, an embedded
+live preview pane, dirty-state indication and explicit Save / Save
+as / Revert buttons. Idle mode drops the camera and publishes a
+placeholder when no consumer is attached.
 
 ## Build
 
@@ -85,6 +91,27 @@ load status (the model path comes from the selected preset's
 `fluxframe benchmark --model <path> --duration 5` runs an
 inference-only latency benchmark.
 
+## Config file location
+
+`fluxframe run` and `fluxframe check` resolve the TOML config file in
+this order (`fluxframe benchmark` does not consult any config — it
+runs inference-only against `--model PATH`):
+
+1. **`--config PATH`** — explicit override, wins over everything.
+2. **`$XDG_CONFIG_HOME/fluxframe/fluxframe.toml`** (or
+   `$HOME/.config/fluxframe/fluxframe.toml` when `XDG_CONFIG_HOME`
+   is unset) — the default lookup path. Same path the GUI's Save
+   button writes to.
+3. **Built-in defaults** — when neither of the above resolves to an
+   existing file, the daemon boots from compiled-in defaults
+   silently.
+
+Pass **`--no-default-config`** to skip step 2 entirely. Useful for
+CI / scripted runs that must never touch the operator's home
+directory. With both `--no-default-config` and no `--config`,
+`save_preset` / the GUI Save button return a structured error
+(there is no writable target).
+
 ## Named presets
 
 The composite pipeline is described under `[presets.NAME]` sections in
@@ -106,7 +133,9 @@ optional):
   alpha-composite step. Effects here see the already-blended frame
   plus a read-only view of the upscaled mask. Available post-effects:
   `passthrough`, `auto_frame` (smart-crop + recenter around the
-  detected person). Requires `[mask]` to be set.
+  detected person), `mirror` (horizontal flip — counters the
+  self-view mirroring conference apps apply so on-camera text reads
+  right-way-round). Requires `[mask]` to be set.
 
 Select a preset at runtime with `--preset NAME`. When the flag is
 omitted, the CLI looks up `presets.default` and exits with a
@@ -218,12 +247,16 @@ Talk to the daemon via `socat`, `nc -U`, or any UNIX-socket client:
 ```bash
 echo '{"cmd":"list_presets"}'                | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
 echo '{"cmd":"current_preset"}'              | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
+echo '{"cmd":"config_path"}'                 | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
 echo '{"cmd":"set_preset","name":"blur"}'    | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
 echo '{"cmd":"set","path":"background.blur.radius","value":40}' \
      | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
 echo '{"cmd":"set_chain","section":"background","chain":["blur","vignette"]}' \
      | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
 echo '{"cmd":"get_config","path":"background.blur"}' \
+     | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
+echo '{"cmd":"save_preset"}'                 | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
+echo '{"cmd":"save_preset_as","name":"experimental"}' \
      | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
 echo '{"cmd":"reload"}'                      | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
 ```
@@ -241,16 +274,34 @@ Capabilities:
   `background.blur.radius`). Sub-millisecond — perfect for
   slider-style tuning.
 * **`set_chain <section> [names...]`** — add or remove effects from a
-  sub-chain (`mask`, `background`, `foreground`, `post`).
+  sub-chain (`mask`, `background`, `foreground`, `post`). Pruning is
+  automatic: per-effect parameter tables for effects no longer in
+  the chain are dropped so the next `save_preset` cannot leave an
+  orphan `[<section>.<effect>]` block on disk.
 * **`reload`** — re-read the TOML file from disk and rebuild the
   active preset. CLI overrides given at startup stay in effect.
 * **`get_config [path]`** — introspect the live preset, optionally at
   a dot-path subtree.
+* **`config_path`** — report the writable TOML path the daemon will
+  Save into, or `null` when the daemon was started with
+  `--no-default-config` and no `--config`. The GUI calls this once
+  on handshake to grey out its Save button when no target is
+  available.
+* **`save_preset`** — persist the in-memory active preset back into
+  the TOML config. Comments and unrelated tables are preserved;
+  `[presets.NAME]` and any `[presets.NAME.*]` sub-tables are
+  rewritten as one contiguous block. Atomic write
+  (sibling `*.tmp.<pid>` + `rename`).
+* **`save_preset_as { name }`** — same as `save_preset` but writes
+  under a fresh preset name. Fails if `name` already exists; the
+  daemon's in-memory preset map is updated so a follow-up
+  `list_presets` reflects the new entry.
 
 Constraints: no auth beyond fs perms; the `[input]`/`[output]`
 sections cannot be reconfigured live (would require a GStreamer
-pipeline restart). Runtime tweaks are ephemeral — they are NOT
-written back to `fluxframe.toml`.
+pipeline restart). `save_preset` writes back to disk, but
+`[input]`/`[output]` and other root tables remain operator-managed
+and are never touched.
 
 ## Live tuning via fluxframe-gui (Stage 14)
 
@@ -270,6 +321,22 @@ What you get:
 * **Preset switcher** — a DropDown in the header bar lists every
   preset defined in the loaded TOML; selecting one dispatches
   `set_preset` and the chain editor refreshes.
+* **Save / Save as… / Revert** — a button group next to the
+  switcher commits the in-memory preset back to the TOML
+  (`save_preset`), forks the current state into a new named preset
+  (`save_preset_as`), or discards local edits by re-pulling the
+  daemon baseline (`get_config`). The window title gains a `●`
+  prefix when there are unsaved edits; Save is greyed out when the
+  daemon has no writable config target (e.g. started with
+  `--no-default-config` and no `--config`).
+* **Embedded live preview** — a `gtk::Paned` at the top of the
+  window streams `/dev/video10` directly into a `gtk::Picture` so
+  you can see the daemon's output while tuning, with the chain
+  editor below the split. The header bar also keeps an **Open
+  preview** button that spawns a detached
+  `gst-launch-1.0 v4l2src device=/dev/video10 ! videoconvert !
+  autovideosink` viewer in a separate window (handy when you want
+  the preview to outlive the GUI).
 * **Chain editor** — one page with four groups (mask /
   background / foreground / post). Each effect is an expandable row
   with `↑` / `↓` / `✕` suffix buttons; clicking the `+` MenuButton on
@@ -282,16 +349,14 @@ What you get:
   before hitting the daemon.
 * **Rollback toasts** — if the daemon rejects a `set` (e.g. out of
   range), an `AdwToast` shows the error and the widget snaps back to
-  the last-good value.
-* **Open preview** — a button in the header bar spawns
-  `gst-launch-1.0 v4l2src device=/dev/video10 ! videoconvert !
-  autovideosink` so you can watch the daemon's output while tuning.
+  the last-good value. Toasts also surface Save / Save as / Revert
+  failures (e.g. duplicate preset name on Save as).
 * **Keyboard shortcuts**:
   * `Ctrl+R` / `F5` — `reload` daemon TOML + refetch state.
   * `Ctrl+Q` — quit.
   * `Ctrl+1` … `Ctrl+9` — switch to preset slot N (1-indexed in the
     preset list).
-* **Window geometry** is persisted to
+* **Window geometry + split position** is persisted to
   `$XDG_CONFIG_HOME/fluxframe/gui.json` (or `~/.config/fluxframe/`)
   between runs.
 
@@ -479,6 +544,7 @@ without enabling debug-level globally.
 | 13. Live reconfiguration via UNIX control socket | done |
 | 14. GTK4 GUI client over the control socket | done |
 | 15. Idle mode (consumer-aware lifecycle) | done (DeepIdle ONNX drop deferred) |
+| 16. GUI-initiated TOML persistence (`save_preset` / Save as / Revert) | done |
 
 ## License
 
