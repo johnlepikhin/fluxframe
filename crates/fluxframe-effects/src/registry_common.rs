@@ -120,57 +120,23 @@ pub(crate) fn assert_metadata_defaults_round_trip<E>(
 ) where
     E: ?Sized + 'static,
 {
-    use fluxframe_core::metadata::ParamKind;
-    'effects: for name in reg.names() {
+    for name in reg.names() {
         let meta = reg.metadata(name).expect("metadata");
         let mut effect = reg.build(name).expect("factory");
-        let mut table = toml::map::Map::new();
-        for p in meta.params {
-            // The `Path` arms and the trailing wildcard all `continue`,
-            // but the explicit `Path { default: None, required: false }`
-            // documents *why* unset optional paths skip; collapsing it
-            // into `_` would hide that intent.  The wildcard exists
-            // solely for cross-crate `#[non_exhaustive]`.
-            #[allow(clippy::match_same_arms)]
-            let value = match p.kind {
-                ParamKind::Float { default, .. } => toml::Value::Float(f64::from(default)),
-                ParamKind::Integer { default, .. } => toml::Value::Integer(default),
-                ParamKind::Bool { default } => toml::Value::Boolean(default),
-                ParamKind::Color { default } => toml::Value::Array(vec![
-                    toml::Value::Integer(default[0].into()),
-                    toml::Value::Integer(default[1].into()),
-                    toml::Value::Integer(default[2].into()),
-                ]),
-                ParamKind::Path {
-                    default: Some(p), ..
-                } => toml::Value::String(p.to_string()),
-                ParamKind::Path {
-                    default: None,
-                    required: false,
-                    ..
-                } => continue,
-                ParamKind::Path {
-                    default: None,
-                    required: true,
-                    ..
-                } => {
-                    // image_fill-shaped param: no defaultable path.
-                    // Skip the whole effect — it would also fail the
-                    // trip with an empty table.
-                    continue 'effects;
-                }
-                ParamKind::Enum { default, .. } => toml::Value::String(default.to_string()),
-                // `ParamKind` is `#[non_exhaustive]` cross-crate.  Any
-                // future variant has to teach this helper how to
-                // synthesise a TOML default; until then, treat
-                // unknown variants as "skip the param" rather than
-                // silently materialising an incorrect value.
-                _ => continue,
-            };
-            table.insert(p.name.to_string(), value);
-        }
-        let params = toml::Value::Table(table);
-        configure(&mut effect, params)
+        // `EffectMetadata::default_config` is the single source of
+        // truth — same helper the runtime uses on the chain-add path.
+        // Effects whose metadata declares a required path with no
+        // default (`image_fill`, `composite`) are skipped here for
+        // the same reason the runtime rejects them: there is no
+        // sensible default.
+        let Ok(table) = meta.default_config() else {
+            eprintln!(
+                "assert_metadata_defaults_round_trip: skipping effect '{name}' \
+                 (metadata has required field(s) without defaults)"
+            );
+            continue;
+        };
+        configure(&mut effect, toml::Value::Table(table))
             .unwrap_or_else(|e| panic!("effect '{name}' rejected its own METADATA defaults: {e}"));
     }
 }

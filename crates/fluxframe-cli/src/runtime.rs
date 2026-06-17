@@ -790,78 +790,174 @@ fn build_and_configure_subchain(
         }
     }
 
+    /// Synthesise a default TOML config for an effect that has no
+    /// explicit `per_effect` block in the incoming preset.
+    ///
+    /// Branches:
+    /// - metadata present + every required param has a default → emit a
+    ///   populated [`toml::Table`].
+    /// - metadata present but at least one required param has no
+    ///   default → return [`EffectError::InvalidConfig`] naming the
+    ///   missing field(s) verbatim so the GUI / TUI can surface them
+    ///   to the user (instead of the cryptic serde error that would
+    ///   otherwise come out of `configure`).
+    /// - metadata absent → programming error: registering an effect
+    ///   without `pub const METADATA: EffectMetadata` is forbidden;
+    ///   return an explicit `InvalidConfig` rather than silently
+    ///   passing an empty table down to `configure` (which is the
+    ///   exact failure mode this whole helper was added to eliminate).
+    fn synthesise_default(
+        name: &str,
+        lookup_metadata: impl Fn(&str) -> Option<&'static fluxframe_core::EffectMetadata>,
+    ) -> Result<toml::Value, fluxframe_core::EffectError> {
+        match lookup_metadata(name).map(fluxframe_core::EffectMetadata::default_config) {
+            Some(Ok(table)) => Ok(toml::Value::Table(table)),
+            Some(Err(missing)) => Err(fluxframe_core::EffectError::InvalidConfig {
+                // `name` is guaranteed by `build_chain` to be a registered
+                // snake_case literal; safe to surface in error/log messages.
+                name: name.to_string(),
+                reason: format!(
+                    "missing required field(s) {}; set them via the parameter editor \
+                     (or in fluxframe.toml) before adding this effect to a chain",
+                    missing
+                        .iter()
+                        .map(|f| format!("`{f}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+                hint: Some(format!(
+                    "set the following field(s) on `{name}` explicitly, \
+                     e.g. via the parameter editor: {}",
+                    missing
+                        .iter()
+                        .map(|f| format!("`{f}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )),
+            }),
+            None => Err(fluxframe_core::EffectError::InvalidConfig {
+                // `name` is guaranteed by `build_chain` to be a registered
+                // snake_case literal; safe to surface in error/log messages.
+                name: name.to_string(),
+                reason: "effect is registered without metadata; cannot synthesise defaults".into(),
+                hint: Some(
+                    "this is a programming error — every effect must declare \
+                     `pub const METADATA: EffectMetadata`. Please file a bug."
+                        .into(),
+                ),
+            }),
+        }
+    }
+
     fn configure_each<E>(
         chain: &mut [Box<E>],
         names: &[String],
         per_effect: &std::collections::BTreeMap<String, toml::Value>,
+        lookup_metadata: impl Fn(&str) -> Option<&'static fluxframe_core::EffectMetadata>,
     ) -> Result<(), fluxframe_core::EffectError>
     where
         E: ?Sized + Configure,
     {
         for (effect, name) in chain.iter_mut().zip(names.iter()) {
-            let params = per_effect
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+            // No explicit per_effect block — happens when a chain
+            // entry was added via the GUI (`Command::SetChain`
+            // with just names). Synthesise a default config from
+            // the effect's metadata so we don't hand `configure`
+            // an empty table that fails for required-field
+            // structs (color_fill.rgb, image_fill.path).
+            let params = if let Some(v) = per_effect.get(name).cloned() {
+                v
+            } else {
+                tracing::debug!(effect = %name, "synthesising default config from metadata");
+                synthesise_default(name, &lookup_metadata)?
+            };
             effect.configure_mut(params)?;
         }
         Ok(())
     }
     match section {
         SubchainKind::Mask => {
-            let mut built = mask_effects::default_registry()
-                .build_chain(names)
-                .map_err(|e| SubChainError {
-                    reason: format!("mask chain build failed: {e}"),
-                    hint: None,
-                })?;
-            configure_each::<dyn fluxframe_core::MaskEffect>(&mut built, names, per_effect)
-                .map_err(|e| SubChainError {
+            let registry = mask_effects::default_registry();
+            let mut built = registry.build_chain(names).map_err(|e| SubChainError {
+                reason: format!("mask chain build failed: {e}"),
+                hint: None,
+            })?;
+            configure_each::<dyn fluxframe_core::MaskEffect>(&mut built, names, per_effect, |n| {
+                registry.metadata(n)
+            })
+            .map_err(|e| match &e {
+                fluxframe_core::EffectError::InvalidConfig { reason, hint, .. } => SubChainError {
+                    reason: reason.clone(),
+                    hint: hint.clone(),
+                },
+                _ => SubChainError {
                     reason: format!("configure failed: {e}"),
                     hint: None,
-                })?;
+                },
+            })?;
             Ok(SubChainPayload::Mask(built))
         }
         SubchainKind::Background => {
-            let mut built = plane_effects::default_registry()
-                .build_chain(names)
-                .map_err(|e| SubChainError {
-                    reason: format!("background chain build failed: {e}"),
-                    hint: None,
-                })?;
-            configure_each::<dyn fluxframe_core::PlaneEffect>(&mut built, names, per_effect)
-                .map_err(|e| SubChainError {
+            let registry = plane_effects::default_registry();
+            let mut built = registry.build_chain(names).map_err(|e| SubChainError {
+                reason: format!("background chain build failed: {e}"),
+                hint: None,
+            })?;
+            configure_each::<dyn fluxframe_core::PlaneEffect>(&mut built, names, per_effect, |n| {
+                registry.metadata(n)
+            })
+            .map_err(|e| match &e {
+                fluxframe_core::EffectError::InvalidConfig { reason, hint, .. } => SubChainError {
+                    reason: reason.clone(),
+                    hint: hint.clone(),
+                },
+                _ => SubChainError {
                     reason: format!("configure failed: {e}"),
                     hint: None,
-                })?;
+                },
+            })?;
             Ok(SubChainPayload::Background(built))
         }
         SubchainKind::Foreground => {
-            let mut built = plane_effects::default_registry()
-                .build_chain(names)
-                .map_err(|e| SubChainError {
-                    reason: format!("foreground chain build failed: {e}"),
-                    hint: None,
-                })?;
-            configure_each::<dyn fluxframe_core::PlaneEffect>(&mut built, names, per_effect)
-                .map_err(|e| SubChainError {
+            let registry = plane_effects::default_registry();
+            let mut built = registry.build_chain(names).map_err(|e| SubChainError {
+                reason: format!("foreground chain build failed: {e}"),
+                hint: None,
+            })?;
+            configure_each::<dyn fluxframe_core::PlaneEffect>(&mut built, names, per_effect, |n| {
+                registry.metadata(n)
+            })
+            .map_err(|e| match &e {
+                fluxframe_core::EffectError::InvalidConfig { reason, hint, .. } => SubChainError {
+                    reason: reason.clone(),
+                    hint: hint.clone(),
+                },
+                _ => SubChainError {
                     reason: format!("configure failed: {e}"),
                     hint: None,
-                })?;
+                },
+            })?;
             Ok(SubChainPayload::Foreground(built))
         }
         SubchainKind::Post => {
-            let mut built = post_effects::default_registry()
-                .build_chain(names)
-                .map_err(|e| SubChainError {
-                    reason: format!("post chain build failed: {e}"),
-                    hint: None,
-                })?;
-            configure_each::<dyn fluxframe_core::PostEffect>(&mut built, names, per_effect)
-                .map_err(|e| SubChainError {
+            let registry = post_effects::default_registry();
+            let mut built = registry.build_chain(names).map_err(|e| SubChainError {
+                reason: format!("post chain build failed: {e}"),
+                hint: None,
+            })?;
+            configure_each::<dyn fluxframe_core::PostEffect>(&mut built, names, per_effect, |n| {
+                registry.metadata(n)
+            })
+            .map_err(|e| match &e {
+                fluxframe_core::EffectError::InvalidConfig { reason, hint, .. } => SubChainError {
+                    reason: reason.clone(),
+                    hint: hint.clone(),
+                },
+                _ => SubChainError {
                     reason: format!("configure failed: {e}"),
                     hint: None,
-                })?;
+                },
+            })?;
             Ok(SubChainPayload::Post(built))
         }
     }
@@ -2681,5 +2777,56 @@ mod tests {
         let resp = apply_reload_command(&mut cfg, None, &ctx, &mut chain, &mut name, &mut preset);
         let reason = err_reason(&resp);
         assert!(reason.contains("config path"), "reason: {reason}");
+    }
+}
+
+#[cfg(all(test, feature = "ml", feature = "image-fill"))]
+mod default_synthesis_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn synthesises_color_fill_defaults_when_per_effect_missing() {
+        let per_effect = BTreeMap::new();
+        let result = build_and_configure_subchain(
+            SubchainKind::Background,
+            &["color_fill".to_string()],
+            &per_effect,
+        );
+        assert!(
+            result.is_ok(),
+            "color_fill should succeed with metadata-synthesised defaults; got {:?}",
+            result.as_ref().err().map(|e| &e.reason),
+        );
+    }
+
+    #[test]
+    fn rejects_image_fill_with_helpful_message() {
+        let per_effect = BTreeMap::new();
+        // `SubChainPayload` does not implement `Debug`, so we cannot
+        // use `expect_err`; use `let...else` instead.
+        let Err(err) = build_and_configure_subchain(
+            SubchainKind::Background,
+            &["image_fill".to_string()],
+            &per_effect,
+        ) else {
+            panic!("image_fill should fail without an explicit path")
+        };
+        assert!(
+            err.reason.contains("missing required field"),
+            "expected missing-field error, got: {}",
+            err.reason,
+        );
+        assert!(
+            err.reason.contains("path"),
+            "expected `path` mentioned in error, got: {}",
+            err.reason,
+        );
+        assert!(
+            err.hint.is_some(),
+            "expected hint with editor suggestion, got reason={} hint={:?}",
+            err.reason,
+            err.hint,
+        );
     }
 }

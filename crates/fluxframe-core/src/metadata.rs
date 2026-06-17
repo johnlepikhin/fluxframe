@@ -11,6 +11,11 @@
 //! straight onto the control socket as JSON. `Deserialize` is **not**
 //! derived — these descriptors are an output of the daemon, never an
 //! input.
+//!
+//! The metadata is also the canonical source of default values:
+//! [`EffectMetadata::default_config`] synthesises a fresh TOML
+//! table when the operator adds an effect without an explicit
+//! `per_effect` block.
 
 use serde::Serialize;
 
@@ -145,6 +150,68 @@ pub enum Scale {
     Logarithmic,
 }
 
+impl EffectMetadata {
+    /// Build a fresh-add default config TOML table from each param's
+    /// declared default.
+    ///
+    /// Mirrors what `#[serde(default = "...")]` on the effect's
+    /// `Config` struct would produce if every field had one, but
+    /// using the metadata block as the canonical source. The daemon
+    /// calls this when a chain entry is added without an explicit
+    /// `per_effect` block (e.g. via the GUI's add-effect menu).
+    ///
+    /// Returns `toml::Table` rather than `serde_json::Value` because
+    /// the operator-facing canonical form is `fluxframe.toml`; converting
+    /// to JSON happens once at the IPC boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the names of [`ParamKind::Path`] fields marked
+    /// `required: true` with no `default` — those have no sensible
+    /// default and the caller must reject the add until the operator
+    /// supplies them (typically `image_fill.path`; composite is
+    /// configured at pipeline level, not via the effect registry).
+    ///
+    /// Optional `Path` params without a default are silently skipped;
+    /// the effect's `Config` struct must therefore accept an empty
+    /// TOML table for those fields (typically via `#[serde(default)]`).
+    /// The `Err` `Vec` is guaranteed non-empty by construction.
+    pub fn default_config(&self) -> Result<toml::Table, Vec<String>> {
+        let mut table = toml::Table::new();
+        let mut missing: Vec<String> = Vec::new();
+        for param in self.params {
+            let value = match param.kind {
+                ParamKind::Float { default, .. } => toml::Value::Float(f64::from(default)),
+                ParamKind::Integer { default, .. } => toml::Value::Integer(default),
+                ParamKind::Bool { default } => toml::Value::Boolean(default),
+                ParamKind::Color { default } => toml::Value::Array(
+                    default
+                        .iter()
+                        .map(|&c| toml::Value::Integer(i64::from(c)))
+                        .collect(),
+                ),
+                ParamKind::Enum { default, .. } => toml::Value::String(default.to_string()),
+                ParamKind::Path {
+                    default, required, ..
+                } => match (default, required) {
+                    (Some(d), _) => toml::Value::String(d.to_string()),
+                    (None, true) => {
+                        missing.push(param.name.to_string());
+                        continue;
+                    }
+                    (None, false) => continue,
+                },
+            };
+            table.insert(param.name.to_string(), value);
+        }
+        if missing.is_empty() {
+            Ok(table)
+        } else {
+            Err(missing)
+        }
+    }
+}
+
 /// When the GUI should send a `set` command for a given parameter.
 ///
 /// The control socket has a bounded channel (16 deep); sending one
@@ -223,6 +290,140 @@ mod tests {
             let s = serde_json::to_string(&kind).expect("serialise");
             assert!(s.contains("\"type\":"), "got: {s}");
         }
+    }
+
+    #[test]
+    fn default_config_emits_one_entry_per_param_with_default() {
+        const META: EffectMetadata = EffectMetadata {
+            name: "demo",
+            help: "",
+            params: &[
+                ParamDescriptor {
+                    name: "radius",
+                    kind: ParamKind::Float {
+                        default: 20.0,
+                        min: 1.0,
+                        max: 256.0,
+                        step: 1.0,
+                        scale: Scale::Linear,
+                    },
+                    help: "",
+                    commit: CommitStrategy::Live { debounce_ms: 50 },
+                },
+                ParamDescriptor {
+                    name: "passes",
+                    kind: ParamKind::Integer {
+                        default: 2,
+                        min: 1,
+                        max: 16,
+                        step: 1,
+                        scale: Scale::Linear,
+                    },
+                    help: "",
+                    commit: CommitStrategy::Live { debounce_ms: 50 },
+                },
+                ParamDescriptor {
+                    name: "rgb",
+                    kind: ParamKind::Color {
+                        default: [128, 128, 128],
+                    },
+                    help: "",
+                    commit: CommitStrategy::OnCommit,
+                },
+                ParamDescriptor {
+                    name: "mode",
+                    kind: ParamKind::Enum {
+                        default: "cover",
+                        variants: &["cover", "contain"],
+                    },
+                    help: "",
+                    commit: CommitStrategy::Instant,
+                },
+            ],
+        };
+        let table = META
+            .default_config()
+            .expect("no required-without-default fields");
+        assert_eq!(table.get("radius"), Some(&toml::Value::Float(20.0)));
+        assert_eq!(table.get("passes"), Some(&toml::Value::Integer(2)));
+        assert_eq!(
+            table.get("rgb"),
+            Some(&toml::Value::Array(vec![
+                toml::Value::Integer(128),
+                toml::Value::Integer(128),
+                toml::Value::Integer(128),
+            ]))
+        );
+        assert_eq!(
+            table.get("mode"),
+            Some(&toml::Value::String("cover".into()))
+        );
+    }
+
+    #[test]
+    fn default_config_returns_missing_for_required_path_without_default() {
+        const META: EffectMetadata = EffectMetadata {
+            name: "image_fill",
+            help: "",
+            params: &[ParamDescriptor {
+                name: "path",
+                kind: ParamKind::Path {
+                    default: None,
+                    extensions: &["png", "jpg"],
+                    required: true,
+                },
+                help: "",
+                commit: CommitStrategy::OnCommit,
+            }],
+        };
+        let err = META.default_config().expect_err("required path => Err");
+        assert_eq!(err, vec!["path".to_string()]);
+    }
+
+    #[test]
+    fn default_config_emits_path_with_default() {
+        const META: EffectMetadata = EffectMetadata {
+            name: "demo",
+            help: "",
+            params: &[ParamDescriptor {
+                name: "model",
+                kind: ParamKind::Path {
+                    default: Some("/var/lib/x.onnx"),
+                    extensions: &["onnx"],
+                    required: true,
+                },
+                help: "",
+                commit: CommitStrategy::OnCommit,
+            }],
+        };
+        let table = META.default_config().expect("Some(default) => Ok");
+        assert_eq!(
+            table.get("model"),
+            Some(&toml::Value::String("/var/lib/x.onnx".into()))
+        );
+    }
+
+    #[test]
+    fn default_config_skips_optional_path_without_default() {
+        const META: EffectMetadata = EffectMetadata {
+            name: "demo",
+            help: "",
+            params: &[ParamDescriptor {
+                name: "logo",
+                kind: ParamKind::Path {
+                    default: None,
+                    extensions: &[],
+                    required: false,
+                },
+                help: "",
+                commit: CommitStrategy::OnCommit,
+            }],
+        };
+        let table = META.default_config().expect("optional => Ok");
+        assert!(
+            table.is_empty(),
+            "optional path with no default skips emission"
+        );
     }
 
     #[test]
