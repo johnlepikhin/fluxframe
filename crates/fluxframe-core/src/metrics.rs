@@ -149,15 +149,20 @@ impl Counters {
         self.idle_entered_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Increment `deep_idle_entered_total` — fires on the
-    /// supervisor's Idle → DeepIdle transition.
+    /// Increment `deep_idle_entered_total`.
+    ///
+    /// Deprecated since Stage 16: the `DeepIdle` state was removed, so
+    /// nothing calls this anymore and `deep_idle_entered_total` stays 0.
+    /// The counter and this method are retained so existing dashboards
+    /// that read the field keep working (they now read a constant 0).
     #[inline]
+    #[deprecated(note = "DeepIdle state removed in Stage 16; counter is always 0")]
     pub fn inc_deep_idle_entered(&self) {
         self.deep_idle_entered_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Increment `idle_frames_pushed_total` — fires every placeholder
-    /// frame the worker emits while in Idle or DeepIdle.
+    /// frame the worker emits while in Idle.
     #[inline]
     pub fn inc_idle_frames_pushed(&self) {
         self.idle_frames_pushed_total

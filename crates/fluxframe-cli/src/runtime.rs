@@ -1915,9 +1915,9 @@ fn process_one_frame(
 }
 
 /// Push a pre-rendered placeholder frame to the output, bypassing
-/// the effect chain. Used by the worker loop while in Idle or
-/// DeepIdle to keep v4l2loopback's ring buffer fresh without paying
-/// the cost of the full pipeline.
+/// the effect chain. Used by the worker loop while in Idle to keep
+/// v4l2loopback's ring buffer fresh (and the device enumerable by
+/// Chrome) without paying the cost of the full pipeline.
 fn push_placeholder(
     placeholder: &dyn crate::idle::Placeholder,
     width: u32,
@@ -1957,8 +1957,8 @@ struct IdleRuntime {
     /// EnterIdle and the reload thread calls `start` on resume.
     input: Arc<InputPipeline>,
     /// `false` whenever the supervisor must not call
-    /// `chain.process` — true in Active, cleared on EnterDeepIdle,
-    /// re-armed by the reload thread.
+    /// `chain.process` — true in Active, cleared on resume while the
+    /// reload thread restarts the input, re-armed by that thread.
     engine_ready: Arc<AtomicBool>,
     /// Live reload thread, if one is currently in flight. The
     /// worker checks `is_finished` periodically to surface failures
@@ -2084,17 +2084,6 @@ fn handle_idle_edge(
             // a stale frame on the chain would be visible to the
             // consumer as a single mis-timed image.
             slot.clear();
-        }
-        IdleEdge::EnterDeepIdle => {
-            metrics.counters.inc_deep_idle_entered();
-            info!(target: "fluxframe::idle", "entering deep idle");
-            // Stage 15 Step 4 ships the visible idle behaviour; the
-            // ONNX-engine unload that brings DeepIdle's RAM
-            // reclamation to life is parked here until the
-            // `EffectChain` ↔ `ManagedComposite` wiring lands.
-            // engine_ready stays `true` so the worker keeps running
-            // the full chain — DeepIdle is currently observationally
-            // identical to Idle.
         }
         IdleEdge::ResumeActive => {
             info!(target: "fluxframe::idle", "consumer reconnected — spawning reload thread");

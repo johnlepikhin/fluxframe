@@ -146,6 +146,7 @@ fn check_output_device(cfg: &FluxConfig) -> Result<(), FluxError> {
         OutputSpec::V4l2(path) => {
             let canon = fluxframe_gst::check_v4l2_output_access(&path)?;
             warn_if_not_loopback(&canon);
+            warn_if_no_exclusive_caps(&canon);
             info!(
                 device = %path.display(),
                 canonical = %canon.display(),
@@ -197,6 +198,91 @@ fn warn_if_not_loopback(canonical: &Path) {
                 "output device does not look like a v4l2loopback; you may be writing to a real camera",
             );
         }
+    }
+}
+
+/// Warn when the v4l2loopback device backing the output is NOT exposing
+/// `exclusive_caps=1`.
+///
+/// Chrome / WebRTC (and other capability-filtering consumers) only list a
+/// loopback device when it advertises CAPTURE caps, which requires the
+/// module to be loaded with `exclusive_caps=1`. Without it the virtual
+/// camera silently never appears in the browser's device picker — the
+/// single most common "FluxFrame isn't showing up" cause. This is a
+/// best-effort, non-fatal diagnostic: missing sysfs files (module not
+/// loaded, non-Linux) are skipped quietly.
+fn warn_if_no_exclusive_caps(device: &Path) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let Some(video_nr) = video_number(device) else {
+        tracing::debug!(
+            device = %device.display(),
+            "exclusive_caps check skipped (could not parse a video number from the path)",
+        );
+        return;
+    };
+    let video_nr_csv = std::fs::read_to_string("/sys/module/v4l2loopback/parameters/video_nr");
+    let exclusive_csv =
+        std::fs::read_to_string("/sys/module/v4l2loopback/parameters/exclusive_caps");
+    let (Ok(video_nr_csv), Ok(exclusive_csv)) = (video_nr_csv, exclusive_csv) else {
+        tracing::debug!(
+            device = %device.display(),
+            "exclusive_caps check skipped (v4l2loopback sysfs parameters unreadable)",
+        );
+        return;
+    };
+
+    match exclusive_caps_for_device(&video_nr_csv, &exclusive_csv, video_nr) {
+        Some(true) => {
+            info!(
+                device = %device.display(),
+                "v4l2loopback exclusive_caps=1 — visible to Chrome/WebRTC",
+            );
+        }
+        Some(false) | None => {
+            warn!(
+                device = %device.display(),
+                "v4l2loopback is NOT exposing exclusive_caps=1 for this device; Chrome and other \
+                 capability-filtering consumers will not list it. Reload the module with: \
+                 sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback exclusive_caps=1 \
+                 card_label=\"FluxFrame Camera\"",
+            );
+        }
+    }
+}
+
+/// Parse the trailing video number from a `/dev/videoN` path
+/// (`/dev/video10` → `10`). Returns `None` if the file name does not
+/// match the `videoN` shape.
+fn video_number(path: &Path) -> Option<i32> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix("video")?.parse::<i32>().ok()
+}
+
+/// Resolve whether a given v4l2loopback device has `exclusive_caps=1`,
+/// from the module's `video_nr` and `exclusive_caps` CSV parameters.
+///
+/// Both parameters are comma-separated and positionally aligned: the
+/// device created at `video_nr[i]` has the cap setting `exclusive_caps[i]`.
+/// We find `video_nr_target` in the `video_nr` CSV, then read the same
+/// index of the `exclusive_caps` CSV. `Y`/`1` → `Some(true)`, `N`/`0` →
+/// `Some(false)`, and any malformed / missing / out-of-range input →
+/// `None` (treated as "could not confirm", which the caller warns on).
+fn exclusive_caps_for_device(
+    video_nr_csv: &str,
+    exclusive_caps_csv: &str,
+    video_nr_target: i32,
+) -> Option<bool> {
+    let idx = video_nr_csv
+        .trim()
+        .split(',')
+        .position(|entry| entry.trim().parse::<i32>().ok() == Some(video_nr_target))?;
+    let entry = exclusive_caps_csv.trim().split(',').nth(idx)?.trim();
+    match entry {
+        "Y" | "y" | "1" => Some(true),
+        "N" | "n" | "0" => Some(false),
+        _ => None,
     }
 }
 
@@ -381,6 +467,57 @@ mod tests {
 
     fn cfg_with(toml: &str) -> FluxConfig {
         FluxConfig::from_toml_str(toml).expect("toml parses")
+    }
+
+    #[test]
+    fn video_number_parses_dev_path() {
+        assert_eq!(video_number(Path::new("/dev/video10")), Some(10));
+        assert_eq!(video_number(Path::new("/dev/video0")), Some(0));
+        assert_eq!(video_number(Path::new("/dev/videoX")), None);
+        assert_eq!(video_number(Path::new("/dev/null")), None);
+    }
+
+    #[test]
+    fn exclusive_caps_maps_index_zero() {
+        // video10 is the first loopback → index 0 → "Y" → enabled.
+        assert_eq!(
+            exclusive_caps_for_device("10,-1,-1", "Y,N,N", 10),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn exclusive_caps_maps_nonzero_index() {
+        // The target sits at index 1; its cap entry is "N" → disabled.
+        assert_eq!(
+            exclusive_caps_for_device("4,10,-1", "Y,N,N", 10),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn exclusive_caps_accepts_numeric_one_as_enabled() {
+        assert_eq!(exclusive_caps_for_device("10", "1", 10), Some(true));
+        assert_eq!(exclusive_caps_for_device("10", "0", 10), Some(false));
+    }
+
+    #[test]
+    fn exclusive_caps_none_when_target_missing() {
+        assert_eq!(exclusive_caps_for_device("4,5,6", "Y,Y,Y", 10), None);
+    }
+
+    #[test]
+    fn exclusive_caps_none_when_index_out_of_range() {
+        // video_nr has the target at index 2 but exclusive_caps is shorter.
+        assert_eq!(exclusive_caps_for_device("4,5,10", "Y,N", 10), None);
+    }
+
+    #[test]
+    fn exclusive_caps_tolerates_whitespace_and_newlines() {
+        assert_eq!(
+            exclusive_caps_for_device(" 10, -1 \n", " Y , N \n", 10),
+            Some(true)
+        );
     }
 
     #[test]

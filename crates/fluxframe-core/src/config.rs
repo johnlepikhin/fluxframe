@@ -672,16 +672,27 @@ pub struct IdleConfig {
     #[serde(default = "default_idle_fps")]
     pub fps: u32,
 
+    /// Minimum placeholder cadence (fps) used while idle so the
+    /// v4l2loopback device keeps advertising CAPTURE caps and stays
+    /// enumerable by capability-filtering consumers (Chrome/WebRTC).
+    /// This is a heartbeat for device VISIBILITY, independent of the
+    /// camera: it is NOT bounded by the input fps (no real camera
+    /// frames flow while idle). The effective idle cadence is
+    /// `max(idle.fps, idle.min_visibility_fps)`. A bare 1 Hz placeholder
+    /// is too sparse for Chrome to reliably enumerate/retain the node.
+    #[serde(default = "default_idle_min_visibility_fps")]
+    pub min_visibility_fps: u32,
+
     /// Seconds of "no consumer" observed before the supervisor flips
     /// from Active to Idle. The 5 s default absorbs the usual reopen
     /// storm from Zoom/OBS startup without flapping the camera LED.
     #[serde(default = "default_idle_teardown_secs")]
     pub teardown_secs: u32,
 
-    /// Seconds of continued idleness before the supervisor flips from
-    /// Idle to DeepIdle (ONNX session dropped). Strictly greater than
-    /// `teardown_secs`. The 30 s default avoids paying the ONNX reload
-    /// cost during short "step away from desk" intervals.
+    /// Deprecated and ignored since Stage 16: the `DeepIdle` state was
+    /// removed (it was a no-op that never unloaded ONNX and could wedge
+    /// the daemon). The field is still accepted so existing TOML keeps
+    /// loading under `deny_unknown_fields`; its value has no effect.
     #[serde(default = "default_idle_deep_secs")]
     pub deep_idle_secs: u32,
 
@@ -700,6 +711,7 @@ impl Default for IdleConfig {
             placeholder_rgb: default_placeholder_rgb(),
             placeholder_path: None,
             fps: default_idle_fps(),
+            min_visibility_fps: default_idle_min_visibility_fps(),
             teardown_secs: default_idle_teardown_secs(),
             deep_idle_secs: default_idle_deep_secs(),
             poll_interval_ms: default_idle_poll_interval_ms(),
@@ -749,6 +761,9 @@ fn default_placeholder_rgb() -> [u8; 3] {
 }
 fn default_idle_fps() -> u32 {
     1
+}
+fn default_idle_min_visibility_fps() -> u32 {
+    10
 }
 fn default_idle_teardown_secs() -> u32 {
     5
@@ -894,6 +909,15 @@ impl FluxConfig {
                 self.idle.fps
             )));
         }
+        // Visibility heartbeat. NOT bounded by input.fps — it streams a
+        // static placeholder, not camera frames, so the loopback stays
+        // enumerable by Chrome/WebRTC even with no/low-fps camera.
+        if self.idle.min_visibility_fps == 0 || self.idle.min_visibility_fps > MAX_IDLE_FPS {
+            return Err(config_err(format!(
+                "idle.min_visibility_fps must be in 1..={MAX_IDLE_FPS}, got {}",
+                self.idle.min_visibility_fps
+            )));
+        }
         if self.idle.teardown_secs == 0 || self.idle.teardown_secs > MAX_IDLE_TEARDOWN_SECS {
             return Err(config_err(format!(
                 "idle.teardown_secs must be in 1..={MAX_IDLE_TEARDOWN_SECS}, got {}",
@@ -909,14 +933,8 @@ impl FluxConfig {
                 self.idle.deep_idle_secs
             )));
         }
-        // Strict `>` rejects the same-value case where DeepIdle would
-        // fire on the same observation as Idle entry.
-        if self.idle.deep_idle_secs <= self.idle.teardown_secs {
-            return Err(config_err(format!(
-                "idle.deep_idle_secs ({}) must be strictly greater than idle.teardown_secs ({})",
-                self.idle.deep_idle_secs, self.idle.teardown_secs
-            )));
-        }
+        // DeepIdle state removed (Stage 16); deep_idle_secs kept for TOML
+        // back-compat, the deep > teardown cross-check is dropped.
         if self.idle.poll_interval_ms < MIN_IDLE_POLL_INTERVAL_MS
             || self.idle.poll_interval_ms > MAX_IDLE_POLL_INTERVAL_MS
         {

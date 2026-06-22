@@ -15,17 +15,22 @@
 //!        ┌───────────────┐  Absent 5 s        ┌────────┴────────┐
 //!        │    Active     │ ───────────────►   │      Idle       │
 //!        │ (full chain)  │                    │ (input Null,    │
-//!        │ engine_ready  │ ◄──────────────    │  placeholder,   │
-//!        └───────┬───────┘   Present          │  engine warm)   │
-//!                │ Absent                     └────────┬────────┘
-//!                │ (5s cooldown timer)                 │ Absent 30 s
-//!                ▼                                     ▼
-//!        ┌───────────────┐                    ┌─────────────────┐
-//!        │   Cooldown    │                    │    DeepIdle     │
-//!        │ (still full,  │                    │ (ONNX dropped,  │
-//!        │  flips soon)  │                    │  placeholder)   │
-//!        └───────────────┘                    └─────────────────┘
+//!        │ engine_ready  │ ◄──────────────    │  placeholder)   │
+//!        └───────┬───────┘   Present          └─────────────────┘
+//!                │ Absent                       Idle is terminal
+//!                │ (5s cooldown timer)          until a consumer
+//!                ▼                              reattaches.
+//!        ┌───────────────┐
+//!        │   Cooldown    │
+//!        │ (still full,  │
+//!        │  flips soon)  │
+//!        └───────────────┘
 //! ```
+//!
+//! The `DeepIdle` state was removed in Stage 16: it never actually
+//! unloaded the ONNX session (a parked TODO) so it was observationally
+//! identical to `Idle`, and it could leave the daemon wedged. The
+//! ONNX-unload RAM reclamation is deferred to a separate work item.
 //!
 //! Cooldown is observably identical to Active from the outside — it
 //! just delays the flip to Idle so a consumer reopen within 5 s never
@@ -106,10 +111,8 @@ pub(crate) enum IdleState {
     /// to Active.
     Cooldown,
     /// Input torn down, placeholder published. ONNX session still
-    /// resident.
+    /// resident. Terminal until a consumer reattaches.
     Idle,
-    /// Input torn down, ONNX session dropped, placeholder published.
-    DeepIdle,
 }
 
 /// One-shot side effect fired at a state transition. The worker
@@ -121,9 +124,7 @@ pub(crate) enum IdleEdge {
     None,
     /// Active/Cooldown → Idle. Tear down input, flush stale frames.
     EnterIdle,
-    /// Idle → DeepIdle. Drop the ONNX session.
-    EnterDeepIdle,
-    /// Any depth → Active. Spawn the reload thread; the worker keeps
+    /// Idle → Active. Spawn the reload thread; the worker keeps
     /// publishing placeholder until `engine_ready` flips true.
     ResumeActive,
 }
@@ -216,7 +217,6 @@ impl IdleStateMachine {
     ) -> IdleTick {
         let elapsed = now.saturating_duration_since(self.last_change);
         let teardown = Duration::from_secs(u64::from(cfg.teardown_secs));
-        let deep = Duration::from_secs(u64::from(cfg.deep_idle_secs));
 
         // Normalise the tri-state observation into a structurally
         // exhaustive two-state input. Unknown collapses to Present —
@@ -255,25 +255,15 @@ impl IdleStateMachine {
                 }
             }
 
-            // Idle / DeepIdle — resume path is identical from both
-            // depths; the reload thread spawned by `ResumeActive` is
-            // a no-op when the engine is already warm (Idle), and a
-            // real rebuild when it was dropped (DeepIdle).
-            (IdleState::Idle | IdleState::DeepIdle, Effective::Present) => {
-                (IdleState::Active, IdleEdge::ResumeActive)
-            }
+            // Idle Present — a reader reattached; resume. The reload
+            // thread spawned by `ResumeActive` restarts the input (the
+            // engine is still warm, so the rebuild is cheap).
+            (IdleState::Idle, Effective::Present) => (IdleState::Active, IdleEdge::ResumeActive),
 
-            // Idle Absent — flip to DeepIdle once the deep timer expires.
-            (IdleState::Idle, Effective::Absent) => {
-                if elapsed >= deep {
-                    (IdleState::DeepIdle, IdleEdge::EnterDeepIdle)
-                } else {
-                    (IdleState::Idle, IdleEdge::None)
-                }
-            }
-
-            // DeepIdle Absent — terminal until a consumer reattaches.
-            (IdleState::DeepIdle, Effective::Absent) => (IdleState::DeepIdle, IdleEdge::None),
+            // Idle Absent — terminal until a consumer reattaches. The
+            // worker keeps publishing the placeholder so the loopback
+            // stays visible to capability-filtering consumers.
+            (IdleState::Idle, Effective::Absent) => (IdleState::Idle, IdleEdge::None),
         };
 
         if new_state != self.state {
@@ -283,24 +273,27 @@ impl IdleStateMachine {
 
         let level = match new_state {
             IdleState::Active | IdleState::Cooldown => IdleLevel::Active,
-            IdleState::Idle | IdleState::DeepIdle => IdleLevel::Placeholder,
+            IdleState::Idle => IdleLevel::Placeholder,
         };
 
         // Next-tick hint. In steady-state Active/Cooldown the worker
         // re-evaluates every frame, so any non-zero value works; we
         // pick the poll interval so the worker does not over-park
-        // waiting for status changes. In Idle/DeepIdle the worker
-        // sleeps `1 / fps` between placeholder pushes.
+        // waiting for status changes. In Idle the worker sleeps
+        // `1 / effective_fps` between placeholder pushes.
         let next_tick_in = match new_state {
             IdleState::Active | IdleState::Cooldown => {
                 Duration::from_millis(u64::from(cfg.poll_interval_ms))
             }
-            IdleState::Idle | IdleState::DeepIdle => {
-                // fps is validated > 0 by FluxConfig::validate, but
-                // saturate defensively in case the runtime updates the
-                // field through a Stage 13 control command before
-                // validation lands.
-                let fps = cfg.fps.max(1);
+            IdleState::Idle => {
+                // Effective idle cadence is the max of the cosmetic
+                // `fps` and the `min_visibility_fps` heartbeat: the
+                // latter keeps v4l2loopback advertising CAPTURE caps so
+                // Chrome/WebRTC keep enumerating the device. Both are
+                // validated > 0 by FluxConfig::validate; saturate
+                // defensively against a mid-flight Stage 13 control
+                // command that lands before re-validation.
+                let fps = cfg.fps.max(cfg.min_visibility_fps).max(1);
                 Duration::from_millis(1000 / u64::from(fps))
             }
         };
@@ -513,7 +506,10 @@ mod tests {
     }
 
     #[test]
-    fn idle_absent_before_deep_timer_stays_idle() {
+    fn idle_absent_stays_idle_terminal() {
+        // After DeepIdle removal (Stage 16), Idle is terminal under
+        // continued Absent: the worker keeps streaming the placeholder
+        // so the loopback stays visible, but the state never advances.
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
         sm.tick(ConsumerStatus::Absent, now, &cfg(1, 30));
@@ -522,102 +518,17 @@ mod tests {
             now + Duration::from_secs(1),
             &cfg(1, 30),
         );
+        assert_eq!(sm.state(), IdleState::Idle);
+
+        // Far past any former deep-idle threshold — still Idle, no edge.
         let tick = sm.tick(
             ConsumerStatus::Absent,
-            now + Duration::from_secs(15),
+            now + Duration::from_secs(120),
             &cfg(1, 30),
         );
         assert_eq!(sm.state(), IdleState::Idle);
         assert_eq!(tick.edge, IdleEdge::None);
         assert_eq!(tick.level, IdleLevel::Placeholder);
-    }
-
-    #[test]
-    fn idle_absent_at_deep_timer_flips_to_deep_idle() {
-        let now = t0();
-        let mut sm = IdleStateMachine::new(now);
-        sm.tick(ConsumerStatus::Absent, now, &cfg(1, 30));
-        let after_idle = now + Duration::from_secs(1);
-        sm.tick(ConsumerStatus::Absent, after_idle, &cfg(1, 30));
-        assert_eq!(sm.state(), IdleState::Idle);
-
-        // Deep timer is measured from Idle entry (last_change), so
-        // we need 30 s past `after_idle` to reach DeepIdle.
-        let tick = sm.tick(
-            ConsumerStatus::Absent,
-            after_idle + Duration::from_secs(30),
-            &cfg(1, 30),
-        );
-        assert_eq!(sm.state(), IdleState::DeepIdle);
-        assert_eq!(tick.edge, IdleEdge::EnterDeepIdle);
-        assert_eq!(tick.level, IdleLevel::Placeholder);
-    }
-
-    // ============================================================
-    // DeepIdle row (3 cases — Present/Absent/Unknown all decisive).
-    // ============================================================
-
-    #[test]
-    fn deep_idle_present_resumes_active_with_edge() {
-        let now = t0();
-        let mut sm = IdleStateMachine::new(now);
-        sm.tick(ConsumerStatus::Absent, now, &cfg(1, 5));
-        let t1 = now + Duration::from_secs(1);
-        sm.tick(ConsumerStatus::Absent, t1, &cfg(1, 5));
-        let t2 = t1 + Duration::from_secs(5);
-        sm.tick(ConsumerStatus::Absent, t2, &cfg(1, 5));
-        assert_eq!(sm.state(), IdleState::DeepIdle);
-
-        let tick = sm.tick(
-            ConsumerStatus::Present,
-            t2 + Duration::from_secs(1),
-            &cfg(1, 5),
-        );
-        assert_eq!(sm.state(), IdleState::Active);
-        assert_eq!(
-            tick.edge,
-            IdleEdge::ResumeActive,
-            "DeepIdle → Active must fire ResumeActive (reload thread will rebuild ONNX)"
-        );
-    }
-
-    #[test]
-    fn deep_idle_unknown_resumes_active() {
-        let now = t0();
-        let mut sm = IdleStateMachine::new(now);
-        sm.tick(ConsumerStatus::Absent, now, &cfg(1, 5));
-        let t1 = now + Duration::from_secs(1);
-        sm.tick(ConsumerStatus::Absent, t1, &cfg(1, 5));
-        let t2 = t1 + Duration::from_secs(5);
-        sm.tick(ConsumerStatus::Absent, t2, &cfg(1, 5));
-
-        let tick = sm.tick(
-            ConsumerStatus::Unknown,
-            t2 + Duration::from_secs(1),
-            &cfg(1, 5),
-        );
-        assert_eq!(sm.state(), IdleState::Active);
-        assert_eq!(tick.edge, IdleEdge::ResumeActive);
-    }
-
-    #[test]
-    fn deep_idle_absent_stays_deep_idle() {
-        let now = t0();
-        let mut sm = IdleStateMachine::new(now);
-        sm.tick(ConsumerStatus::Absent, now, &cfg(1, 5));
-        let t1 = now + Duration::from_secs(1);
-        sm.tick(ConsumerStatus::Absent, t1, &cfg(1, 5));
-        let t2 = t1 + Duration::from_secs(5);
-        sm.tick(ConsumerStatus::Absent, t2, &cfg(1, 5));
-        assert_eq!(sm.state(), IdleState::DeepIdle);
-
-        let tick = sm.tick(
-            ConsumerStatus::Absent,
-            t2 + Duration::from_secs(100),
-            &cfg(1, 5),
-        );
-        assert_eq!(sm.state(), IdleState::DeepIdle);
-        assert_eq!(tick.edge, IdleEdge::None);
     }
 
     // ============================================================
@@ -626,7 +537,7 @@ mod tests {
 
     #[test]
     fn full_lifecycle_walk() {
-        // Active → Cooldown → Idle → DeepIdle → Active in one walk.
+        // Active → Cooldown → Idle → Active in one walk.
         let cfg = cfg(1, 5);
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
@@ -642,13 +553,13 @@ mod tests {
         assert_eq!(tick.edge, IdleEdge::EnterIdle);
         assert_eq!(sm.state(), IdleState::Idle);
 
-        // Idle → DeepIdle (timer fires).
+        // Idle stays Idle under continued Absent (terminal).
         let t = t + Duration::from_secs(5);
         let tick = sm.tick(ConsumerStatus::Absent, t, &cfg);
-        assert_eq!(tick.edge, IdleEdge::EnterDeepIdle);
-        assert_eq!(sm.state(), IdleState::DeepIdle);
+        assert_eq!(tick.edge, IdleEdge::None);
+        assert_eq!(sm.state(), IdleState::Idle);
 
-        // DeepIdle → Active (Present).
+        // Idle → Active (Present).
         let t = t + Duration::from_secs(1);
         let tick = sm.tick(ConsumerStatus::Present, t, &cfg);
         assert_eq!(tick.edge, IdleEdge::ResumeActive);
@@ -710,6 +621,9 @@ mod tests {
             teardown_secs: 1,
             deep_idle_secs: 10,
             fps: 5,
+            // Pin the visibility floor below `fps` so this test exercises
+            // the cosmetic `fps` path, not the heartbeat clamp.
+            min_visibility_fps: 1,
             ..IdleConfig::default()
         };
         let now = t0();
@@ -721,6 +635,30 @@ mod tests {
             tick.next_tick_in,
             Duration::from_millis(200),
             "5 fps → 200 ms per tick"
+        );
+    }
+
+    #[test]
+    fn next_tick_in_clamps_to_min_visibility_fps_when_idle() {
+        // The cosmetic `fps` (1) is below the visibility heartbeat (10),
+        // so the effective idle cadence must be 10 fps → 100 ms. This is
+        // what keeps the loopback enumerable by Chrome while idle.
+        let cfg = IdleConfig {
+            enabled: true,
+            teardown_secs: 1,
+            fps: 1,
+            min_visibility_fps: 10,
+            ..IdleConfig::default()
+        };
+        let now = t0();
+        let mut sm = IdleStateMachine::new(now);
+        sm.tick(ConsumerStatus::Absent, now, &cfg);
+        let tick = sm.tick(ConsumerStatus::Absent, now + Duration::from_secs(1), &cfg);
+        assert_eq!(sm.state(), IdleState::Idle);
+        assert_eq!(
+            tick.next_tick_in,
+            Duration::from_millis(100),
+            "max(fps=1, min_visibility_fps=10) → 10 fps → 100 ms"
         );
     }
 

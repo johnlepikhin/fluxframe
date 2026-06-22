@@ -67,6 +67,14 @@ Verify:
 v4l2-ctl --list-devices
 ```
 
+> **`exclusive_caps=1` обязателен для Chrome/браузеров.** Chrome и другие
+> потребители, фильтрующие устройства по возможностям, показывают
+> loopback в списке камер только когда модуль загружен с
+> `exclusive_caps=1`. Без этого «FluxFrame Camera» просто не появляется в
+> выборе устройства — самая частая причина «виртуальной камеры не видно».
+> `fluxframe check` диагностирует это и подскажет команду перезагрузки
+> модуля.
+
 ## ONNX Runtime setup (Stage 3+)
 
 `fluxframe-effects::ml::OnnxEngine` loads ONNX Runtime dynamically via
@@ -418,22 +426,21 @@ match the typical "step away from desk" use case:
 | `placeholder` | `"color"` | `"color"` or `"image"`. |
 | `placeholder_rgb` | `[16, 16, 16]` | Dark grey fill for `placeholder = "color"`. |
 | `placeholder_path` | — | Required when `placeholder = "image"`. PNG or JPEG, absolute path (relative-path resolution is a Stage 15 follow-up). |
-| `fps` | `1` | Placeholder frame rate. 1 Hz is enough to keep v4l2loopback's ring buffer fresh. |
+| `fps` | `1` | Cosmetic placeholder frame rate. The effective idle cadence is `max(fps, min_visibility_fps)`. |
+| `min_visibility_fps` | `10` | Visibility heartbeat. Keeps the loopback advertising CAPTURE caps so Chrome/WebRTC keep listing the device while idle. Independent of the camera/input fps (a static placeholder, not real frames). A bare 1 Hz placeholder is too sparse for Chrome to reliably enumerate the node. |
 | `teardown_secs` | `5` | "No consumer" grace window before the camera drops. Absorbs Zoom / OBS reopen storms. |
-| `deep_idle_secs` | `30` | Idle → DeepIdle threshold. *(Currently a no-op stub; see follow-ups.)* |
+| `deep_idle_secs` | `30` | **Deprecated / ignored** since Stage 16 (the `DeepIdle` state was removed). Still accepted in TOML for back-compat; has no effect. |
 | `poll_interval_ms` | `250` | Polling-fallback walk cadence. The default path is event-driven via `inotify`, which ignores this knob; it only kicks in when `inotify` is unavailable (sandbox, watch-limit exhaustion). |
 
 A consumer disconnect triggers this lifecycle:
 
 ```
-                 t = 0 s        t = 5 s              t = 35 s
-consumer drops ─────► Cooldown ─────► Idle ──────────────► DeepIdle
-                       (LED on)       (LED off,            (placeholder
-                                       placeholder @ 1 Hz)  + future ONNX
-                                                            unload)
+                 t = 0 s        t = 5 s
+consumer drops ─────► Cooldown ─────► Idle (terminal until a consumer reattaches)
+                       (LED on)       (LED off, placeholder @ max(fps, min_visibility_fps))
 ```
 
-Re-attaching at any depth fires `ResumeActive`: the supervisor pushes
+Re-attaching fires `ResumeActive`: the supervisor pushes
 one placeholder immediately to clear v4l2loopback's stale-frame
 replay, then spawns a reload thread that brings the input pipeline
 back to `Playing`. Steady-state cold-start budget on UVC cameras is
@@ -497,7 +504,7 @@ Idle transitions are logged at `info!` with `target =
 "fluxframe::idle"`. Counters surface in the teardown summary log:
 
 - `idle_entered_total` — Active → Idle transitions.
-- `deep_idle_entered_total` — Idle → DeepIdle transitions.
+- `deep_idle_entered_total` — retained for dashboard back-compat; always `0` since the `DeepIdle` state was removed in Stage 16.
 - `idle_frames_pushed_total` — placeholder frames emitted.
 
 Status changes (`Present ↔ Absent` from the detector) also log at
@@ -506,11 +513,20 @@ without enabling debug-level globally.
 
 ### Stage 15 follow-ups
 
-- **DeepIdle ONNX drop.** Currently a counter-only stub — DeepIdle is
-  observationally identical to Idle. The real RAM reclamation
-  (~150 MB) needs `EffectChain` ↔ `ManagedComposite` integration
+- **DeepIdle removed (Stage 16).** The counter-only stub was deleted —
+  it never actually unloaded ONNX and could leave the daemon wedged.
+  The real RAM reclamation (~150 MB) is deferred to a separate work
+  item: drop the ONNX session on a long idle and rebuild it on resume,
+  needing `EffectChain` ↔ `ManagedComposite` integration
   (`SegmentationBase::take_engine` / `install_engine` accessors are
   already in place; the chain refactor is the missing piece).
+- **Always-on loopback visibility (deferred).** When the camera is busy
+  or absent the output producer is still torn down on each retry, so
+  `/dev/video10` can vanish from Chrome's list mid-restart. The planned
+  fix decouples the loopback producer from the input lifecycle (keep it
+  streaming the placeholder through camera-acquire backoff) and splits
+  input-vs-output bus fatals. Tracked separately; needs hardware
+  verification.
 - **`engine_ready` race tightening** — currently survivable (one
   unnecessary placeholder push per resume race) but worth moving
   `store(false)` into `spawn_reload_thread`'s body to close the
@@ -543,7 +559,7 @@ without enabling debug-level globally.
 | 12. Post-composite mask-aware chain + `auto_frame` | done |
 | 13. Live reconfiguration via UNIX control socket | done |
 | 14. GTK4 GUI client over the control socket | done |
-| 15. Idle mode (consumer-aware lifecycle) | done (DeepIdle ONNX drop deferred) |
+| 15. Idle mode (consumer-aware lifecycle) | done (DeepIdle removed in Stage 16; ONNX-drop reclamation deferred) |
 | 16. GUI-initiated TOML persistence (`save_preset` / Save as / Revert) | done |
 
 ## License

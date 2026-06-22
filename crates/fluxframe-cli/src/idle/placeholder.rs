@@ -1,10 +1,11 @@
 //! Idle-mode placeholder frame source.
 //!
-//! When the supervisor is in `Idle` or `DeepIdle` it stops pulling
-//! real frames from the input pipeline and instead pushes a cheap
-//! pre-rendered placeholder to the output sink at `idle.fps`. Step 4
-//! caches the converted bytes as `Arc<[u8]>` so the per-tick cost
-//! collapses to one `Arc` clone plus an enqueue into the writer slot.
+//! When the supervisor is in `Idle` it stops pulling real frames from
+//! the input pipeline and instead pushes a cheap pre-rendered
+//! placeholder to the output sink at `max(idle.fps,
+//! idle.min_visibility_fps)`. The converted bytes are cached as
+//! `Arc<[u8]>` so the per-tick cost collapses to one `Arc` clone plus
+//! an enqueue into the writer slot.
 //!
 //! Two concrete kinds are supported in Stage 15:
 //!
@@ -16,10 +17,12 @@
 //!   dimensions.
 //!
 //! Both impls cache an RGB byte buffer matching the supervisor's
-//! output `(width, height)`. `Placeholder::render` performs the
-//! per-call format conversion only. The supervisor (Step 4) wraps
-//! the resulting bytes in `FrameBuffer::Shared(Arc<[u8]>)` so steady-
-//! state idle pushes are zero-copy.
+//! output `(width, height)`. On top of that, each placeholder memoizes
+//! the *converted* output bytes per `(width, height, format)` as an
+//! `Arc<[u8]>` and hands out `FrameBuffer::Shared` clones, so a
+//! steady-state idle push at the raised `min_visibility_fps` cadence
+//! collapses to an `Arc` clone plus an enqueue — no per-tick
+//! RGB→target conversion or large allocation.
 //!
 //! Format coverage matches the small set that shows up as
 //! `input.format` (the appsrc format) in practice: RGB, RGBA, BGR,
@@ -29,6 +32,9 @@
 //! never the appsrc format in current configs (it is only a sink
 //! format, where videoconvert handles it). If a future config needs
 //! it, extend [`Placeholder::render`] then.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use fluxframe_core::frame::{FrameBuffer, FrameMeta, PixelFormat, VideoFrame};
 use fluxframe_core::{FluxError, IdleConfig, IdlePlaceholderKind};
@@ -77,10 +83,11 @@ const BT601_CHROMA_BIAS: i32 = 128;
 /// reload-coordinator thread without locking.
 pub(crate) trait Placeholder: Send + Sync {
     /// Produce a [`VideoFrame`] in `format` at the dimensions the
-    /// placeholder was built for. Each call performs a format
-    /// conversion from the cached RGB buffer; the supervisor (Step 4)
-    /// caches the resulting bytes as `FrameBuffer::Shared(Arc<[u8]>)`
-    /// so steady-state idle pushes are zero-copy.
+    /// placeholder was built for. The first call for a given
+    /// `(width, height, format)` runs the format conversion from the
+    /// cached RGB buffer and memoizes the result as
+    /// `FrameBuffer::Shared(Arc<[u8]>)`; subsequent calls return a
+    /// zero-copy `Arc` clone.
     ///
     /// # Single-instance contract
     ///
@@ -179,11 +186,12 @@ pub(crate) fn build(
 // ---------------------------------------------------------------------------
 
 /// Solid-fill placeholder. The cached RGB buffer is built once at
-/// construction and reused on every `render` call.
+/// construction; converted output bytes are memoized per format.
 pub(crate) struct ColorPlaceholder {
     width: u32,
     height: u32,
     rgb: Vec<u8>,
+    cache: ConvertedCache,
 }
 
 impl ColorPlaceholder {
@@ -202,6 +210,7 @@ impl ColorPlaceholder {
             width,
             height,
             rgb: buf,
+            cache: ConvertedCache::default(),
         }
     }
 }
@@ -214,8 +223,10 @@ impl Placeholder for ColorPlaceholder {
         format: PixelFormat,
     ) -> Result<VideoFrame, FluxError> {
         ensure_dims_match(self.width, self.height, width, height)?;
-        let bytes = convert_rgb_to(&self.rgb, width, height, format)?;
-        wrap_into_frame(bytes, width, height, format)
+        let bytes = self
+            .cache
+            .get_or_convert(&self.rgb, width, height, format)?;
+        wrap_into_frame(FrameBuffer::Shared(bytes), width, height, format)
     }
 }
 
@@ -238,6 +249,7 @@ pub(crate) struct ImagePlaceholder {
     width: u32,
     height: u32,
     rgb: Vec<u8>,
+    cache: ConvertedCache,
 }
 
 #[cfg(feature = "image-fill")]
@@ -261,6 +273,7 @@ impl ImagePlaceholder {
             width,
             height,
             rgb: resized.into_raw(),
+            cache: ConvertedCache::default(),
         })
     }
 }
@@ -274,14 +287,61 @@ impl Placeholder for ImagePlaceholder {
         format: PixelFormat,
     ) -> Result<VideoFrame, FluxError> {
         ensure_dims_match(self.width, self.height, width, height)?;
-        let bytes = convert_rgb_to(&self.rgb, width, height, format)?;
-        wrap_into_frame(bytes, width, height, format)
+        let bytes = self
+            .cache
+            .get_or_convert(&self.rgb, width, height, format)?;
+        wrap_into_frame(FrameBuffer::Shared(bytes), width, height, format)
     }
 }
 
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
+
+/// Per-placeholder memo of converted output bytes keyed by
+/// `(width, height, format)`. The placeholder image is static, so the
+/// first `render` for a given key runs the RGB→target conversion and
+/// every subsequent call returns a cheap `Arc` clone. This keeps the
+/// raised idle cadence (`min_visibility_fps`, ~10 Hz) from churning a
+/// fresh allocation + conversion on every tick.
+///
+/// `render` takes `&self`, so the cache uses interior mutability via a
+/// `Mutex`. In practice only the worker thread renders, but the
+/// `Placeholder` trait is `Send + Sync` and the `Mutex` keeps that
+/// contract honest at negligible cost (uncontended lock per tick).
+/// Memo keyed by the converted output's `(width, height, format)`.
+type ConvertedMap = HashMap<(u32, u32, PixelFormat), Arc<[u8]>>;
+
+#[derive(Default)]
+struct ConvertedCache {
+    map: Mutex<ConvertedMap>,
+}
+
+impl ConvertedCache {
+    /// Return the converted bytes for `(width, height, format)`, running
+    /// the conversion once and memoizing the result. Errors (unsupported
+    /// format, odd-width YUY2) are deliberately NOT cached, so they keep
+    /// surfacing on every call exactly as the un-cached path did.
+    fn get_or_convert(
+        &self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+    ) -> Result<Arc<[u8]>, FluxError> {
+        let key = (width, height, format);
+        // Recover from a poisoned lock: a prior panic while holding the
+        // guard does not corrupt the memo (entries are immutable once
+        // inserted), so the cached bytes stay valid.
+        let mut map = self.map.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(bytes) = map.get(&key) {
+            return Ok(Arc::clone(bytes));
+        }
+        let bytes: Arc<[u8]> = Arc::from(convert_rgb_to(rgb, width, height, format)?);
+        map.insert(key, Arc::clone(&bytes));
+        Ok(bytes)
+    }
+}
 
 fn ensure_dims_match(
     cached_w: u32,
@@ -301,25 +361,24 @@ fn ensure_dims_match(
     }
 }
 
-/// Wrap a packed byte buffer in a [`VideoFrame`] with a synthetic
+/// Wrap a packed buffer in a [`VideoFrame`] with a synthetic
 /// [`FrameMeta`]. The supervisor's writer thread overwrites
-/// timestamps anyway, so meta values are nominal.
+/// timestamps anyway, so meta values are nominal. Takes the buffer as
+/// a [`FrameBuffer`] so the caller can pass a zero-copy
+/// [`FrameBuffer::Shared`] clone from the converted-bytes cache.
 fn wrap_into_frame(
-    bytes: Vec<u8>,
+    buffer: FrameBuffer,
     width: u32,
     height: u32,
     format: PixelFormat,
 ) -> Result<VideoFrame, FluxError> {
-    VideoFrame::new_packed(
-        FrameBuffer::Owned(bytes),
-        width,
-        height,
-        format,
-        FrameMeta::default(),
-    )
-    .ok_or_else(|| FluxError::Config {
-        reason: format!("placeholder frame construction failed for {format:?} {width}x{height}"),
-        hint: None,
+    VideoFrame::new_packed(buffer, width, height, format, FrameMeta::default()).ok_or_else(|| {
+        FluxError::Config {
+            reason: format!(
+                "placeholder frame construction failed for {format:?} {width}x{height}"
+            ),
+            hint: None,
+        }
     })
 }
 
@@ -595,6 +654,24 @@ mod tests {
                     "error must mention the feature flag, got: {msg}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn repeated_render_is_byte_identical_via_cache() {
+        // The converted-bytes cache must be transparent: a second
+        // render of the same (w, h, format) returns the same bytes as
+        // the first. Also exercises two distinct formats sharing one
+        // placeholder so the per-key memo is keyed correctly.
+        let p = build(&color_cfg([10, 20, 30]), 4, 2).expect("build");
+        let first = p.render(4, 2, PixelFormat::Rgb).expect("render 1");
+        let second = p.render(4, 2, PixelFormat::Rgb).expect("render 2");
+        assert_eq!(first.data.as_slice(), second.data.as_slice());
+
+        let bgr = p.render(4, 2, PixelFormat::Bgr).expect("render bgr");
+        assert_eq!(bgr.format, PixelFormat::Bgr);
+        for chunk in bgr.data.as_slice().chunks_exact(3) {
+            assert_eq!(chunk, [30, 20, 10]);
         }
     }
 

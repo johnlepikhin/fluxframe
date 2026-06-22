@@ -153,14 +153,24 @@ device = "/dev/video1"
     }
 
     #[test]
-    fn idle_validation_rejects_deep_le_teardown() {
+    fn idle_validation_accepts_deep_le_teardown() {
+        // DeepIdle removed (Stage 16): the deep > teardown cross-check
+        // is gone, so deep_idle_secs == teardown_secs now loads fine.
         let mut cfg = FluxConfig::default();
         cfg.idle.teardown_secs = 10;
         cfg.idle.deep_idle_secs = 10;
+        cfg.validate()
+            .expect("deep_idle_secs == teardown_secs must be accepted after DeepIdle removal");
+    }
+
+    #[test]
+    fn idle_validation_rejects_excessive_min_visibility_fps() {
+        let mut cfg = FluxConfig::default();
+        cfg.idle.min_visibility_fps = 200;
         let err = cfg
             .validate()
-            .expect_err("deep_idle_secs == teardown_secs must be rejected (strict >)");
-        assert!(format!("{err}").contains("deep_idle_secs"));
+            .expect_err("min_visibility_fps>60 must be rejected");
+        assert!(format!("{err}").contains("min_visibility_fps"));
     }
 
     #[test]
