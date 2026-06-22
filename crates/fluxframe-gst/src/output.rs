@@ -253,7 +253,7 @@ impl OutputPipeline {
             pre_sink: sink_pre,
             sink: sink_elem,
             fd_guard,
-        } = build_sink_chain(sink, width, height, effective_sink_format)?;
+        } = build_sink_chain(sink, width, height, fps, effective_sink_format)?;
         sink_elem.set_property("sync", false);
 
         let sink_capsfilter = maybe_format_capsfilter(format, sink_format, fd_guard.is_some())?;
@@ -591,10 +591,15 @@ fn build_format_capsfilter(
 /// `VIDIOC_S_FMT` on the device before handing the fd to fdsink.
 /// Other sink paths ignore it (they delegate format negotiation to
 /// the sink element itself).
+///
+/// `fps` is the output frame rate; the V4l2Loopback path sets it on
+/// the device via `VIDIOC_S_PARM` so capture consumers see a valid
+/// frame interval. Other sink paths ignore it.
 fn build_sink_chain(
     sink: OutputSink,
     width: u32,
     height: u32,
+    fps: u32,
     effective_format: PixelFormat,
 ) -> Result<SinkChainResult, PipelineError> {
     match sink {
@@ -609,7 +614,7 @@ fn build_sink_chain(
             fd_guard: None,
         }),
         OutputSink::V4l2Loopback { device } => {
-            build_v4l2_direct_chain(&device, width, height, effective_format)
+            build_v4l2_direct_chain(&device, width, height, fps, effective_format)
         }
         OutputSink::Pipewire { node_name } => Ok(SinkChainResult {
             pre_sink: Vec::new(),
@@ -654,6 +659,7 @@ fn build_v4l2_direct_chain(
     device_path: &Path,
     width: u32,
     height: u32,
+    fps: u32,
     pixel_format: PixelFormat,
 ) -> Result<SinkChainResult, PipelineError> {
     // Pre-open write check first so EACCES/EBUSY/ENOENT surface with
@@ -697,6 +703,32 @@ fn build_v4l2_direct_chain(
         fourcc = %got.fourcc,
         "v4l2 output format negotiated",
     );
+
+    // Set the output frame interval (VIDIOC_S_PARM, timeperframe = 1/fps).
+    // Without this, v4l2loopback reports an uninitialised interval
+    // (`u32::MAX`s → 0 fps) to capture consumers, and Chrome/WebRTC
+    // refuse to open such a device ("preview unavailable"). Best-effort:
+    // a kernel that rejects S_PARM degrades to the old behaviour rather
+    // than failing the whole output, but every v4l2loopback build
+    // accepts it.
+    let want_fps = fps.max(1);
+    match v4l::video::Output::set_params(
+        &device,
+        &v4l::video::output::Parameters::with_fps(want_fps),
+    ) {
+        Ok(p) => debug!(
+            device = %canon.display(),
+            fps = want_fps,
+            interval = %p.interval,
+            "v4l2 output frame interval set",
+        ),
+        Err(e) => warn!(
+            device = %canon.display(),
+            fps = want_fps,
+            error = %e,
+            "VIDIOC_S_PARM failed; consumers may see a 0 fps device and refuse to open it",
+        ),
+    }
 
     let fd = device.handle().fd();
     let sink_elem = make_element("fdsink", "output_sink")?;

@@ -1410,37 +1410,27 @@ pub(crate) fn run_v4l2_chain(
             });
         }
     };
-    // The `v4l::Device` opened inside `detect_native_mode` is dropped
-    // at end-of-call (before the closure below opens the device via
-    // `v4l2src`).  Do not lift this call into the closure or a struct
-    // field — that would race v4l2src on VIDIOC_REQBUFS.
-    let detected = fluxframe_gst::v4l2_caps::detect_native_mode(&device_path, cfg.input.fps)?;
-    info!(
-        device = %device_path.display(),
-        cfg_w = cfg.input.width,
-        cfg_h = cfg.input.height,
-        cfg_fps = cfg.input.fps,
-        ?cfg.input.format,
-        detected_w = detected.width,
-        detected_h = detected.height,
-        detected_fps = detected.fps,
-        detected_format = ?detected.format,
-        "auto-detected v4l2 camera native mode"
-    );
-
-    // Only fps is taken from the camera; width/height stay at the
-    // operator-configured values.
-    let mut resolved = cfg.clone();
-    resolved.input.fps = detected.fps;
-
+    // Stage 16: detection now lives INSIDE the input builder so it runs
+    // on every (re)acquire attempt — the camera may be busy at startup
+    // and become free later. `detect_native_mode` opens the device and
+    // drops its `v4l::Device` before `build_v4l2` re-opens it via
+    // `v4l2src`, so there is no VIDIOC_REQBUFS race within a single
+    // attempt. Output fps comes from `cfg.input.fps`; only the *input*
+    // adopts the detected native fps (width/height stay operator-set).
     let device_path_for_builder = device_path.clone();
     run_chain(
-        &resolved,
+        cfg,
         preset_name,
         config_path,
         chain,
         "v4l2src",
-        move |params| InputPipeline::build_v4l2(&device_path_for_builder, params),
+        move |params| {
+            let detected =
+                fluxframe_gst::v4l2_caps::detect_native_mode(&device_path_for_builder, params.fps)?;
+            let resolved =
+                InputParams::new(params.width, params.height, detected.fps, params.format);
+            InputPipeline::build_v4l2(&device_path_for_builder, resolved)
+        },
     )
 }
 
@@ -1456,7 +1446,7 @@ fn run_chain<F>(
     input_builder: F,
 ) -> Result<(), FluxError>
 where
-    F: FnOnce(InputParams) -> Result<InputPipeline, PipelineError>,
+    F: Fn(InputParams) -> Result<InputPipeline, PipelineError>,
 {
     fluxframe_gst::init()?;
 
@@ -1467,11 +1457,11 @@ where
     // through the same counter bundle the supervisor reads later.
     let metrics = RuntimeMetrics::new();
 
-    let (input, output, mut processing_ctx, sink_label) = build_pipelines(cfg, input_builder)?;
-    // Stage 15 needs to share `input` with the reload thread, so the
-    // supervisor wraps it in an Arc up-front. `&*input` keeps the
-    // legacy `&InputPipeline` ergonomics for the rest of this fn.
-    let input: Arc<InputPipeline> = Arc::new(input);
+    // Stage 16: build + start the output (loopback) producer FIRST, so
+    // `/dev/video10` is enumerable by Chrome and streams a placeholder
+    // even while the camera is busy/absent. The input is acquired
+    // afterwards (with backoff on the supervised path).
+    let (output, mut processing_ctx, sink_label) = build_output(cfg)?;
     processing_ctx.counters = Some(Arc::clone(&metrics.counters));
     // Per-effect TOML configuration happens inside the composite
     // builder (preset path) and at construction for [`PassthroughEffect`],
@@ -1500,7 +1490,17 @@ where
     );
 
     output.start()?;
-    input.start()?;
+
+    // Stage 16: acquire the input AFTER the output is live. On the
+    // supervised path a busy/absent camera streams the placeholder and
+    // retries with backoff instead of tearing the loopback down.
+    // `prepare_input` tears the output + chain down itself on a clean
+    // shutdown (`None`) or a permanent error (`Err`).
+    let Some(input) = prepare_input(cfg, &input_builder, &output, &metrics, &mut chain)? else {
+        // Shutdown requested while waiting for the camera; prepare_input
+        // already tore the output + chain down.
+        return Ok(());
+    };
 
     let slot = input.slot();
     // The token guard MUST live until the end of this function: when it
@@ -1599,43 +1599,80 @@ where
     }
 }
 
-fn build_pipelines<F>(
+/// Stop the already-started output and shut the effect chain down —
+/// the partial-teardown path when input acquisition aborts (shutdown)
+/// or fails permanently, before the full [`teardown`] wiring exists.
+fn teardown_partial(output: &OutputPipeline, chain: &mut EffectChain) {
+    if let Err(e) = output.stop() {
+        warn!(error = %e, "output.stop failed during acquire teardown");
+    }
+    if let Err(e) = chain.shutdown_all() {
+        warn!(error = %e, "chain shutdown reported an error during acquire teardown");
+    }
+}
+
+/// Build the idle placeholder (supervised path only) and acquire the
+/// input. Returns `Some(input)` to proceed, `None` if shutdown was
+/// requested while waiting for the camera (output + chain already torn
+/// down here), or `Err` on a permanent acquire failure (also torn down
+/// here, so the caller just propagates).
+fn prepare_input<F>(
     cfg: &FluxConfig,
-    input_builder: F,
-) -> Result<
-    (
-        InputPipeline,
-        OutputPipeline,
-        ProcessingContext,
-        &'static str,
-    ),
-    FluxError,
->
+    input_builder: &F,
+    output: &OutputPipeline,
+    metrics: &RuntimeMetrics,
+    chain: &mut EffectChain,
+) -> Result<Option<Arc<InputPipeline>>, FluxError>
 where
-    F: FnOnce(InputParams) -> Result<InputPipeline, PipelineError>,
+    F: Fn(InputParams) -> Result<InputPipeline, PipelineError>,
 {
-    let input_params = InputParams::new(
-        cfg.input.width,
-        cfg.input.height,
-        cfg.input.fps,
-        cfg.input.format,
-    );
+    let (out_w, out_h) = cfg
+        .output
+        .effective_dimensions(cfg.input.width, cfg.input.height);
+    let placeholder: Option<Box<dyn crate::idle::Placeholder>> = if supervised_acquire(cfg) {
+        match crate::idle::build_placeholder(&cfg.idle, out_w, out_h) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                warn!(error = %e, "failed to build acquire placeholder — falling back to single-attempt input acquisition");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    match acquire_input(cfg, input_builder, output, metrics, placeholder.as_deref()) {
+        Ok(Some(input)) => Ok(Some(Arc::new(input))),
+        Ok(None) => {
+            teardown_partial(output, chain);
+            Ok(None)
+        }
+        Err(e) => {
+            teardown_partial(output, chain);
+            Err(e)
+        }
+    }
+}
+
+/// Build the output (loopback) pipeline and the processing context,
+/// independent of the input. Stage 16 brings the output up *first* so
+/// `/dev/video10` advertises CAPTURE caps and streams a placeholder
+/// while the camera is acquired (or retried) — see [`acquire_input`].
+fn build_output(
+    cfg: &FluxConfig,
+) -> Result<(OutputPipeline, ProcessingContext, &'static str), FluxError> {
     let sink = resolve_output_sink(cfg)?;
     let sink_label = output_sink_label(&sink);
-    // Sink dimensions = input × `output.scale`, rounded to even
-    // pixels.  For v4l2 cameras the supervisor has already overridden
-    // `cfg.input.width/height` with the auto-detected native mode, so
-    // this multiplication produces the right output size for the
-    // operator's chosen scale.  fps is inherited verbatim — operator
-    // cannot misconfigure the output to a different rate (which would
-    // silently insert videorate, duplicating or dropping frames).
+    // Sink dimensions = input × `output.scale`, rounded to even pixels.
+    // fps is inherited from `cfg.input.fps` verbatim; the camera's
+    // detected native fps is applied to the *input* at acquire time, and
+    // the output writer thread decouples the two cadences (it re-pushes
+    // the latest composite at the output rate, deduped by sequence).
     let (sink_w, sink_h) = cfg
         .output
         .effective_dimensions(cfg.input.width, cfg.input.height);
     let output_params = OutputParams::new(sink_w, sink_h, cfg.input.fps, cfg.input.format, sink)
         .with_sink_format(cfg.output.format);
 
-    let input = input_builder(input_params)?;
     let output = OutputPipeline::build(output_params)?;
 
     let processing_ctx = ProcessingContext {
@@ -1643,14 +1680,162 @@ where
         height: cfg.input.height,
         format: cfg.input.format,
         fps: cfg.input.fps,
-        // The caller (`run_chain`) fills in the supervisor's
-        // `Arc<Counters>` after `build_pipelines` returns.  `None`
-        // here is the correct default for any standalone caller that
-        // doesn't run a full supervisor.
+        // `run_chain` fills in the supervisor's `Arc<Counters>` after
+        // this returns.  `None` is the correct default for any
+        // standalone caller that doesn't run a full supervisor.
         counters: None,
     };
 
-    Ok((input, output, processing_ctx, sink_label))
+    Ok((output, processing_ctx, sink_label))
+}
+
+/// Whether the supervised (Stage 16) always-on path applies: idle mode
+/// on, a v4l2loopback sink (so a placeholder keeps the device visible),
+/// and a v4l2 camera input (the only source that can be busy/absent).
+/// testsrc never contends, so it keeps the plain single-attempt path.
+fn supervised_acquire(cfg: &FluxConfig) -> bool {
+    cfg.idle.enabled
+        && matches!(classify_output(cfg), OutputSpec::V4l2(_))
+        && matches!(classify_input(cfg), InputSpec::V4l2(_))
+}
+
+/// `true` for input errors that are device-contention (camera busy or
+/// temporarily absent) — the only class the supervisor retries forever.
+/// Everything else (missing element, bad caps/format, config) is treated
+/// as permanent and propagated so a real misconfiguration fails fast.
+fn is_input_contention(e: &FluxError) -> bool {
+    matches!(
+        e,
+        FluxError::Pipeline(fluxframe_core::PipelineError::InputDeviceUnavailable { .. })
+    )
+}
+
+/// Acquire (build + start) the input pipeline.
+///
+/// Non-supervised path: a single attempt; any error propagates (the
+/// `run_auto` layer decides whether to retry).
+///
+/// Supervised path (Stage 16, [`supervised_acquire`]): the output is
+/// already streaming, so on a *contention* error this keeps pushing the
+/// placeholder to `output` and retries with exponential backoff
+/// (`input.acquire_backoff_base_ms` → … → `_max_ms`), forever. A
+/// permanent error still propagates. `Ok(None)` signals shutdown was
+/// requested while waiting — the caller exits cleanly.
+fn acquire_input<F>(
+    cfg: &FluxConfig,
+    input_builder: &F,
+    output: &OutputPipeline,
+    metrics: &RuntimeMetrics,
+    placeholder: Option<&dyn crate::idle::Placeholder>,
+) -> Result<Option<InputPipeline>, FluxError>
+where
+    F: Fn(InputParams) -> Result<InputPipeline, PipelineError>,
+{
+    let (ph_w, ph_h) = cfg
+        .output
+        .effective_dimensions(cfg.input.width, cfg.input.height);
+    let base = Duration::from_millis(u64::from(cfg.input.acquire_backoff_base_ms));
+    let max = Duration::from_millis(u64::from(cfg.input.acquire_backoff_max_ms));
+    let mut backoff = base;
+    let mut logged_kind: Option<String> = None;
+
+    loop {
+        if is_shutdown_requested() {
+            return Ok(None);
+        }
+        metrics.counters.inc_input_acquire_attempts();
+        let params = InputParams::new(
+            cfg.input.width,
+            cfg.input.height,
+            cfg.input.fps,
+            cfg.input.format,
+        );
+        // build + start in one shot; both can surface a busy device.
+        let attempt = input_builder(params).and_then(|input| input.start().map(|()| input));
+        match attempt {
+            Ok(input) => return Ok(Some(input)),
+            Err(e) => {
+                let fe = FluxError::from(e);
+                let Some(placeholder) = placeholder.filter(|_| is_input_contention(&fe)) else {
+                    // Not supervised, or a permanent error → propagate.
+                    return Err(fe);
+                };
+                let cont = backoff_after_contention(
+                    &fe,
+                    &mut logged_kind,
+                    backoff,
+                    placeholder,
+                    ph_w,
+                    ph_h,
+                    cfg.input.format,
+                    output,
+                    metrics,
+                )?;
+                if !cont {
+                    // Shutdown requested during the backoff sleep.
+                    return Ok(None);
+                }
+                backoff = (backoff * 2).min(max);
+            }
+        }
+    }
+}
+
+/// Handle one contention failure during [`acquire_input`]: count it, log
+/// it (rate-limited — `warn` once per distinct error text, `debug` on
+/// repeats), push a placeholder so the loopback stays visible, then
+/// sleep the current `backoff` in Ctrl-C-responsive chunks. Returns
+/// `Ok(false)` if shutdown was requested during the sleep, `Ok(true)` to
+/// keep retrying, `Err` only if the output itself is broken.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "extracted from acquire_input's loop purely to satisfy too-many-lines; \
+              the arguments are the acquire context and bundling them adds no clarity"
+)]
+fn backoff_after_contention(
+    fe: &FluxError,
+    logged_kind: &mut Option<String>,
+    backoff: Duration,
+    placeholder: &dyn crate::idle::Placeholder,
+    ph_w: u32,
+    ph_h: u32,
+    format: fluxframe_core::frame::PixelFormat,
+    output: &OutputPipeline,
+    metrics: &RuntimeMetrics,
+) -> Result<bool, FluxError> {
+    metrics.counters.inc_input_acquire_failures();
+    let kind = fe.to_string();
+    if logged_kind.as_deref() == Some(kind.as_str()) {
+        tracing::debug!(
+            target: "fluxframe::idle",
+            backoff_ms = backoff.as_millis() as u64,
+            "input still unavailable — retrying",
+        );
+    } else {
+        warn!(
+            target: "fluxframe::idle",
+            error = %kind,
+            backoff_ms = backoff.as_millis() as u64,
+            "input device unavailable — streaming placeholder, retrying with backoff",
+        );
+        *logged_kind = Some(kind);
+    }
+    // Output itself broken → genuinely fatal (propagates).
+    push_placeholder(placeholder, ph_w, ph_h, format, output, metrics)?;
+    // Sleep the backoff in short chunks so Ctrl-C is honoured within
+    // ~100 ms regardless of the current backoff.
+    let deadline = Instant::now() + backoff;
+    while Instant::now() < deadline {
+        if is_shutdown_requested() {
+            return Ok(false);
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100)),
+        );
+    }
+    Ok(true)
 }
 
 /// Build the [`BusListener`] watching both pipelines.  The listener is
@@ -2376,6 +2561,48 @@ mod tests {
         let mut cfg = base_cfg();
         cfg.input.device = InputDevice::Testsrc;
         assert_eq!(classify_input(&cfg), InputSpec::Testsrc);
+    }
+
+    #[test]
+    fn is_input_contention_retries_only_device_unavailable() {
+        // Camera busy/absent → retry (the only contention class).
+        let busy = FluxError::Pipeline(fluxframe_core::PipelineError::InputDeviceUnavailable {
+            device: "/dev/video0".into(),
+            reason: "device is busy".into(),
+            hint: "another app holds it".into(),
+        });
+        assert!(is_input_contention(&busy));
+
+        // A missing element or a config error is permanent → fail fast,
+        // never spin forever on a real misconfiguration.
+        let missing = FluxError::Pipeline(fluxframe_core::PipelineError::MissingElement {
+            element: "v4l2src".into(),
+            hint: "install gst-plugins-good".into(),
+        });
+        assert!(!is_input_contention(&missing));
+        let cfg_err = FluxError::Config {
+            reason: "bad".into(),
+            hint: None,
+        };
+        assert!(!is_input_contention(&cfg_err));
+    }
+
+    #[test]
+    fn supervised_acquire_requires_idle_loopback_and_v4l2_input() {
+        // idle off → not supervised regardless of devices.
+        let mut cfg = base_cfg();
+        cfg.idle.enabled = false;
+        cfg.input.device = InputDevice::Path("/dev/video0".into());
+        cfg.output.device = "/dev/video10".into();
+        assert!(!supervised_acquire(&cfg));
+
+        // idle on + v4l2 loopback sink + v4l2 camera input → supervised.
+        cfg.idle.enabled = true;
+        assert!(supervised_acquire(&cfg));
+
+        // testsrc input never contends → not supervised.
+        cfg.input.device = InputDevice::Testsrc;
+        assert!(!supervised_acquire(&cfg));
     }
 
     #[test]

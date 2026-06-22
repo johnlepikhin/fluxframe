@@ -11,11 +11,13 @@
 
 //! Lifecycle wrapper around [`CompositeEffect`].
 //!
-//! Stage 15 adds the ability to drop the ONNX inference engine
-//! when the daemon enters `DeepIdle` and rebuild it when a consumer
-//! reconnects. The effect trait itself stays pure — `process` is
-//! still a per-frame compute call — so the lifecycle concern lives
-//! here in the CLI layer rather than leaking into every
+//! This wrapper exists for the (deferred) ability to drop the ONNX
+//! inference engine on a long idle and rebuild it when a consumer
+//! reconnects. (The `DeepIdle` state that would have triggered the
+//! drop was removed in Stage 16; the unload itself is still future
+//! work.) The effect trait itself stays pure — `process` is still a
+//! per-frame compute call — so the lifecycle concern lives here in the
+//! CLI layer rather than leaking into every
 //! `VideoEffect` implementer.
 //!
 //! [`ManagedComposite`] owns a [`CompositeEffect`] outright and

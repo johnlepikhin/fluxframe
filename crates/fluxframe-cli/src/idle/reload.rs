@@ -8,10 +8,12 @@
 //! 1. The input GStreamer pipeline (currently in `Null`) is brought
 //!    back to `Playing`, which on UVC cameras takes 50–300 ms for
 //!    USB renegotiation.
-//! 2. If we were in `DeepIdle`, the ONNX session was dropped — it
-//!    has to be rebuilt via [`fluxframe_effects::backend::
-//!    build_inference_engine`], which is another 300–700 ms of disk
-//!    + ORT init.
+//! 2. The ONNX session is still resident (it is kept warm across
+//!    `Idle` — the `DeepIdle` state that used to drop it was removed
+//!    in Stage 16), so `engine_reloader` is a no-op today. The hook is
+//!    kept for the future RAM-reclamation path that would rebuild the
+//!    session via [`fluxframe_effects::backend::build_inference_engine`]
+//!    (another 300–700 ms of disk + ORT init).
 //!
 //! Doing either on the worker thread would stall the placeholder
 //! cadence and leave the just-reconnected consumer staring at the

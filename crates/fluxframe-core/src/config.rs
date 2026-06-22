@@ -250,6 +250,18 @@ pub struct InputConfig {
     /// explicit path or backend name.
     #[serde(default)]
     pub auto: AutoInputConfig,
+    /// Base delay (milliseconds) for the input-acquire exponential
+    /// backoff. When `idle.enabled`, the supervisor keeps the
+    /// v4l2loopback output streaming a placeholder and retries acquiring
+    /// the camera with backoff starting at this value (doubling up to
+    /// `acquire_backoff_max_ms`). Only device-contention errors
+    /// (busy/absent) are retried; permanent errors fail fast.
+    #[serde(default = "default_acquire_backoff_base_ms")]
+    pub acquire_backoff_base_ms: u32,
+    /// Ceiling (milliseconds) for the input-acquire backoff. Must be
+    /// `>= acquire_backoff_base_ms`.
+    #[serde(default = "default_acquire_backoff_max_ms")]
+    pub acquire_backoff_max_ms: u32,
 }
 
 impl Default for InputConfig {
@@ -262,6 +274,8 @@ impl Default for InputConfig {
             fps: default_fps(),
             format: default_input_format(),
             auto: AutoInputConfig::default(),
+            acquire_backoff_base_ms: default_acquire_backoff_base_ms(),
+            acquire_backoff_max_ms: default_acquire_backoff_max_ms(),
         }
     }
 }
@@ -297,6 +311,17 @@ impl Default for AutoInputConfig {
 fn default_auto_poll_interval_secs() -> u32 {
     2
 }
+fn default_acquire_backoff_base_ms() -> u32 {
+    500
+}
+fn default_acquire_backoff_max_ms() -> u32 {
+    5000
+}
+
+/// Upper inclusive bound on `input.acquire_backoff_max_ms` — a busy
+/// camera should be re-tried at least every 30 s; beyond that the
+/// recovery latency feels broken.
+pub const MAX_ACQUIRE_BACKOFF_MS: u32 = 30_000;
 
 // ---------------------------------------------------------------------------
 // Section: output
@@ -897,6 +922,27 @@ impl FluxConfig {
             return Err(config_err(format!(
                 "input.auto.poll_interval_secs must be in 1..={MAX_POLL_INTERVAL_SECS}, got {}",
                 self.input.auto.poll_interval_secs
+            )));
+        }
+
+        // Input-acquire backoff bounds. `base == 0` would busy-spin on a
+        // contended camera; `max < base` is incoherent; an oversized cap
+        // makes recovery feel broken.
+        if self.input.acquire_backoff_base_ms == 0 {
+            return Err(config_err(
+                "input.acquire_backoff_base_ms must be > 0, got 0".into(),
+            ));
+        }
+        if self.input.acquire_backoff_max_ms > MAX_ACQUIRE_BACKOFF_MS {
+            return Err(config_err(format!(
+                "input.acquire_backoff_max_ms must be <= {MAX_ACQUIRE_BACKOFF_MS}, got {}",
+                self.input.acquire_backoff_max_ms
+            )));
+        }
+        if self.input.acquire_backoff_max_ms < self.input.acquire_backoff_base_ms {
+            return Err(config_err(format!(
+                "input.acquire_backoff_max_ms ({}) must be >= input.acquire_backoff_base_ms ({})",
+                self.input.acquire_backoff_max_ms, self.input.acquire_backoff_base_ms
             )));
         }
 

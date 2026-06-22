@@ -75,6 +75,16 @@ v4l2-ctl --list-devices
 > `fluxframe check` диагностирует это и подскажет команду перезагрузки
 > модуля.
 
+> **Камера занята на старте (Stage 16).** При `[idle] enabled = true`
+> FluxFrame поднимает `/dev/video10` и стримит placeholder ещё до захвата
+> камеры, а занятую `/dev/video0` ретраит с backoff — `/dev/video10`
+> остаётся видимым в Chrome. Проверка после деплоя: занять камеру
+> `cat /dev/video0 >/dev/null &`, запустить FluxFrame → `v4l2-ctl
+> --list-devices` показывает «FluxFrame Camera» и Chrome её видит (серый
+> placeholder); затем `kill %1` — в пределах одного backoff появляется
+> живое видео. В логе строка `input device unavailable …` должна быть
+> одна (без флуда).
+
 ## ONNX Runtime setup (Stage 3+)
 
 `fluxframe-effects::ml::OnnxEngine` loads ONNX Runtime dynamically via
@@ -520,13 +530,15 @@ without enabling debug-level globally.
   needing `EffectChain` ↔ `ManagedComposite` integration
   (`SegmentationBase::take_engine` / `install_engine` accessors are
   already in place; the chain refactor is the missing piece).
-- **Always-on loopback visibility (deferred).** When the camera is busy
-  or absent the output producer is still torn down on each retry, so
-  `/dev/video10` can vanish from Chrome's list mid-restart. The planned
-  fix decouples the loopback producer from the input lifecycle (keep it
-  streaming the placeholder through camera-acquire backoff) and splits
-  input-vs-output bus fatals. Tracked separately; needs hardware
-  verification.
+- **Always-on loopback visibility (Stage 16, done).** With `idle.enabled`
+  the output (loopback) producer is now built and started *before* the
+  camera, so `/dev/video10` advertises CAPTURE caps and streams the
+  placeholder even when `/dev/video0` is busy/absent at startup. A busy
+  camera is retried with exponential backoff (`input.acquire_backoff_base_ms`
+  → `…_max_ms`) instead of crash-looping. **Remaining (deferred):** when
+  the camera is unplugged *mid-stream*, the output still blips briefly on
+  the `run_auto` re-entry (the loopback `LatestFrameSlot` is owned by the
+  `InputPipeline`, so a zero-blip rebuild needs slot/input decoupling).
 - **`engine_ready` race tightening** — currently survivable (one
   unnecessary placeholder push per resume race) but worth moving
   `store(false)` into `spawn_reload_thread`'s body to close the

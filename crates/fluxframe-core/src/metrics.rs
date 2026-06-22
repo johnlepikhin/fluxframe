@@ -66,6 +66,14 @@ pub struct Counters {
     idle_entered_total: AtomicU64,
     deep_idle_entered_total: AtomicU64,
     idle_frames_pushed_total: AtomicU64,
+    // Stage 16 input-supervisor counters. `input_acquire_attempts_total`
+    // increments each time the supervisor spawns an acquire (build+start
+    // of the camera input); `input_acquire_failures_total` on each failed
+    // acquire (busy/absent camera). A growing gap between the two with a
+    // flat `frames_in` means the camera is contended — the loopback keeps
+    // streaming the placeholder meanwhile.
+    input_acquire_attempts_total: AtomicU64,
+    input_acquire_failures_total: AtomicU64,
 }
 
 impl Counters {
@@ -83,6 +91,8 @@ impl Counters {
             idle_entered_total: AtomicU64::new(0),
             deep_idle_entered_total: AtomicU64::new(0),
             idle_frames_pushed_total: AtomicU64::new(0),
+            input_acquire_attempts_total: AtomicU64::new(0),
+            input_acquire_failures_total: AtomicU64::new(0),
         }
     }
 
@@ -169,6 +179,22 @@ impl Counters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment `input_acquire_attempts_total` — fires each time the
+    /// supervisor spawns an input-acquire (build+start of the camera).
+    #[inline]
+    pub fn inc_input_acquire_attempts(&self) {
+        self.input_acquire_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `input_acquire_failures_total` — fires on each failed
+    /// acquire (camera busy/absent), before the supervisor backs off.
+    #[inline]
+    pub fn inc_input_acquire_failures(&self) {
+        self.input_acquire_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot the counter values.  Each load is independent — there
     /// is no cross-counter atomicity guarantee.
     #[must_use]
@@ -188,6 +214,8 @@ impl Counters {
             idle_entered_total: self.idle_entered_total.load(Ordering::Relaxed),
             deep_idle_entered_total: self.deep_idle_entered_total.load(Ordering::Relaxed),
             idle_frames_pushed_total: self.idle_frames_pushed_total.load(Ordering::Relaxed),
+            input_acquire_attempts_total: self.input_acquire_attempts_total.load(Ordering::Relaxed),
+            input_acquire_failures_total: self.input_acquire_failures_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -222,6 +250,10 @@ pub struct CounterValues {
     pub deep_idle_entered_total: u64,
     /// See [`Counters::inc_idle_frames_pushed`].
     pub idle_frames_pushed_total: u64,
+    /// See [`Counters::inc_input_acquire_attempts`].
+    pub input_acquire_attempts_total: u64,
+    /// See [`Counters::inc_input_acquire_failures`].
+    pub input_acquire_failures_total: u64,
 }
 
 /// Bounded ring of latency samples in microseconds.

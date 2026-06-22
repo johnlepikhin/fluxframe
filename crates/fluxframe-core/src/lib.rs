@@ -174,6 +174,33 @@ device = "/dev/video1"
     }
 
     #[test]
+    fn input_validation_rejects_zero_acquire_backoff_base() {
+        let mut cfg = FluxConfig::default();
+        cfg.input.acquire_backoff_base_ms = 0;
+        let err = cfg
+            .validate()
+            .expect_err("acquire_backoff_base_ms=0 must be rejected");
+        assert!(format!("{err}").contains("acquire_backoff_base_ms"));
+    }
+
+    #[test]
+    fn input_validation_rejects_max_below_base() {
+        let mut cfg = FluxConfig::default();
+        cfg.input.acquire_backoff_base_ms = 2000;
+        cfg.input.acquire_backoff_max_ms = 1000;
+        let err = cfg.validate().expect_err("max < base must be rejected");
+        assert!(format!("{err}").contains("acquire_backoff_max_ms"));
+    }
+
+    #[test]
+    fn input_validation_accepts_default_backoff() {
+        // Defaults (500/5000) must validate cleanly.
+        FluxConfig::default()
+            .validate()
+            .expect("default backoff knobs must validate");
+    }
+
+    #[test]
     fn idle_validation_rejects_zero_deep_idle_secs() {
         let mut cfg = FluxConfig::default();
         cfg.idle.deep_idle_secs = 0;
