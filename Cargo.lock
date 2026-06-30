@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "fluxframe-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -536,7 +536,7 @@ dependencies = [
 
 [[package]]
 name = "fluxframe-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "parking_lot",
  "serde",
@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "fluxframe-effects"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "fluxframe-core",
  "image",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "fluxframe-gst"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "fluxframe-core",
  "glib 0.20.12",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "fluxframe-gui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
  "fluxframe-core",
