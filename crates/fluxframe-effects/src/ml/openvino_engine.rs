@@ -78,9 +78,17 @@ pub struct OpenVinoEngine {
                   field; no methods need to be called on it after construction."
     )]
     compiled: CompiledModel,
-    /// Per-engine reusable infer request.  Re-bound to a fresh input
-    /// tensor on every `infer()` call.
+    /// Per-engine reusable infer request.  The input tensor
+    /// ([`Self::input_tensor`]) is bound to it once and reused; each
+    /// frame overwrites the tensor's data buffer in place.
     request: InferRequest,
+    /// Reused input tensor, (re)allocated and (re)bound to `request`
+    /// only when the input shape changes (so a dynamic model still
+    /// works; the static selfie model builds it exactly once). This
+    /// replaces the per-frame `Tensor::new` that drove ~768 KB/frame of
+    /// heap churn under the AUTO/CPU plugin (multi-GB RSS over a run).
+    /// `Some` is the invariant "allocated AND successfully bound".
+    input_tensor: Option<CachedInputTensor>,
     /// Tensor name expected by the loaded model on its single input
     /// port (e.g. `"input_1:0"` for SelfieSegmentation).  Captured
     /// once at load so the hot path does not call OpenVINO metadata
@@ -106,6 +114,25 @@ pub struct OpenVinoEngine {
                   `input_name` / `output_name`."
     )]
     config: ModelConfig,
+}
+
+/// The reused input tensor plus the shape it was allocated for.
+///
+/// `shape` is the OpenVINO `i64` form (matching the `shape_i64` built in
+/// [`OpenVinoEngine::infer`]) so the per-frame "do we need to
+/// reallocate?" check is a plain slice compare with no conversion.
+struct CachedInputTensor {
+    shape: Vec<i64>,
+    tensor: Tensor,
+}
+
+/// Whether the cached input tensor must be (re)allocated for `shape`.
+///
+/// Pure decision extracted from the hot path so it is unit-testable
+/// without an OpenVINO runtime. `None` (no tensor yet) or a shape
+/// mismatch both force a reallocation; an exact match reuses.
+fn needs_realloc(cached_shape: Option<&[i64]>, shape: &[i64]) -> bool {
+    cached_shape != Some(shape)
 }
 
 impl OpenVinoEngine {
@@ -224,6 +251,7 @@ impl OpenVinoEngine {
             core,
             compiled,
             request,
+            input_tensor: None,
             input_name,
             output_name,
             device: device.to_string(),
@@ -272,24 +300,51 @@ impl InferenceEngine for OpenVinoEngine {
             .map_err(|e| InferenceError::InferenceFailed {
                 reason: format!("shape dimension overflow: {e}"),
             })?;
-        let shape = Shape::new(&shape_i64).map_err(|e| InferenceError::InferenceFailed {
-            reason: format!("Shape::new({:?}): {e}", input.shape),
-        })?;
-        let mut tensor =
-            Tensor::new(ElementType::F32, &shape).map_err(|e| InferenceError::InferenceFailed {
-                reason: format!("Tensor::new(F32, {:?}): {e}", input.shape),
+        // (Re)allocate + bind the input tensor only when the shape
+        // changes (once, for the static selfie model). The hot path
+        // below just overwrites its buffer — no per-frame allocation.
+        if needs_realloc(
+            self.input_tensor.as_ref().map(|c| c.shape.as_slice()),
+            &shape_i64,
+        ) {
+            let shape = Shape::new(&shape_i64).map_err(|e| InferenceError::InferenceFailed {
+                reason: format!("Shape::new({:?}): {e}", input.shape),
             })?;
-        tensor
+            let tensor = Tensor::new(ElementType::F32, &shape).map_err(|e| {
+                InferenceError::InferenceFailed {
+                    reason: format!("Tensor::new(F32, {:?}): {e}", input.shape),
+                }
+            })?;
+            // Bind once. OpenVINO reads the tensor lazily at `infer()`
+            // time, so in-place overwrites of its buffer are picked up
+            // without re-calling `set_tensor` per frame.
+            self.request
+                .set_tensor(&self.input_name, &tensor)
+                .map_err(|e| InferenceError::InferenceFailed {
+                    reason: format!("set_tensor({}): {e}", self.input_name),
+                })?;
+            // Only now is the cache valid: allocated AND bound. If either
+            // step above failed we left `input_tensor` untouched (`None`
+            // or the prior tensor) so the next call retries cleanly.
+            self.input_tensor = Some(CachedInputTensor {
+                shape: shape_i64,
+                tensor,
+            });
+            debug!(
+                input_shape = ?input.shape,
+                "openvino input tensor (re)allocated and bound",
+            );
+        }
+        // Overwrite the reused tensor's buffer in place with this frame.
+        self.input_tensor
+            .as_mut()
+            .expect("input_tensor is Some after the (re)alloc block")
+            .tensor
             .get_data_mut::<f32>()
             .map_err(|e| InferenceError::InferenceFailed {
                 reason: format!("tensor.get_data_mut: {e}"),
             })?
             .copy_from_slice(input.data);
-        self.request
-            .set_tensor(&self.input_name, &tensor)
-            .map_err(|e| InferenceError::InferenceFailed {
-                reason: format!("set_tensor({}): {e}", self.input_name),
-            })?;
         self.request
             .infer()
             .map_err(|e| InferenceError::InferenceFailed {
@@ -404,6 +459,58 @@ mod tests {
         assert!(
             (-0.01..=1.01).contains(&min) && (-0.01..=1.01).contains(&max),
             "mask values out of [0, 1]: min={min} max={max}"
+        );
+    }
+
+    /// CI-runnable (no OpenVINO runtime needed): the pure cache-reuse
+    /// decision that keeps `infer()` from reallocating the input tensor
+    /// per frame. This is the regression-prone part of the leak fix
+    /// (the dynamic-shape branch); the FFI reuse path is hardware-gated.
+    #[test]
+    fn needs_realloc_only_on_first_call_or_shape_change() {
+        let shape: [i64; 4] = [1, 256, 256, 3];
+        // No tensor yet → must allocate.
+        assert!(needs_realloc(None, &shape));
+        // Same shape → reuse (no allocation).
+        assert!(!needs_realloc(Some(&shape), &shape));
+        // Changed shape → reallocate.
+        let other: [i64; 4] = [1, 128, 128, 3];
+        assert!(needs_realloc(Some(&shape), &other));
+        // Differing rank also reallocates.
+        assert!(needs_realloc(Some(&shape), &[1, 256, 256]));
+    }
+
+    /// FFI reuse smoke: run `infer()` several times on one engine and
+    /// confirm each call still produces a valid mask (exercises the
+    /// "bind once, overwrite in place" path). Memory non-growth is a
+    /// hardware metric verified out-of-band (sample `/proc/<pid>/status`
+    /// `VmRSS` under `fluxframe run` with the OpenVINO backend).
+    #[test]
+    #[ignore = "requires Guix Home with openvino-full + the SelfieSegmentation ONNX file"]
+    fn infer_reuses_input_tensor_across_calls() {
+        let model_path = selfie_segmentation_path();
+        if !model_path.exists() {
+            eprintln!("skipping: {} not found", model_path.display());
+            return;
+        }
+        let cfg = ModelConfig::new("mediapipe-selfie-segmentation", 256, 256);
+        let mut engine = OpenVinoEngine::load(&model_path, cfg, "CPU").expect("openvino load");
+        let shape = [1_usize, 256, 256, 3];
+        let pixels: usize = shape.iter().product();
+        for i in 0..5 {
+            let data = vec![(i as f32) * 0.1; pixels];
+            let out = engine
+                .infer(InferenceInput {
+                    data: &data,
+                    shape: &shape,
+                })
+                .expect("infer ok on reuse");
+            assert!(!out.data.is_empty(), "empty output on call {i}");
+        }
+        // After the first call the tensor must be cached and reused.
+        assert!(
+            engine.input_tensor.is_some(),
+            "input tensor should be cached after inference"
         );
     }
 }
