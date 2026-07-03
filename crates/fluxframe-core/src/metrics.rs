@@ -2,10 +2,14 @@
 //!
 //! Wire-compatible with §29 of the spec (periodic
 //! `fps=… dropped=… latency_p50=…ms latency_p95=…ms inference_p50=…ms`
-//! reporter).  This module defines the pure data types only; the
-//! supervisor wiring (incrementing counters, recording latencies on
-//! each frame) and the periodic CLI reporter ship in follow-on
-//! commits (5.D.2 and 5.D.3 of the Stage 5 plan).
+//! reporter).  This module owns the metric data types ([`Counters`],
+//! [`CounterValues`], the histograms, [`MetricsSnapshot`]) **and** the
+//! single structured-log emitter [`emit_metrics_line`] — kept here, next
+//! to `CounterValues`, so the field list is exhaustively destructured in
+//! one place and the compiler flags any counter added but never emitted.
+//! The supervisor wiring (incrementing counters, recording latencies) and
+//! the periodic CLI reporter live in `fluxframe-cli` and call
+//! [`emit_metrics_line`].
 //!
 //! Design:
 //! * [`Counters`] is `Arc`-sharable; the supervisor's hot loop and the
@@ -57,12 +61,12 @@ pub struct Counters {
     // counter shape rather than encoding the source as a string.
     inference_runtime_fallback_gpu_to_cpu: AtomicU64,
     blur_runtime_fallback_gpu_to_cpu: AtomicU64,
-    // Stage 15 idle-mode counters. `idle_entered_total` increments
-    // on every Active → Idle edge; `deep_idle_entered_total` on every
-    // Idle → DeepIdle edge; `idle_frames_pushed_total` is the count
-    // of placeholder frames emitted to the output during idle/deep
-    // idle steady state. The supervisor's teardown summary surfaces
-    // all three.
+    // Stage 15 idle-mode counters. `idle_entered_total` increments on
+    // every Active → Idle edge; `idle_frames_pushed_total` is the count
+    // of placeholder frames emitted to the output during idle steady
+    // state. `deep_idle_entered_total` is retained but always 0 — the
+    // `DeepIdle` state was removed in Stage 16 (see the deprecated
+    // `inc_deep_idle_entered`); the field stays for wire-compat.
     idle_entered_total: AtomicU64,
     deep_idle_entered_total: AtomicU64,
     idle_frames_pushed_total: AtomicU64,
@@ -74,6 +78,15 @@ pub struct Counters {
     // streaming the placeholder meanwhile.
     input_acquire_attempts_total: AtomicU64,
     input_acquire_failures_total: AtomicU64,
+    // Consumer-wake + hotplug counters. `resume_failures_total` increments
+    // each time an idle→active resume fails to re-acquire the camera input
+    // (which restarts the chain; under `device = "auto"` that re-enumerates
+    // the capture device on the next pass). `unattributable_wakes_total`
+    // increments each time the consumer detector wakes on an open of the
+    // loopback it could not attribute via `/proc` (EACCES — e.g. a sandboxed
+    // browser).
+    resume_failures_total: AtomicU64,
+    unattributable_wakes_total: AtomicU64,
 }
 
 impl Counters {
@@ -93,6 +106,8 @@ impl Counters {
             idle_frames_pushed_total: AtomicU64::new(0),
             input_acquire_attempts_total: AtomicU64::new(0),
             input_acquire_failures_total: AtomicU64::new(0),
+            resume_failures_total: AtomicU64::new(0),
+            unattributable_wakes_total: AtomicU64::new(0),
         }
     }
 
@@ -195,6 +210,22 @@ impl Counters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment `resume_failures_total` — fires each time an idle→active
+    /// resume fails to re-acquire the camera input.
+    #[inline]
+    pub fn inc_resume_failures(&self) {
+        self.resume_failures_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `unattributable_wakes_total` — fires when the consumer
+    /// detector wakes on a loopback open it could not attribute via
+    /// `/proc` (EACCES: sandboxed/privileged consumer).
+    #[inline]
+    pub fn inc_unattributable_wakes(&self) {
+        self.unattributable_wakes_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot the counter values.  Each load is independent — there
     /// is no cross-counter atomicity guarantee.
     #[must_use]
@@ -216,6 +247,8 @@ impl Counters {
             idle_frames_pushed_total: self.idle_frames_pushed_total.load(Ordering::Relaxed),
             input_acquire_attempts_total: self.input_acquire_attempts_total.load(Ordering::Relaxed),
             input_acquire_failures_total: self.input_acquire_failures_total.load(Ordering::Relaxed),
+            resume_failures_total: self.resume_failures_total.load(Ordering::Relaxed),
+            unattributable_wakes_total: self.unattributable_wakes_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -254,6 +287,10 @@ pub struct CounterValues {
     pub input_acquire_attempts_total: u64,
     /// See [`Counters::inc_input_acquire_failures`].
     pub input_acquire_failures_total: u64,
+    /// See [`Counters::inc_resume_failures`].
+    pub resume_failures_total: u64,
+    /// See [`Counters::inc_unattributable_wakes`].
+    pub unattributable_wakes_total: u64,
 }
 
 /// Bounded ring of latency samples in microseconds.
@@ -501,9 +538,168 @@ impl MetricsSnapshot {
     }
 }
 
+/// Rolling-window extras only the periodic reporter has: the frames/drop
+/// deltas since the last tick and the window they were observed over.
+///
+/// The teardown summary — which reports absolute totals, not deltas —
+/// passes `None` to [`emit_metrics_line`], and these fields emit as zero.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PeriodicExtras {
+    /// `frames_out` delta since the previous tick.
+    pub frames_out_delta: u64,
+    /// `frames_dropped` delta since the previous tick.
+    pub dropped_delta: u64,
+    /// Wall-clock window the deltas were observed over.
+    pub window: Duration,
+}
+
+/// Emit one structured metrics `info!` line — the SINGLE source of truth
+/// for the metrics field set.
+///
+/// Both the periodic reporter (`fluxframe-cli::metrics_reporter`) and the
+/// supervisor's teardown summary call this, so a newly added counter is
+/// emitted from exactly one place with one key. The `snap.counters`
+/// destructure below is intentionally exhaustive (no `..`): adding a field
+/// to [`CounterValues`] is a compile error here until it is wired into the
+/// line, which is the guard against "counter added but never emitted".
+///
+/// `extras` carries the reporter's rolling-window deltas; the teardown
+/// summary passes `None` (the delta/fps fields emit as zero). The line is
+/// emitted under the `fluxframe::metrics` target so `RUST_LOG=fluxframe=…`
+/// filters keep matching it.
+pub fn emit_metrics_line(snap: &MetricsSnapshot, extras: Option<PeriodicExtras>) {
+    // Exhaustive by design — see the doc comment. `CounterValues` is
+    // `Copy`, so this reads out of the borrowed snapshot without moving it.
+    let CounterValues {
+        frames_in,
+        frames_out,
+        frames_dropped,
+        fallback_count,
+        effect_error_count,
+        inference_runtime_fallback_gpu_to_cpu,
+        blur_runtime_fallback_gpu_to_cpu,
+        idle_entered_total,
+        deep_idle_entered_total,
+        idle_frames_pushed_total,
+        input_acquire_attempts_total,
+        input_acquire_failures_total,
+        resume_failures_total,
+        unattributable_wakes_total,
+    } = snap.counters;
+
+    let ex = extras.unwrap_or_default();
+    let periodic = extras.is_some();
+    let fps = round2(compute_fps(ex.frames_out_delta, ex.window));
+    let window_secs = round2(ex.window.as_secs_f64());
+    // Distinguish the two callers by message so existing log greps keep
+    // working; the field set is identical either way.
+    let msg = if periodic {
+        "metrics tick"
+    } else {
+        "run metrics"
+    };
+
+    tracing::info!(
+        target: "fluxframe::metrics",
+        fps = fps,
+        window_secs = window_secs,
+        frames_out_delta = ex.frames_out_delta,
+        dropped_delta = ex.dropped_delta,
+        frames_in_total = frames_in,
+        frames_out_total = frames_out,
+        frames_dropped_total = frames_dropped,
+        fallback_total = fallback_count,
+        effect_err_total = effect_error_count,
+        inference_runtime_fallback_gpu_to_cpu = inference_runtime_fallback_gpu_to_cpu,
+        blur_runtime_fallback_gpu_to_cpu = blur_runtime_fallback_gpu_to_cpu,
+        idle_entered_total = idle_entered_total,
+        deep_idle_entered_total = deep_idle_entered_total,
+        idle_frames_pushed_total = idle_frames_pushed_total,
+        input_acquire_attempts_total = input_acquire_attempts_total,
+        input_acquire_failures_total = input_acquire_failures_total,
+        resume_failures_total = resume_failures_total,
+        unattributable_wakes_total = unattributable_wakes_total,
+        capture_p50_us = snap.capture.percentile_us(0.5),
+        capture_p95_us = snap.capture.percentile_us(0.95),
+        inference_p50_us = snap.inference.percentile_us(0.5),
+        inference_p95_us = snap.inference.percentile_us(0.95),
+        processing_p50_us = snap.processing.percentile_us(0.5),
+        processing_p95_us = snap.processing.percentile_us(0.95),
+        output_p50_us = snap.output.percentile_us(0.5),
+        output_p95_us = snap.output.percentile_us(0.95),
+        end_to_end_p50_us = snap.end_to_end.percentile_us(0.5),
+        end_to_end_p95_us = snap.end_to_end.percentile_us(0.95),
+        "{msg}"
+    );
+}
+
+/// Frames-per-second from a frame delta and its wall-clock window.
+/// Returns `0.0` for zero-length windows (defensive against a clock that
+/// did not advance between ticks on coarse-`Instant` systems).
+#[inline]
+fn compute_fps(frames_delta: u64, dt: Duration) -> f64 {
+    let secs = dt.as_secs_f64();
+    if secs <= 0.0 {
+        0.0
+    } else {
+        (frames_delta as f64) / secs
+    }
+}
+
+/// Round to two decimal places. Display-only for the reporter line; never
+/// used for a downstream calculation.
+#[inline]
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn approx_eq(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn compute_fps_zero_window_returns_zero() {
+        assert!(approx_eq(compute_fps(100, Duration::ZERO), 0.0));
+    }
+
+    #[test]
+    fn compute_fps_zero_frames_returns_zero() {
+        assert!(approx_eq(compute_fps(0, Duration::from_secs(5)), 0.0));
+    }
+
+    #[test]
+    fn compute_fps_normal_window() {
+        // 150 frames over 5 s → 30 fps.
+        let fps = compute_fps(150, Duration::from_secs(5));
+        assert!((fps - 30.0).abs() < 1e-9, "expected 30 fps, got {fps}");
+    }
+
+    #[test]
+    fn round2_basic() {
+        assert!(approx_eq(round2(23.965_698_241), 23.97));
+        assert!(approx_eq(round2(0.0), 0.0));
+        assert!(approx_eq(round2(100.0), 100.0));
+    }
+
+    #[test]
+    fn emit_metrics_line_smoke_both_variants() {
+        // Exercises the emit path (exhaustive destructure + info!) without
+        // asserting on captured output — just that neither variant panics.
+        let snap = MetricsSnapshot::new();
+        emit_metrics_line(&snap, None);
+        emit_metrics_line(
+            &snap,
+            Some(PeriodicExtras {
+                frames_out_delta: 30,
+                dropped_delta: 1,
+                window: Duration::from_secs(1),
+            }),
+        );
+    }
 
     #[test]
     fn counters_default_zero() {

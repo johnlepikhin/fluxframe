@@ -14,6 +14,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
+# Structured logging. Core stays GStreamer/ONNX-free, but `emit_metrics_line`
+# is the single source of truth for the metrics `info!` line (consumed by
+# both the periodic reporter and the teardown summary in `fluxframe-cli`);
+# keeping the field list here — next to `CounterValues` — lets the compiler
+# guard "counter added but not emitted". `tracing` is pure safe Rust, so it
+# does not compromise the crate's `#![forbid(unsafe_code)]`.
+tracing = { workspace = true }
 
 [lints]
 workspace = true

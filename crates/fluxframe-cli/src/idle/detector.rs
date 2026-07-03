@@ -28,21 +28,29 @@
 //! per-poll `/proc` walk, and the kernel only delivers an actual
 //! event when somebody opens or closes the device.
 //!
-//! Counting events naively is unsound — fluxframe's input pipeline
-//! opens and closes the device on its own state transitions, and
-//! we have no way to distinguish self-events from external ones at
-//! the event level. So on every event the detector walks
-//! `/proc/[0-9]+/fd/` via [`count_external_consumers`], which
-//! filters out `my_pid` and decides Present/Absent:
+//! On every event the detector classifies the device via two signals,
+//! folded together in [`ConsumerPresence`]:
 //!
-//! * one or more external pids hold the fd → `Present`
-//! * nobody but fluxframe holds the fd → `Absent`
-//! * `/proc` itself is unreadable → `Unknown` (fail-open)
+//! 1. A `/proc/[0-9]+/fd/` walk ([`count_external_consumers`], filtering
+//!    out `my_pid`) yields a [`WalkOutcome`]: a readable external holder
+//!    (`External`), a fully-readable "nobody" (`CleanAbsent`), a walk
+//!    where ≥1 candidate `/proc/<pid>/fd` returned `EACCES` so the answer
+//!    is suspect (`UncertainAbsent` — a sandboxed/root-owned consumer is
+//!    indistinguishable from "nobody"), or an unreadable `/proc` root
+//!    (`Unreadable` → `Unknown`, fail-open).
+//! 2. A net **open balance**: `IN_OPEN` is `+1`, `IN_CLOSE_*` is `−1`,
+//!    accumulated since the watch armed. fluxframe never re-opens the
+//!    loopback after startup (its output write-fd is opened before the
+//!    watch and held for the whole run), so a positive balance means an
+//!    external consumer is attached — *even one the walk cannot see*.
 //!
-//! Per-pid walk errors — `EACCES` on `/proc/<root-pid>/fd`,
-//! `ENOENT` from a process that exited mid-scan — are skipped
-//! silently. Steady-state expected on any multi-user / sandboxed
-//! system.
+//! `ConsumerPresence::observe` combines them: a readable walk is
+//! authoritative (`External → Present`, `CleanAbsent → Absent`), while an
+//! `UncertainAbsent` walk defers to the balance — a held open we could
+//! not attribute (EACCES) still wakes to `Present`, and returns to
+//! `Absent` when it closes. This is what lets a sandboxed browser (whose
+//! capture process is non-dumpable → `/proc/<pid>/fd` = EACCES) wake the
+//! daemon. `ENOENT` from a process that exited mid-scan is skipped.
 //!
 //! ## Overflow and fallback
 //!
@@ -78,13 +86,18 @@
 //!
 //! ## Limitations
 //!
-//! * **Root-owned consumers are invisible.** An unprivileged
-//!   fluxframe cannot read `/proc/<root-pid>/fd`, so a root-owned
-//!   process consuming `/dev/video10` looks identical to "no
-//!   consumer". The pragmatic workaround is to run fluxframe as the
-//!   same user as the consumer. This is documented in README.
+//! * **Unattributable consumers rely on the open balance.** An
+//!   unprivileged fluxframe cannot read a root-owned or sandboxed
+//!   consumer's `/proc/<pid>/fd`, so the walk classifies it as
+//!   `UncertainAbsent`. The net open balance still catches a *held*
+//!   open (inotify fires regardless of who opened), so such a consumer
+//!   does wake the daemon; the residual blind spot is a consumer that
+//!   was already holding the device *before* the watch armed (its
+//!   opening `IN_OPEN` predates the balance) — it reads as `Absent`
+//!   until it re-opens. Running fluxframe as the same user as the
+//!   consumer removes the EACCES entirely (the walk then sees it).
 //! * **`/proc` must be mounted.** Hard containerization that hides
-//!   `/proc` collapses the detector to `Unknown` (fail-open).
+//!   `/proc` collapses the walk to `Unreadable` → `Unknown` (fail-open).
 //!
 //! ## Lifecycle
 //!
@@ -112,10 +125,17 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use fluxframe_core::Counters;
 use fluxframe_gst::output::OutputSink;
 use tracing::{debug, info, warn};
 
 use super::state::ConsumerStatus;
+
+/// Maximum number of unreadable-pid identifiers sampled into
+/// [`WalkOutcome::UncertainAbsent`] for the diagnostic line. The full
+/// EACCES count is kept separately; only this bounded sample is carried
+/// so a pathological host cannot build an unbounded `Vec`.
+const EACCES_PID_SAMPLE: usize = 8;
 
 /// Number of poll iterations between log-flag re-arms. With the
 /// default 250 ms poll cadence this is one re-arm every 15 s —
@@ -185,6 +205,10 @@ struct DetectorContext<'a> {
     stopped: &'a AtomicBool,
     restat_interval_polls: u32,
     device_basename: &'a OsStr,
+    /// Process-wide counters. The detector bumps
+    /// `unattributable_wakes_total` when it wakes on an open it could
+    /// not attribute via `/proc`.
+    counters: &'a Counters,
     /// Per-detector test counter incremented in the inotify path on
     /// successful init + add_watch. See [`ConsumerDetector::inotify_activations_handle`].
     #[cfg(test)]
@@ -197,6 +221,7 @@ struct DetectorContext<'a> {
 struct DetectorState<'a> {
     log_once: &'a mut LogOnce,
     last_status: &'a mut Option<ConsumerStatus>,
+    presence: &'a mut ConsumerPresence,
 }
 
 /// Resolve the `/dev/videoN` device path for a V4L2 output sink.
@@ -269,6 +294,115 @@ impl LogOnce {
     }
 }
 
+/// Outcome of one `/proc` walk — pure data, no side effects. The caller
+/// ([`walk_observe_publish`]) fires the one-shot diagnostics and folds
+/// this into the presence latch. Keeping the walk free of `&mut LogOnce`
+/// makes it trivially unit-testable and puts every log line at one
+/// consistent layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WalkOutcome {
+    /// A readable external process holds the device fd; `pid` is the
+    /// first such holder (the walk short-circuits on the first match).
+    External { pid: u32 },
+    /// No external holder, and every candidate `/proc/<pid>/fd` was
+    /// readable — authoritatively nobody.
+    CleanAbsent,
+    /// No external holder found, but ≥1 candidate `/proc/<pid>/fd`
+    /// returned `EACCES`, so the answer is suspect: a sandboxed or
+    /// root-owned consumer looks identical to "nobody". `eacces_count`
+    /// is the full count; `pids` a bounded sample for diagnostics.
+    UncertainAbsent { eacces_count: u32, pids: Vec<u32> },
+    /// `/proc` root itself was unreadable — detection disabled.
+    Unreadable(io::ErrorKind),
+}
+
+/// Why the detector published a given [`ConsumerStatus`]. `Copy` so it
+/// threads into the diagnostic line and the wake counter without
+/// allocating on the common unchanged-walk path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresenceReason {
+    /// A readable external holder was found.
+    External,
+    /// A fully-readable `/proc` walk found nobody — authoritative absence.
+    CleanAbsent,
+    /// An unattributable (EACCES) walk with a zero open balance — assumed
+    /// absent, but not authoritative. Distinguished from `CleanAbsent` so
+    /// an operator reading the diagnostic can tell a proven absence from a
+    /// fail-open guess.
+    UncertainAbsent,
+    /// An open we could not attribute (EACCES) with a positive open
+    /// balance — the fail-open wake.
+    UnattributableWake,
+    /// `/proc` root unreadable — fail-open `Unknown`.
+    FailOpen,
+}
+
+/// Consumer-presence latch. Pure state machine mirroring
+/// [`super::state::IdleStateMachine`]'s style — the producer end of the
+/// detector's status channel, kept separate from the worker-side
+/// consumer FSM (they sit on opposite ends of the `AtomicU8`).
+///
+/// `open_balance` tracks live external opens of the loopback: inotify
+/// `IN_OPEN` is `+1`, `IN_CLOSE_*` is `−1`, accumulated since the watch
+/// armed. inotify counts open *file descriptions*, so `dup`/`fork` do
+/// not inflate it and a crashed consumer still emits its close. Because
+/// fluxframe never re-opens the loopback after startup (the output
+/// write-fd is opened before the watch and held for the whole run), a
+/// positive balance means an external consumer is attached — even one
+/// whose `/proc/<pid>/fd` is unreadable (a sandboxed browser → EACCES).
+/// The readable walk (`External`/`CleanAbsent`) re-anchors the balance
+/// authoritatively, so drift is self-correcting.
+#[derive(Default)]
+struct ConsumerPresence {
+    open_balance: i32,
+}
+
+impl ConsumerPresence {
+    /// Fold one walk outcome plus the inotify open/close delta into the
+    /// latch and return the published status and the reason for it.
+    fn observe(
+        &mut self,
+        walk: &WalkOutcome,
+        net_opens: i32,
+        overflow: bool,
+    ) -> (ConsumerStatus, PresenceReason) {
+        // `overflow` means we lost events: reset the balance and let the
+        // walk re-anchor. Otherwise fold the batch's net delta, clamped
+        // at zero so an unmatched close (a pre-watch fd closing after
+        // the watch armed) cannot drive the balance negative.
+        if overflow {
+            self.open_balance = 0;
+        } else {
+            self.open_balance = (self.open_balance + net_opens).max(0);
+        }
+        match walk {
+            WalkOutcome::Unreadable(_) => (ConsumerStatus::Unknown, PresenceReason::FailOpen),
+            WalkOutcome::External { .. } => {
+                self.open_balance = self.open_balance.max(1);
+                (ConsumerStatus::Present, PresenceReason::External)
+            }
+            WalkOutcome::CleanAbsent => {
+                self.open_balance = 0;
+                (ConsumerStatus::Absent, PresenceReason::CleanAbsent)
+            }
+            WalkOutcome::UncertainAbsent { .. } => {
+                if self.open_balance > 0 {
+                    (ConsumerStatus::Present, PresenceReason::UnattributableWake)
+                } else {
+                    (ConsumerStatus::Absent, PresenceReason::UncertainAbsent)
+                }
+            }
+        }
+    }
+
+    /// Reset the balance to zero. Called when the inotify path falls
+    /// back to polling (no more edge counting), so a stale positive
+    /// balance cannot latch `Present` until the next authoritative walk.
+    fn reset(&mut self) {
+        self.open_balance = 0;
+    }
+}
+
 /// Detector handle returned from [`ConsumerDetector::spawn`]. Owns
 /// the worker thread and exposes the shared status atomic.
 ///
@@ -312,6 +446,7 @@ impl ConsumerDetector {
         my_pid: u32,
         poll_interval: Duration,
         running: Arc<AtomicBool>,
+        counters: Arc<Counters>,
     ) -> Self {
         Self::spawn_with_proc_root(
             device_path,
@@ -320,6 +455,7 @@ impl ConsumerDetector {
             poll_interval,
             running,
             RESTAT_INTERVAL_POLLS,
+            counters,
             #[cfg(test)]
             Arc::new(AtomicU64::new(0)),
         )
@@ -329,6 +465,14 @@ impl ConsumerDetector {
     /// `/proc`, tune the re-arm cadence, and observe how often the
     /// inotify path activated. Production code uses [`Self::spawn`]
     /// which fixes the defaults.
+    // `too_many_arguments` fires only in the test build (the extra
+    // `inotify_activations` arg is `#[cfg(test)]`), so `allow` rather
+    // than `expect` — the latter would be unfulfilled in non-test builds.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test-seam constructor mirroring the thread entry point's owned inputs; \
+                  bundling them into a struct only adds noise for a test-only helper"
+    )]
     pub(crate) fn spawn_with_proc_root(
         device_path: PathBuf,
         proc_root: PathBuf,
@@ -336,6 +480,7 @@ impl ConsumerDetector {
         poll_interval: Duration,
         running: Arc<AtomicBool>,
         restat_interval_polls: u32,
+        counters: Arc<Counters>,
         #[cfg(test)] inotify_activations: Arc<AtomicU64>,
     ) -> Self {
         let status = Arc::new(AtomicU8::new(ConsumerStatus::Unknown.as_u8()));
@@ -356,6 +501,7 @@ impl ConsumerDetector {
                     status_for_thread,
                     stopped_for_thread,
                     restat_interval_polls,
+                    counters,
                     #[cfg(test)]
                     activations_for_thread,
                 );
@@ -458,6 +604,7 @@ fn run_detector(
     status: Arc<AtomicU8>,
     stopped: Arc<AtomicBool>,
     restat_interval_polls: u32,
+    counters: Arc<Counters>,
     #[cfg(test)] inotify_activations: Arc<AtomicU64>,
 ) {
     // Resolved once outside the loop — `file_name()` allocates `OsStr`
@@ -484,6 +631,7 @@ fn run_detector(
 
     let mut log_once = LogOnce::armed();
     let mut last_status: Option<ConsumerStatus> = None;
+    let mut presence = ConsumerPresence::default();
     let ctx = DetectorContext {
         proc_root: &proc_root,
         my_pid,
@@ -492,12 +640,14 @@ fn run_detector(
         stopped: &stopped,
         restat_interval_polls,
         device_basename: &device_basename,
+        counters: &counters,
         #[cfg(test)]
         inotify_activations: &inotify_activations,
     };
     let mut state = DetectorState {
         log_once: &mut log_once,
         last_status: &mut last_status,
+        presence: &mut presence,
     };
 
     // Try the inotify event-driven path first. On failure (watch
@@ -535,6 +685,9 @@ fn run_detector(
 #[derive(Default, Clone, Copy)]
 struct EventSummary {
     needs_rescan: bool,
+    /// Net open/close delta over the batch: `IN_OPEN` is `+1`,
+    /// `IN_CLOSE_*` is `−1`. Feeds [`ConsumerPresence`]'s open balance.
+    net_opens: i32,
     overflow: bool,
     watch_removed: bool,
 }
@@ -545,12 +698,17 @@ impl EventSummary {
         if mask.contains(inotify::EventMask::Q_OVERFLOW) {
             self.overflow = true;
         }
-        if mask.intersects(
-            inotify::EventMask::OPEN
-                | inotify::EventMask::CLOSE_WRITE
-                | inotify::EventMask::CLOSE_NOWRITE,
-        ) {
+        // OPEN and CLOSE arrive as distinct events, but fold each
+        // independently so a hypothetical combined mask is still counted
+        // correctly. `needs_rescan` stays the walk trigger; `net_opens`
+        // is only the balance input.
+        if mask.contains(inotify::EventMask::OPEN) {
             self.needs_rescan = true;
+            self.net_opens += 1;
+        }
+        if mask.intersects(inotify::EventMask::CLOSE_WRITE | inotify::EventMask::CLOSE_NOWRITE) {
+            self.needs_rescan = true;
+            self.net_opens -= 1;
         }
         if mask.contains(inotify::EventMask::IGNORED) {
             self.watch_removed = true;
@@ -605,14 +763,8 @@ fn run_detector_inotify(
     // AFTER `add()`, so we need one synchronous walk to publish the
     // initial state. Without this the worker would observe
     // `Unknown` until the first open/close, which on a quiet system
-    // may be never.
-    let baseline = count_external_consumers(
-        ctx.proc_root,
-        ctx.device_basename,
-        ctx.my_pid,
-        state.log_once,
-    );
-    publish_if_changed(baseline, ctx.status, state.last_status);
+    // may be never. No inotify delta yet (`net_opens = 0`).
+    walk_observe_publish(ctx, state, 0, false);
 
     let mut buffer = [0u8; INOTIFY_EVENT_BUFFER_BYTES];
     let mut walks_since_restat: u32 = 0;
@@ -733,13 +885,7 @@ fn apply_summary(
     }
 
     if summary.needs_rescan || summary.overflow {
-        let new_status = count_external_consumers(
-            ctx.proc_root,
-            ctx.device_basename,
-            ctx.my_pid,
-            state.log_once,
-        );
-        publish_if_changed(new_status, ctx.status, state.last_status);
+        walk_observe_publish(ctx, state, summary.net_opens, summary.overflow);
         // Rearm gate cadence shifts from wall-clock (polling path)
         // to walk-count here. The gates exist to surface
         // activity-time problems; rearm-on-activity is arguably
@@ -770,15 +916,15 @@ fn run_detector_polling(
     state: &mut DetectorState<'_>,
 ) {
     let mut polls_since_restat: u32 = 0;
+    // The polling path has no open/close edges to count, so drop any
+    // balance the inotify path accumulated before falling back — a
+    // stale positive balance must not latch `Present` here.
+    state.presence.reset();
 
     while ctx.running.load(Ordering::Acquire) && !ctx.stopped.load(Ordering::Acquire) {
-        let new_status = count_external_consumers(
-            ctx.proc_root,
-            ctx.device_basename,
-            ctx.my_pid,
-            state.log_once,
-        );
-        publish_if_changed(new_status, ctx.status, state.last_status);
+        // No inotify delta on the polling path (`net_opens = 0`); the
+        // walk alone drives the status.
+        walk_observe_publish(ctx, state, 0, false);
 
         // Clear the one-shot log flag every restat_interval_polls
         // so a transient diagnostic (e.g. `/proc` briefly remount)
@@ -806,48 +952,104 @@ fn run_detector_polling(
     }
 }
 
-/// Walk `proc_root` (typically `/proc`) and decide whether any
-/// external process holds an fd whose symlink target's basename
-/// equals `device_basename`. The walk short-circuits as soon as the
-/// first match is found — there is no count, only Present / Absent.
-///
-/// # Errors handled inline
-///
-/// * Top-level `read_dir(proc_root)` failure fires
-///   `log_once.scan_failed` (warn) and returns `Unknown`.
-/// * Per-pid `read_dir(<proc>/<pid>/fd)` `EACCES` errors are counted
-///   and surfaced once via `log_once.eacces_storm` (info) if the
-///   scan would otherwise return `Absent` — i.e. every candidate pid
-///   was unreadable. This catches the multi-user blind spot where an
-///   unprivileged fluxframe cannot see a root-owned consumer.
-/// * Per-pid `ENOENT` and other I/O errors skip silently — steady-
-///   state expected on a multi-user / sandboxed system.
-/// * `read_link` failures on individual fds skip silently.
-fn count_external_consumers(
-    proc_root: &Path,
-    device_basename: &OsStr,
-    my_pid: u32,
-    log_once: &mut LogOnce,
-) -> ConsumerStatus {
-    let entries = match std::fs::read_dir(proc_root) {
-        Ok(it) => it,
-        Err(e) => {
-            if log_once.scan_failed.fire() {
+/// Walk `/proc`, fold the outcome into the presence latch, publish any
+/// status change, and fire the one-shot diagnostics. This is the single
+/// place the walk → observe → publish → log → metrics sequence lives;
+/// the baseline walk, the inotify event path, and the polling fallback
+/// all call it. `net_opens` is the inotify open/close delta for this
+/// batch (`0` for the baseline and polling paths, which have no edges).
+fn walk_observe_publish(
+    ctx: &DetectorContext<'_>,
+    state: &mut DetectorState<'_>,
+    net_opens: i32,
+    overflow: bool,
+) {
+    let walk = count_external_consumers(ctx.proc_root, ctx.device_basename, ctx.my_pid);
+    let prev = *state.last_status;
+    let (status, reason) = state.presence.observe(&walk, net_opens, overflow);
+
+    // Diagnostics — both one-shot gates fire from this single site. The
+    // walk is pure data; the presence-layer fields (`open_balance`,
+    // `net_opens`, the decision) are only known here, so the enriched
+    // EACCES line cannot live inside the walk.
+    match &walk {
+        WalkOutcome::Unreadable(kind) => {
+            if state.log_once.scan_failed.fire() {
                 warn!(
                     target: "fluxframe::idle",
-                    proc_root = %proc_root.display(),
-                    error = %e,
+                    proc_root = %ctx.proc_root.display(),
+                    error = ?kind,
                     "/proc scan failed — consumer detection disabled"
                 );
             }
-            return ConsumerStatus::Unknown;
         }
+        WalkOutcome::UncertainAbsent { eacces_count, pids } => {
+            if state.log_once.eacces_storm.fire() {
+                // `comm` is world-readable even for a process whose
+                // `fd/` dir gave EACCES (non-dumpable/sandboxed), so it
+                // names the likely holder ("chrome"). Read only now —
+                // the gate fires ≤ once per rearm window, off the hot
+                // path.
+                let comms = read_comms(ctx.proc_root, pids);
+                info!(
+                    target: "fluxframe::idle",
+                    eacces_count = *eacces_count,
+                    net_opens,
+                    open_balance = state.presence.open_balance,
+                    decision = ?status,
+                    reason = ?reason,
+                    comms = ?comms,
+                    "scanned /proc; candidate fd dirs returned EACCES — a sandboxed/privileged consumer may be present"
+                );
+            }
+        }
+        WalkOutcome::External { .. } | WalkOutcome::CleanAbsent => {}
+    }
+
+    // An open we could not attribute but chose to treat as a consumer
+    // (fail-open) that just flipped us to Present.
+    if reason == PresenceReason::UnattributableWake && prev != Some(ConsumerStatus::Present) {
+        ctx.counters.inc_unattributable_wakes();
+    }
+
+    publish_if_changed(status, ctx.status, state.last_status);
+}
+
+/// Best-effort read of `/proc/<pid>/comm` for a sample of pids, for the
+/// EACCES-storm diagnostic. Failures (ENOENT for a process that exited)
+/// are skipped. Called only when the gate fires.
+fn read_comms(proc_root: &Path, pids: &[u32]) -> Vec<String> {
+    pids.iter()
+        .filter_map(|&pid| {
+            std::fs::read_to_string(proc_root.join(pid.to_string()).join("comm"))
+                .ok()
+                .map(|s| s.trim_end().to_string())
+        })
+        .collect()
+}
+
+/// Walk `proc_root` (typically `/proc`) and classify whether any
+/// external process holds an fd whose symlink target's basename equals
+/// `device_basename`. Pure — returns a [`WalkOutcome`]; the caller fires
+/// diagnostics. The walk short-circuits on the first match.
+///
+/// * Top-level `read_dir(proc_root)` failure → [`WalkOutcome::Unreadable`].
+/// * A readable pid holding the fd → [`WalkOutcome::External`].
+/// * No holder, all candidates readable → [`WalkOutcome::CleanAbsent`].
+/// * No holder but ≥1 `/proc/<pid>/fd` returned `EACCES` →
+///   [`WalkOutcome::UncertainAbsent`] (the multi-user / sandboxed blind
+///   spot where an unprivileged fluxframe cannot see the consumer).
+/// * Per-pid `ENOENT`/other I/O and `read_link` failures skip silently.
+fn count_external_consumers(proc_root: &Path, device_basename: &OsStr, my_pid: u32) -> WalkOutcome {
+    let entries = match std::fs::read_dir(proc_root) {
+        Ok(it) => it,
+        Err(e) => return WalkOutcome::Unreadable(e.kind()),
     };
 
-    let mut has_external = false;
     let mut eacces_count: u32 = 0;
+    let mut eacces_pids: Vec<u32> = Vec::new();
 
-    'outer: for entry in entries.flatten() {
+    for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else {
             continue;
@@ -862,14 +1064,16 @@ fn count_external_consumers(
 
         let fd_dir = entry.path().join("fd");
         // EACCES (root or other-user pid) is counted so we can surface
-        // the "every candidate was unreadable" blind spot below.
-        // ENOENT (process exited mid-scan) and any other I/O error
-        // skip silently — steady-state expected on a multi-user
-        // system.
+        // the "candidate unreadable" blind spot. ENOENT (process exited
+        // mid-scan) and any other I/O error skip silently — steady-state
+        // expected on a multi-user system.
         let fd_entries = match std::fs::read_dir(&fd_dir) {
             Ok(it) => it,
             Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
                 eacces_count = eacces_count.saturating_add(1);
+                if eacces_pids.len() < EACCES_PID_SAMPLE {
+                    eacces_pids.push(pid);
+                }
                 continue;
             }
             Err(_) => continue,
@@ -880,27 +1084,19 @@ fn count_external_consumers(
                 continue;
             };
             if link.file_name() == Some(device_basename) {
-                has_external = true;
-                // One matching fd is enough to settle Present/Absent.
-                // Break the inner fd loop AND the outer pid loop —
-                // scanning further pids would be wasted work.
-                break 'outer;
+                // One matching fd settles it — no need to scan further.
+                return WalkOutcome::External { pid };
             }
         }
     }
 
-    if !has_external && eacces_count > 0 && log_once.eacces_storm.fire() {
-        info!(
-            target: "fluxframe::idle",
+    if eacces_count > 0 {
+        WalkOutcome::UncertainAbsent {
             eacces_count,
-            "scanned /proc; all candidate fd dirs returned EACCES — idle may be inaccurate if a privileged consumer is active"
-        );
-    }
-
-    if has_external {
-        ConsumerStatus::Present
+            pids: eacces_pids,
+        }
     } else {
-        ConsumerStatus::Absent
+        WalkOutcome::CleanAbsent
     }
 }
 
@@ -960,68 +1156,55 @@ mod tests {
     }
 
     #[test]
-    fn one_external_pid_with_matching_fd_is_present() {
+    fn one_external_pid_with_matching_fd_is_external() {
         let dir = tempfile::tempdir().expect("tempdir");
         make_proc_entry(dir.path(), 1234, 3, Path::new("/dev/video10"));
 
-        let mut log = LogOnce::armed();
-        let status = count_external_consumers(dir.path(), OsStr::new("video10"), 9999, &mut log);
-        assert_eq!(status, ConsumerStatus::Present);
-        assert!(
-            log.scan_failed.is_armed(),
-            "happy path must not consume scan_failed gate"
-        );
+        let walk = count_external_consumers(dir.path(), OsStr::new("video10"), 9999);
+        assert_eq!(walk, WalkOutcome::External { pid: 1234 });
     }
 
     #[test]
-    fn multiple_fds_same_pid_count_once() {
-        // Two fds from one pid both pointing at /dev/video10 should
-        // still produce Present (and conceptually one consumer — the
-        // public surface only exposes Present/Absent, so we verify
-        // status; HashSet collapses the duplicates internally).
+    fn multiple_fds_same_pid_is_external() {
+        // Several fds from one pid all pointing at /dev/video10 still
+        // classify as a single External holder (the walk short-circuits
+        // on the first match).
         let dir = tempfile::tempdir().expect("tempdir");
         make_proc_entry(dir.path(), 1234, 3, Path::new("/dev/video10"));
         make_proc_entry(dir.path(), 1234, 4, Path::new("/dev/video10"));
         make_proc_entry(dir.path(), 1234, 5, Path::new("/dev/video10"));
 
-        let mut log = LogOnce::armed();
-        let status = count_external_consumers(dir.path(), OsStr::new("video10"), 9999, &mut log);
-        assert_eq!(status, ConsumerStatus::Present);
+        let walk = count_external_consumers(dir.path(), OsStr::new("video10"), 9999);
+        assert_eq!(walk, WalkOutcome::External { pid: 1234 });
     }
 
     #[test]
-    fn self_pid_only_is_absent() {
+    fn self_pid_only_is_clean_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         // fluxframe's own fd should not count as a consumer.
         make_proc_entry(dir.path(), 9999, 3, Path::new("/dev/video10"));
 
-        let mut log = LogOnce::armed();
-        let status = count_external_consumers(dir.path(), OsStr::new("video10"), 9999, &mut log);
-        assert_eq!(status, ConsumerStatus::Absent);
+        let walk = count_external_consumers(dir.path(), OsStr::new("video10"), 9999);
+        assert_eq!(walk, WalkOutcome::CleanAbsent);
     }
 
     #[test]
-    fn no_matching_fds_is_absent() {
+    fn no_matching_fds_is_clean_absent() {
         let dir = tempfile::tempdir().expect("tempdir");
         // External pid but holding unrelated fds.
         make_proc_entry(dir.path(), 1234, 3, Path::new("/dev/null"));
         make_proc_entry(dir.path(), 1234, 4, Path::new("/dev/video11"));
         make_proc_entry(dir.path(), 5678, 3, Path::new("/dev/zero"));
 
-        let mut log = LogOnce::armed();
-        let status = count_external_consumers(dir.path(), OsStr::new("video10"), 9999, &mut log);
-        assert_eq!(status, ConsumerStatus::Absent);
+        let walk = count_external_consumers(dir.path(), OsStr::new("video10"), 9999);
+        assert_eq!(walk, WalkOutcome::CleanAbsent);
     }
 
-    /// A pid with a chmod-0o000 fd dir must be skipped silently
-    /// (steady-state expected on multi-user systems), while a
-    /// readable pid with a matching fd is still surfaced. The
-    /// `scan_failed` gate must NOT fire — that's reserved for
-    /// `/proc` root-level failure only. The `eacces_storm` gate
-    /// also must NOT fire here because we DID find an external
-    /// consumer — the EACCES count is irrelevant in that case.
+    /// A pid with a chmod-0o000 fd dir is unreadable (EACCES) but a
+    /// readable pid holding a matching fd still settles the walk as
+    /// `External` — one found consumer trumps any EACCES noise.
     #[test]
-    fn permission_denied_pid_skipped_silently() {
+    fn permission_denied_pid_skipped_when_consumer_found() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Unreadable pid (simulated root-owned process).
         let unreadable_fd_dir = dir.path().join("1234").join("fd");
@@ -1039,44 +1222,253 @@ mod tests {
         // External pid that IS readable and matches.
         make_proc_entry(dir.path(), 5678, 3, Path::new("/dev/video10"));
 
-        let mut log = LogOnce::armed();
-        let status = count_external_consumers(dir.path(), OsStr::new("video10"), 9999, &mut log);
-        assert_eq!(status, ConsumerStatus::Present);
+        let walk = count_external_consumers(dir.path(), OsStr::new("video10"), 9999);
+        assert_eq!(walk, WalkOutcome::External { pid: 5678 });
+    }
+
+    /// Every candidate `/proc/<pid>/fd` unreadable and no match →
+    /// `UncertainAbsent` carrying the full EACCES count (the sampled
+    /// pids are a bounded sample; assert only the count to stay robust
+    /// against `read_dir` ordering).
+    #[test]
+    fn all_eacces_no_match_is_uncertain_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let unreadable_fd_dir = dir.path().join("1234").join("fd");
+        fs::create_dir_all(&unreadable_fd_dir).unwrap();
+        let _restore = ScopeGuard::new({
+            let p = unreadable_fd_dir.clone();
+            move || {
+                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
+            }
+        });
+        fs::set_permissions(&unreadable_fd_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let walk = count_external_consumers(dir.path(), OsStr::new("video10"), 9999);
         assert!(
-            log.scan_failed.is_armed(),
-            "per-pid EACCES must not consume the scan_failed gate"
-        );
-        assert!(
-            log.eacces_storm.is_armed(),
-            "found a consumer => eacces_storm gate must stay armed"
+            matches!(
+                walk,
+                WalkOutcome::UncertainAbsent {
+                    eacces_count: 1,
+                    ..
+                }
+            ),
+            "expected UncertainAbsent with one EACCES, got {walk:?}"
         );
     }
 
     #[test]
-    fn unreadable_proc_root_is_unknown() {
-        let mut log = LogOnce::armed();
-        let status = count_external_consumers(
-            Path::new("/no/such/proc/path"),
-            OsStr::new("video10"),
-            9999,
-            &mut log,
-        );
-        assert_eq!(status, ConsumerStatus::Unknown);
-        assert!(
-            !log.scan_failed.is_armed(),
-            "scan_failed gate must be consumed when /proc root cannot be read"
-        );
+    fn unreadable_proc_root_is_unreadable() {
+        let walk =
+            count_external_consumers(Path::new("/no/such/proc/path"), OsStr::new("video10"), 9999);
+        assert!(matches!(walk, WalkOutcome::Unreadable(_)), "got {walk:?}");
     }
 
     #[test]
-    fn mixed_self_plus_external_is_present() {
+    fn mixed_self_plus_external_is_external() {
         let dir = tempfile::tempdir().expect("tempdir");
         make_proc_entry(dir.path(), 9999, 3, Path::new("/dev/video10"));
         make_proc_entry(dir.path(), 1234, 3, Path::new("/dev/video10"));
 
-        let mut log = LogOnce::armed();
-        let status = count_external_consumers(dir.path(), OsStr::new("video10"), 9999, &mut log);
-        assert_eq!(status, ConsumerStatus::Present);
+        let walk = count_external_consumers(dir.path(), OsStr::new("video10"), 9999);
+        assert_eq!(walk, WalkOutcome::External { pid: 1234 });
+    }
+
+    // --- ConsumerPresence::observe pure matrix -------------------------
+
+    fn uncertain(n: u32) -> WalkOutcome {
+        WalkOutcome::UncertainAbsent {
+            eacces_count: n,
+            pids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn observe_external_is_present_and_floors_balance() {
+        let mut p = ConsumerPresence::default();
+        // Even with a stale negative delta, External floors to >=1.
+        let (s, r) = p.observe(&WalkOutcome::External { pid: 1 }, -5, false);
+        assert_eq!((s, r), (ConsumerStatus::Present, PresenceReason::External));
+        assert!(p.open_balance >= 1);
+    }
+
+    #[test]
+    fn observe_clean_absent_zeroes_balance() {
+        let mut p = ConsumerPresence { open_balance: 4 };
+        let (s, r) = p.observe(&WalkOutcome::CleanAbsent, 0, false);
+        assert_eq!(
+            (s, r),
+            (ConsumerStatus::Absent, PresenceReason::CleanAbsent)
+        );
+        assert_eq!(p.open_balance, 0);
+    }
+
+    #[test]
+    fn observe_unreadable_is_failopen_and_keeps_counting() {
+        let mut p = ConsumerPresence { open_balance: 1 };
+        let (s, r) = p.observe(&WalkOutcome::Unreadable(io::ErrorKind::NotFound), 1, false);
+        assert_eq!((s, r), (ConsumerStatus::Unknown, PresenceReason::FailOpen));
+        // Balance still folds the delta (valid regardless of /proc).
+        assert_eq!(p.open_balance, 2);
+    }
+
+    #[test]
+    fn observe_uncertain_wakes_on_positive_balance() {
+        let mut p = ConsumerPresence::default();
+        // Open arrives (net +1) but the walk can't attribute it → wake.
+        let (s, r) = p.observe(&uncertain(1), 1, false);
+        assert_eq!(
+            (s, r),
+            (ConsumerStatus::Present, PresenceReason::UnattributableWake)
+        );
+    }
+
+    #[test]
+    fn observe_uncertain_probe_open_then_close_stays_absent() {
+        let mut p = ConsumerPresence::default();
+        // A brief probe: OPEN then CLOSE in one batch → net 0 → Absent.
+        let (s, r) = p.observe(&uncertain(1), 0, false);
+        assert_eq!(
+            (s, r),
+            (ConsumerStatus::Absent, PresenceReason::UncertainAbsent)
+        );
+    }
+
+    #[test]
+    fn observe_uncertain_aux_fd_close_keeps_present() {
+        let mut p = ConsumerPresence { open_balance: 2 };
+        // One of several held fds closes (net -1); balance 1 > 0 → still Present.
+        let (s, r) = p.observe(&uncertain(1), -1, false);
+        assert_eq!(
+            (s, r),
+            (ConsumerStatus::Present, PresenceReason::UnattributableWake)
+        );
+        assert_eq!(p.open_balance, 1);
+    }
+
+    #[test]
+    fn observe_uncertain_steady_no_open_is_absent() {
+        let mut p = ConsumerPresence::default();
+        // Steady EACCES noise with no open events → stays Absent.
+        let (s, r) = p.observe(&uncertain(3), 0, false);
+        assert_eq!(
+            (s, r),
+            (ConsumerStatus::Absent, PresenceReason::UncertainAbsent)
+        );
+    }
+
+    #[test]
+    fn observe_overflow_resets_balance_before_deciding() {
+        let mut p = ConsumerPresence { open_balance: 5 };
+        // Overflow drops the balance to 0 before the walk decides; an
+        // uncertain walk with the balance reset → Absent.
+        let (s, _) = p.observe(&uncertain(1), 3, true);
+        assert_eq!(s, ConsumerStatus::Absent);
+        assert_eq!(p.open_balance, 0);
+    }
+
+    #[test]
+    fn observe_balance_clamps_at_zero() {
+        let mut p = ConsumerPresence::default();
+        // Unmatched close (pre-watch fd) must not drive balance negative.
+        let (_s, _r) = p.observe(&uncertain(1), -3, false);
+        assert_eq!(p.open_balance, 0);
+    }
+
+    // --- read_comms + gate wiring --------------------------------------
+
+    #[test]
+    fn read_comms_reads_present_and_skips_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_dir = dir.path().join("1234");
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(pid_dir.join("comm"), "chrome\n").unwrap();
+        // 1234 has a comm (trailing newline trimmed); 5678 has none → skipped.
+        assert_eq!(
+            read_comms(dir.path(), &[1234, 5678]),
+            vec!["chrome".to_string()]
+        );
+    }
+
+    /// Run one `walk_observe_publish` against `proc_root` and report which
+    /// [`LogOnce`] gates remain armed afterwards — the seam that maps a
+    /// [`WalkOutcome`] to its diagnostic gate now that the walk itself is
+    /// gate-free.
+    fn gates_after_one_walk(proc_root: &Path) -> (bool, bool) {
+        let running = AtomicBool::new(true);
+        let status = AtomicU8::new(ConsumerStatus::Unknown.as_u8());
+        let stopped = AtomicBool::new(false);
+        let counters = Counters::new();
+        let device_basename = OsString::from("video10");
+        let activations = AtomicU64::new(0);
+        let ctx = DetectorContext {
+            proc_root,
+            my_pid: 9999,
+            running: &running,
+            status: &status,
+            stopped: &stopped,
+            restat_interval_polls: RESTAT_INTERVAL_POLLS,
+            device_basename: &device_basename,
+            counters: &counters,
+            inotify_activations: &activations,
+        };
+        let mut log_once = LogOnce::armed();
+        let mut last_status = None;
+        let mut presence = ConsumerPresence::default();
+        let mut state = DetectorState {
+            log_once: &mut log_once,
+            last_status: &mut last_status,
+            presence: &mut presence,
+        };
+        walk_observe_publish(&ctx, &mut state, 0, false);
+        (
+            log_once.scan_failed.is_armed(),
+            log_once.eacces_storm.is_armed(),
+        )
+    }
+
+    #[test]
+    fn walk_observe_publish_fires_scan_failed_on_unreadable() {
+        // Unreadable /proc root → Unreadable → scan_failed consumed,
+        // eacces_storm untouched.
+        let (scan_armed, eacces_armed) = gates_after_one_walk(Path::new("/no/such/proc/path"));
+        assert!(!scan_armed, "Unreadable walk must consume scan_failed");
+        assert!(eacces_armed, "Unreadable walk must not touch eacces_storm");
+    }
+
+    #[test]
+    fn walk_observe_publish_fires_eacces_storm_on_uncertain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let unreadable_fd_dir = dir.path().join("1234").join("fd");
+        fs::create_dir_all(&unreadable_fd_dir).unwrap();
+        let _restore = ScopeGuard::new({
+            let p = unreadable_fd_dir.clone();
+            move || {
+                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
+            }
+        });
+        fs::set_permissions(&unreadable_fd_dir, fs::Permissions::from_mode(0o000)).unwrap();
+        // All-EACCES → UncertainAbsent → eacces_storm consumed, scan_failed untouched.
+        let (scan_armed, eacces_armed) = gates_after_one_walk(dir.path());
+        assert!(
+            scan_armed,
+            "UncertainAbsent walk must not touch scan_failed"
+        );
+        assert!(
+            !eacces_armed,
+            "UncertainAbsent walk must consume eacces_storm"
+        );
+    }
+
+    #[test]
+    fn walk_observe_publish_fires_no_gate_on_clean_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        make_proc_entry(dir.path(), 1234, 3, Path::new("/dev/null"));
+        // Fully-readable, no match → CleanAbsent → neither gate fires.
+        let (scan_armed, eacces_armed) = gates_after_one_walk(dir.path());
+        assert!(
+            scan_armed && eacces_armed,
+            "CleanAbsent must not fire any gate"
+        );
     }
 
     /// Walk the full transition cycle expected at runtime: absent →
@@ -1109,6 +1501,7 @@ mod tests {
             Duration::from_millis(20),
             Arc::clone(&running),
             RESTAT_INTERVAL_POLLS,
+            Arc::new(Counters::new()),
             Arc::clone(&activations),
         );
         let status = detector.status_handle();
@@ -1162,6 +1555,7 @@ mod tests {
             Duration::from_secs(2), // long poll
             Arc::clone(&running),
             RESTAT_INTERVAL_POLLS,
+            Arc::new(Counters::new()),
             Arc::new(AtomicU64::new(0)),
         );
 
@@ -1179,107 +1573,31 @@ mod tests {
         );
     }
 
-    /// `LogOnce::rearm` resets the `scan_failed` gate so a transient
-    /// `/proc` failure can re-surface in the log after the re-arm
-    /// window. `eacces_storm` follows the same contract (rearmed in
-    /// lockstep).
+    /// One-shot gate mechanics used by both diagnostic gates: `fire()`
+    /// returns `true` exactly once per `armed()`/`rearm()` cycle, then
+    /// `false`, and `rearm()` restores it. The diagnostics that consume
+    /// these gates now live in [`walk_observe_publish`] rather than the
+    /// walk; the gate contract itself is what these tests pin.
     #[test]
-    fn log_once_rearm_re_arms_scan_failed_armed() {
+    fn log_once_gates_fire_once_and_rearm_in_lockstep() {
         let mut log = LogOnce::armed();
         assert!(log.scan_failed.is_armed());
         assert!(log.eacces_storm.is_armed());
 
-        // Consuming the gate via an unreadable proc root.
-        let _ = count_external_consumers(
-            Path::new("/no/such/proc/path"),
-            OsStr::new("video10"),
-            9999,
-            &mut log,
-        );
-        assert!(!log.scan_failed.is_armed());
+        assert!(log.scan_failed.fire(), "first fire returns true");
+        assert!(!log.scan_failed.is_armed(), "gate consumed after fire");
+        assert!(!log.scan_failed.fire(), "second fire returns false");
 
-        // A second failure does NOT re-flip — gate stays consumed.
-        let _ = count_external_consumers(
-            Path::new("/no/such/proc/path"),
-            OsStr::new("video10"),
-            9999,
-            &mut log,
-        );
-        assert!(!log.scan_failed.is_armed());
-
-        log.rearm();
-        assert!(
-            log.scan_failed.is_armed(),
-            "rearm restores the scan_failed gate"
-        );
-        assert!(
-            log.eacces_storm.is_armed(),
-            "rearm restores the eacces_storm gate"
-        );
-
-        // Now the gate fires again on the next failure.
-        let _ = count_external_consumers(
-            Path::new("/no/such/proc/path"),
-            OsStr::new("video10"),
-            9999,
-            &mut log,
-        );
-        assert!(
-            !log.scan_failed.is_armed(),
-            "re-armed gate is consumable again"
-        );
-    }
-
-    /// Synthesise a `/proc` walk where the only candidate pid has a
-    /// chmod-0o000 fd dir and no other pids exist — exactly the
-    /// scenario where every external candidate returns EACCES, the
-    /// scan finds nothing, and idle would otherwise wrongly engage.
-    ///
-    /// Contract: the gate fires exactly once (consumed on the first
-    /// matching call), stays consumed on the second call, and is
-    /// restored by `rearm()`.
-    #[test]
-    fn eacces_storm_logs_once_per_rearm_window() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        // One unreadable pid dir, nothing else.
-        let unreadable_fd_dir = dir.path().join("1234").join("fd");
-        fs::create_dir_all(&unreadable_fd_dir).unwrap();
-        let _restore = ScopeGuard::new({
-            let p = unreadable_fd_dir.clone();
-            move || {
-                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
-            }
-        });
-        fs::set_permissions(&unreadable_fd_dir, fs::Permissions::from_mode(0o000)).unwrap();
-
-        let mut log = LogOnce::armed();
+        // eacces_storm is independent until rearm.
         assert!(log.eacces_storm.is_armed());
+        assert!(log.eacces_storm.fire());
+        assert!(!log.eacces_storm.is_armed());
 
-        // First call: finds nothing, sees one EACCES, consumes the gate.
-        let status = count_external_consumers(dir.path(), OsStr::new("video10"), 9999, &mut log);
-        assert_eq!(status, ConsumerStatus::Absent);
-        assert!(
-            !log.eacces_storm.is_armed(),
-            "EACCES storm must consume the gate on first occurrence"
-        );
-
-        // Second call: still finds nothing, still sees EACCES, but
-        // gate stays consumed (no re-log).
-        let status = count_external_consumers(dir.path(), OsStr::new("video10"), 9999, &mut log);
-        assert_eq!(status, ConsumerStatus::Absent);
-        assert!(
-            !log.eacces_storm.is_armed(),
-            "consumed gate must stay consumed across calls"
-        );
-
-        // rearm restores it; next call fires it again.
+        // rearm restores every gate in lockstep.
         log.rearm();
-        assert!(log.eacces_storm.is_armed());
-        let _ = count_external_consumers(dir.path(), OsStr::new("video10"), 9999, &mut log);
-        assert!(
-            !log.eacces_storm.is_armed(),
-            "re-armed gate is consumable again"
-        );
+        assert!(log.scan_failed.is_armed(), "rearm restores scan_failed");
+        assert!(log.eacces_storm.is_armed(), "rearm restores eacces_storm");
+        assert!(log.scan_failed.fire(), "re-armed gate is consumable again");
     }
 
     /// Pragmatic survival test for the `run_detector` rearm boundary:
@@ -1304,6 +1622,7 @@ mod tests {
             Duration::from_millis(20),
             Arc::clone(&running),
             1, // rearm on EVERY poll
+            Arc::new(Counters::new()),
             Arc::new(AtomicU64::new(0)),
         );
         let status = detector.status_handle();
@@ -1371,6 +1690,7 @@ mod tests {
             Duration::from_millis(20),
             Arc::clone(&running),
             RESTAT_INTERVAL_POLLS,
+            Arc::new(Counters::new()),
             Arc::new(AtomicU64::new(0)),
         );
         let status = detector.status_handle();
@@ -1416,6 +1736,70 @@ mod tests {
         drop(detector);
     }
 
+    /// The core net-count wake: a consumer whose `/proc/<pid>/fd` is
+    /// unreadable (EACCES — sandboxed browser) is invisible to the walk
+    /// (`UncertainAbsent`), but a *held* `IN_OPEN` drives the open
+    /// balance positive and must wake the detector to `Present`;
+    /// closing it must return to `Absent`. Reproduces the incident's
+    /// root cause without a real camera or Chrome by chmod-0'ing the
+    /// fake `/proc/<pid>/fd` dir and holding the watched file open
+    /// across an inotify drain.
+    #[test]
+    fn unattributable_held_open_wakes_via_net_count() {
+        let proc_dir = tempfile::tempdir().expect("proc tempdir");
+        let proc_root = proc_dir.path().to_path_buf();
+        // One unreadable pid dir → every walk returns UncertainAbsent.
+        let unreadable_fd_dir = proc_root.join("1234").join("fd");
+        fs::create_dir_all(&unreadable_fd_dir).unwrap();
+        let _restore = ScopeGuard::new({
+            let p = unreadable_fd_dir.clone();
+            move || {
+                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o700));
+            }
+        });
+        fs::set_permissions(&unreadable_fd_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let device = tempfile::NamedTempFile::new().expect("device tempfile");
+        let device_path = device.path().to_path_buf();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let detector = ConsumerDetector::spawn_with_proc_root(
+            device_path.clone(),
+            proc_root.clone(),
+            9999,
+            Duration::from_millis(20),
+            Arc::clone(&running),
+            RESTAT_INTERVAL_POLLS,
+            Arc::new(Counters::new()),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let status = detector.status_handle();
+
+        // Baseline: UncertainAbsent with a zero open balance → Absent.
+        assert!(
+            wait_for_status(&status, ConsumerStatus::Absent, Duration::from_millis(500)),
+            "uncertain-absent with zero balance must read Absent"
+        );
+
+        // Hold the device open across a drain: IN_OPEN (+1), no matching
+        // close yet → balance 1 → Present despite the EACCES walk.
+        let held = std::fs::File::open(&device_path).expect("open device");
+        assert!(
+            wait_for_status(&status, ConsumerStatus::Present, Duration::from_millis(500)),
+            "held open on an unattributable consumer must wake to Present"
+        );
+
+        // Close → IN_CLOSE_NOWRITE (−1) → balance 0 → Absent.
+        drop(held);
+        assert!(
+            wait_for_status(&status, ConsumerStatus::Absent, Duration::from_millis(500)),
+            "closing the held fd must return to Absent"
+        );
+
+        running.store(false, Ordering::Release);
+        drop(detector);
+    }
+
     /// `EventMask::IGNORED` is the kernel's signal that the watched
     /// file went away (deleted, fs unmounted). The detector surfaces
     /// it as an `io::Error` from `run_detector_inotify`, and the
@@ -1445,6 +1829,7 @@ mod tests {
             Duration::from_millis(20),
             Arc::clone(&running),
             RESTAT_INTERVAL_POLLS,
+            Arc::new(Counters::new()),
             Arc::new(AtomicU64::new(0)),
         );
         let status = detector.status_handle();
@@ -1475,10 +1860,10 @@ mod tests {
         drop(detector);
     }
 
-    /// Tiny RAII guard so the `permission_denied_pid_skipped_silently`
-    /// test can restore the 0o000 dir's permissions before tempdir
-    /// drops. Pulled in here rather than as a dep — `defer-rs` /
-    /// `scopeguard` would be overkill for one call site.
+    /// Tiny RAII guard so the EACCES tests can restore a 0o000 dir's
+    /// permissions before the tempdir drops (some platforms refuse to
+    /// remove a 0o000 directory). Pulled in here rather than as a dep —
+    /// `defer-rs` / `scopeguard` would be overkill for one call site.
     struct ScopeGuard<F: FnMut()> {
         f: Option<F>,
     }

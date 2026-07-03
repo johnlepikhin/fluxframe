@@ -1537,7 +1537,7 @@ where
     // Stage 15 idle runtime: detector spawn + state machine + cached
     // placeholder. Returns `None` (Stage 14 fallthrough) when idle
     // mode is disabled, the sink is non-V4L2, or the host is non-Linux.
-    let idle_runtime = build_idle_runtime(cfg, &input, &running);
+    let idle_runtime = build_idle_runtime(cfg, &input, &running, &metrics.counters);
 
     let process_result = run_process_loop(
         WorkerDeps {
@@ -1570,25 +1570,11 @@ where
     // last sync inside the loop and shutdown.
     metrics.sync_dropped(slot.dropped_count());
     let snap = metrics.snapshot();
-    // Emit per-field structured values so log-ingestors (ELK, Vector,
-    // tracing-subscriber JSON layer) can query each metric without
-    // string-parsing.  Mirrors the periodic reporter's per-tick line
-    // (`metrics_reporter::emit`) but covers absolute totals at
-    // teardown, not the rolling-window deltas the reporter shows.
-    info!(
-        frames_in = snap.counters.frames_in,
-        frames_out = snap.counters.frames_out,
-        frames_dropped = snap.counters.frames_dropped,
-        fallback = snap.counters.fallback_count,
-        effect_err = snap.counters.effect_error_count,
-        processing_p50_us = snap.processing.percentile_us(0.5),
-        processing_p95_us = snap.processing.percentile_us(0.95),
-        output_p50_us = snap.output.percentile_us(0.5),
-        output_p95_us = snap.output.percentile_us(0.95),
-        end_to_end_p50_us = snap.end_to_end.percentile_us(0.5),
-        end_to_end_p95_us = snap.end_to_end.percentile_us(0.95),
-        "run metrics"
-    );
+    // Absolute totals at teardown. Shares the single-source-of-truth
+    // field list with the periodic reporter via `emit_metrics_line`
+    // (passing `None` — no rolling-window deltas here), so every counter
+    // is emitted from one place under the `fluxframe::metrics` target.
+    fluxframe_core::emit_metrics_line(&snap, None);
 
     // Surface bus-reported errors when the processing loop itself was
     // clean, so the operator sees the real cause of shutdown.
@@ -2172,6 +2158,7 @@ fn build_idle_runtime(
     cfg: &FluxConfig,
     input: &Arc<InputPipeline>,
     running: &Arc<AtomicBool>,
+    counters: &Arc<fluxframe_core::Counters>,
 ) -> Option<IdleRuntime> {
     if !cfg.idle.enabled {
         return None;
@@ -2215,6 +2202,7 @@ fn build_idle_runtime(
             my_pid,
             std::time::Duration::from_millis(u64::from(cfg.idle.poll_interval_ms)),
             detector_running,
+            Arc::clone(counters),
         );
         // The detector handle moves into the runtime so its Drop
         // runs when the worker loop exits.
@@ -2236,11 +2224,37 @@ fn build_idle_runtime(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (input, running);
+        let _ = (input, running, counters);
         warn!(
             target: "fluxframe::idle",
             "idle mode requested but host is not Linux — idle disabled (the /proc/*/fd consumer detector is Linux-only)"
         );
+        None
+    }
+}
+
+/// Non-blocking reap of a finished reload thread. Returns its
+/// [`crate::idle::reload::ResumeOutcome`] when the thread has already
+/// exited (the `join` is then instant); leaves an in-flight handle in
+/// place and returns `None`. Called by [`tick_idle`] every iteration.
+///
+/// Takes the handle slot directly (rather than the whole `IdleRuntime`)
+/// so it stays unit-testable without fabricating a full runtime. The
+/// shutdown path does its own *blocking* join instead — it must wait for
+/// an in-flight reload to finish before teardown, which this
+/// non-blocking reaper deliberately does not.
+fn reap_reload(
+    reload_handle: &mut Option<std::thread::JoinHandle<crate::idle::reload::ResumeOutcome>>,
+) -> Option<crate::idle::reload::ResumeOutcome> {
+    let handle = reload_handle.take()?;
+    if !handle.is_finished() {
+        *reload_handle = Some(handle);
+        return None;
+    }
+    if let Ok(outcome) = handle.join() {
+        Some(outcome)
+    } else {
+        warn!(target: "fluxframe::idle", "reload thread panicked");
         None
     }
 }
@@ -2286,47 +2300,29 @@ fn handle_idle_edge(
                 warn!(error = %e, "resume-edge placeholder push failed");
             }
             // Spawn the reload coordinator. The engine reloader is a
-            // no-op here because Step 4 does not yet unload the ONNX
-            // session; the input.start() inside `spawn_reload_thread`
-            // is the meaningful work.
-            // Fix #5: double-spawn guard. If a previous reload thread
-            // is still running we keep the existing handle and return
-            // early — kicking off a second reload while the first is
-            // mid-`input.start()` would race the GStreamer state
-            // transitions and likely produce a wedged input. Tested
-            // shape: this path is currently observed only via logs;
-            // a synthetic unit test would need a stalled reload
-            // closure and a full `IdleRuntime` (Arc<dyn Placeholder>,
-            // OutputPipeline, detector handle) which is integration
-            // territory.
-            // TODO(stage-15-followup): add a focused unit test by
-            // extracting a `double_spawn_guard(handle) -> Option<handle>`
-            // helper that does not depend on the full IdleRuntime.
-            let prior = idle.reload_handle.take();
-            if let Some(handle) = prior {
+            // no-op here because the ONNX session is kept warm across
+            // Idle; `input.reacquire()` inside `spawn_reload_thread` is
+            // the meaningful work.
+            //
+            // Double-spawn guard: a finished reload was already reaped
+            // (and acted on) in `tick_idle` before this edge dispatch,
+            // so `reload_handle` is either empty or an in-flight thread.
+            // Never kick a second reload over an in-flight one — racing
+            // the GStreamer state transitions would wedge the input.
+            if let Some(handle) = idle.reload_handle.take() {
                 if !handle.is_finished() {
                     warn!("a previous reload thread is still in flight; not spawning a second one");
                     idle.reload_handle = Some(handle);
                     return;
                 }
-                // Reap the outcome so the JoinHandle does not leak.
+                // Straggler — unreachable in the normal flow (tick_idle
+                // reaps finished handles first); join to avoid detaching.
                 let _ = handle.join();
             }
-            // Fix #4: race between the `is_finished` check above and
-            // this `store(false)` is narrow but real — a prior reload
-            // that finished between the check and the store loses its
-            // `engine_ready = true` write, so the worker spends one
-            // extra placeholder cycle before the new reload thread
-            // re-flips it. The clean fix is to push the `store(false)`
-            // into `spawn_reload_thread`'s body so the supervisor never
-            // touches `engine_ready` directly, but `idle/reload.rs` is
-            // owned by a sibling work item.
-            // TODO(stage-15-followup): move `engine_ready.store(false)`
-            // into `spawn_reload_thread`'s spawned closure (first
-            // action, before `input.start()`) and drop this line. The
-            // observable cost today is at most one extra placeholder
-            // push per ResumeActive that races a just-finished reload
-            // — counted in `idle_frames_pushed`, harmless.
+            // Clear `engine_ready` synchronously on this (worker) thread
+            // before launching, so no tick observes `Active + ready`
+            // during the resume window (the input was just set to Null
+            // on EnterIdle).
             idle.engine_ready.store(false, Ordering::Release);
             let input = Arc::clone(&idle.input);
             let engine_ready = Arc::clone(&idle.engine_ready);
@@ -2377,6 +2373,41 @@ fn tick_idle(
     let Some(idle_rt) = idle else {
         return Ok(IdleTickAction::ProcessFrame);
     };
+    // Reap a finished reload thread BEFORE ticking the state machine so
+    // its outcome is never dropped or double-spawned. A failed camera
+    // reacquire returns a transient error here, which unwinds
+    // `run_process_loop` → `run_chain` → `run_once`. Under
+    // `device = "auto"` that re-enters `run_auto`, which re-enumerates
+    // and re-selects the (re-plugged) device; for a fixed device path
+    // the daemon exits and relies on the service supervisor to restart
+    // it (documented in the changelog). Either way beats the old
+    // behaviour of spinning in placeholder forever.
+    if let Some(outcome) = reap_reload(&mut idle_rt.reload_handle) {
+        use crate::idle::reload::ResumeOutcome;
+        match outcome {
+            // The reload thread already logs completion (at info, with
+            // elapsed); nothing to do here but drop the reaped handle.
+            ResumeOutcome::Completed => {}
+            ResumeOutcome::EngineFailed(reason) => {
+                // ORT/disk problem, not the camera — stay in placeholder;
+                // a later ResumeActive edge re-spawns the reload attempt.
+                warn!(
+                    target: "fluxframe::idle",
+                    error = %reason,
+                    "reload: engine rebuild failed — staying in placeholder mode"
+                );
+            }
+            ResumeOutcome::InputFailed(e) => {
+                metrics.counters.inc_resume_failures();
+                warn!(
+                    target: "fluxframe::idle",
+                    error = %e,
+                    "reload: camera reacquire failed — restarting chain to re-select the device"
+                );
+                return Err(e);
+            }
+        }
+    }
     let status =
         crate::idle::ConsumerStatus::from_u8(idle_rt.consumer_status.load(Ordering::Acquire));
     let tick = idle_rt
@@ -2486,7 +2517,7 @@ fn run_process_loop(
                 Ok(outcome) => {
                     tracing::debug!(
                         target: "fluxframe::idle",
-                        elapsed_ms = outcome.elapsed.as_millis() as u64,
+                        ?outcome,
                         "reload thread reaped at shutdown",
                     );
                 }
@@ -2554,6 +2585,68 @@ mod tests {
         // Default Test configuration: start from `FluxConfig::default()`.
         // The fields tweaked here are the ones exercised by each test.
         FluxConfig::default()
+    }
+
+    // --- reap_reload -------------------------------------------------
+
+    fn spawn_finished(
+        outcome: crate::idle::reload::ResumeOutcome,
+    ) -> std::thread::JoinHandle<crate::idle::reload::ResumeOutcome> {
+        let handle = std::thread::spawn(move || outcome);
+        // Wait so `is_finished()` is observably true before the reap.
+        while !handle.is_finished() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        handle
+    }
+
+    #[test]
+    fn reap_reload_none_when_empty() {
+        let mut handle = None;
+        assert!(reap_reload(&mut handle).is_none());
+    }
+
+    #[test]
+    fn reap_reload_leaves_in_flight_handle() {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel::<()>();
+        let mut handle = Some(std::thread::spawn(move || {
+            let _ = rx.recv(); // block until released
+            crate::idle::reload::ResumeOutcome::Completed
+        }));
+        // Still running → None, and the handle must be put back.
+        assert!(reap_reload(&mut handle).is_none());
+        assert!(handle.is_some(), "in-flight handle must be preserved");
+        tx.send(()).unwrap();
+        handle.take().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn reap_reload_returns_input_failed_outcome() {
+        use crate::idle::reload::ResumeOutcome;
+        use fluxframe_core::error::PipelineError;
+        let mut handle = Some(spawn_finished(ResumeOutcome::InputFailed(FluxError::from(
+            PipelineError::StateChangeFailed {
+                reason: "synthetic reacquire failure".into(),
+            },
+        ))));
+        let outcome = reap_reload(&mut handle);
+        assert!(
+            matches!(outcome, Some(ResumeOutcome::InputFailed(ref e)) if e.is_transient()),
+            "InputFailed must be surfaced and be transient so run_auto retries, got {outcome:?}"
+        );
+        assert!(handle.is_none(), "reaped handle must be consumed");
+    }
+
+    #[test]
+    fn reap_reload_returns_completed_outcome() {
+        use crate::idle::reload::ResumeOutcome;
+        let mut handle = Some(spawn_finished(ResumeOutcome::Completed));
+        assert!(matches!(
+            reap_reload(&mut handle),
+            Some(ResumeOutcome::Completed)
+        ));
+        assert!(handle.is_none());
     }
 
     #[test]

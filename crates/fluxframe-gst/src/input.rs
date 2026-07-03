@@ -219,6 +219,31 @@ impl InputPipeline {
             })
     }
 
+    /// Re-acquire the camera on the **existing** pipeline: drop to
+    /// `Null` and drive back to `Playing`.
+    ///
+    /// Idle→resume calls this instead of a bare [`Self::start`]. The
+    /// explicit `Null` first is an idempotent reset — it recovers from a
+    /// prior resume that left the pipeline wedged in a partial/`Ready`
+    /// state, and `v4l2src` re-`open(2)`s the device on the `Null→Ready`
+    /// transition, so a camera unplugged-and-replugged onto the *same*
+    /// `/dev/videoN` node is picked up. Deliberately does **not**
+    /// recreate the pipeline or its elements: the frame slot and the
+    /// bus belong to this `gstreamer::Pipeline` and the supervisor holds
+    /// clones of both, so recreating them would orphan the worker's slot
+    /// read and the bus watch. A camera that re-enumerated onto a
+    /// *different* node is out of scope here — that path is handled by
+    /// the supervisor re-running device auto-selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::StateChangeFailed`] if either state
+    /// change fails.
+    pub fn reacquire(&self) -> Result<(), PipelineError> {
+        self.pipeline_to_null()?;
+        self.start()
+    }
+
     /// Stop the pipeline and release device resources.
     ///
     /// # Errors

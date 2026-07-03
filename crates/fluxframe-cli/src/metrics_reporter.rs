@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use tracing::info;
+use fluxframe_core::{PeriodicExtras, emit_metrics_line};
 
 use crate::runtime_metrics::RuntimeMetrics;
 
@@ -75,20 +75,6 @@ impl Drop for MetricsReporter {
     }
 }
 
-/// Compute frames-per-second from a frame delta and the wall-clock
-/// window over which it was observed.  Returns `0.0` for zero-length
-/// windows (defensive against a clock that did not advance between
-/// ticks, which can happen on systems with coarse `Instant` resolution).
-#[inline]
-fn compute_fps(frames_delta: u64, dt: Duration) -> f64 {
-    let secs = dt.as_secs_f64();
-    if secs <= 0.0 {
-        0.0
-    } else {
-        (frames_delta as f64) / secs
-    }
-}
-
 fn reporter_loop(
     metrics: &RuntimeMetrics,
     interval: Duration,
@@ -130,85 +116,20 @@ fn reporter_loop(
         let dropped_delta = dropped_now.saturating_sub(last_frames_dropped);
         last_frames_dropped = dropped_now;
 
-        emit(&snap, frames_delta, dropped_delta, dt);
+        emit_metrics_line(
+            &snap,
+            Some(PeriodicExtras {
+                frames_out_delta: frames_delta,
+                dropped_delta,
+                window: dt,
+            }),
+        );
     }
-}
-
-fn emit(
-    snap: &fluxframe_core::MetricsSnapshot,
-    frames_delta: u64,
-    dropped_delta: u64,
-    window: Duration,
-) {
-    let fps = compute_fps(frames_delta, window);
-    // Round display-only floats to two decimals so the line stays
-    // readable (`fps=24.0` rather than `fps=23.965698241213406`).
-    // The raw f64 is fine for downstream ingestors but the line is
-    // primarily for humans tailing `journalctl`.
-    let fps_rounded = round2(fps);
-    let window_secs = round2(window.as_secs_f64());
-    info!(
-        fps = fps_rounded,
-        window_secs = window_secs,
-        frames_out_delta = frames_delta,
-        dropped_delta = dropped_delta,
-        frames_in_total = snap.counters.frames_in,
-        frames_out_total = snap.counters.frames_out,
-        frames_dropped_total = snap.counters.frames_dropped,
-        fallback_total = snap.counters.fallback_count,
-        effect_err_total = snap.counters.effect_error_count,
-        inference_runtime_fallback_gpu_to_cpu = snap.counters.inference_runtime_fallback_gpu_to_cpu,
-        blur_runtime_fallback_gpu_to_cpu = snap.counters.blur_runtime_fallback_gpu_to_cpu,
-        inference_p50_us = snap.inference.percentile_us(0.5),
-        inference_p95_us = snap.inference.percentile_us(0.95),
-        processing_p50_us = snap.processing.percentile_us(0.5),
-        processing_p95_us = snap.processing.percentile_us(0.95),
-        output_p50_us = snap.output.percentile_us(0.5),
-        output_p95_us = snap.output.percentile_us(0.95),
-        end_to_end_p50_us = snap.end_to_end.percentile_us(0.5),
-        end_to_end_p95_us = snap.end_to_end.percentile_us(0.95),
-        "metrics tick"
-    );
-}
-
-/// Round to two decimal places.  Used for display-only float fields
-/// in the reporter line; not for any downstream calculation.
-#[inline]
-fn round2(x: f64) -> f64 {
-    (x * 100.0).round() / 100.0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn approx_eq(a: f64, b: f64) -> bool {
-        (a - b).abs() < 1e-9
-    }
-
-    #[test]
-    fn compute_fps_zero_window_returns_zero() {
-        assert!(approx_eq(compute_fps(100, Duration::ZERO), 0.0));
-    }
-
-    #[test]
-    fn compute_fps_zero_frames_returns_zero() {
-        assert!(approx_eq(compute_fps(0, Duration::from_secs(5)), 0.0));
-    }
-
-    #[test]
-    fn compute_fps_normal_window() {
-        // 150 frames over 5 s → 30 fps.
-        let fps = compute_fps(150, Duration::from_secs(5));
-        assert!((fps - 30.0).abs() < 1e-9, "expected 30 fps, got {fps}");
-    }
-
-    #[test]
-    fn compute_fps_sub_second_window() {
-        // 3 frames over 100 ms → 30 fps.
-        let fps = compute_fps(3, Duration::from_millis(100));
-        assert!((fps - 30.0).abs() < 1e-9, "expected 30 fps, got {fps}");
-    }
 
     #[test]
     fn reporter_joins_when_running_flag_drops() {
@@ -238,18 +159,6 @@ mod tests {
         // `running` still observable here — the supervisor would
         // typically flip it on its own teardown path.
         assert!(running.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn round2_basic() {
-        assert!(approx_eq(round2(23.965_698_241), 23.97));
-        assert!(approx_eq(round2(0.0), 0.0));
-        assert!(approx_eq(round2(5.007_156_428), 5.01));
-        assert!(approx_eq(round2(100.0), 100.0));
-        // Halfway cases — Rust's f64::round is round-half-away-from-zero,
-        // but 1.005 cannot be represented exactly in binary float, so the
-        // observed value is one of 1.00 or 1.01 depending on the platform.
-        assert!(approx_eq(round2(1.005), 1.01) || approx_eq(round2(1.005), 1.00));
     }
 
     #[test]
