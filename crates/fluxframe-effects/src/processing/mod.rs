@@ -11,6 +11,7 @@ pub mod fit;
 #[cfg(feature = "image-fill")]
 pub mod image_loader;
 pub mod mask;
+pub mod parallel;
 pub mod resize;
 
 pub use blur::box_blur_rgb;

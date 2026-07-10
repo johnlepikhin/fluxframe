@@ -1,12 +1,12 @@
 //! Alpha compositing for packed RGB buffers with an `f32` mask.
 
-use rayon::prelude::*;
+use super::parallel::for_each_chunk_mut;
 
-/// Number of pixels per parallel work chunk.  Rayon splits the buffer
-/// into chunks of this size so each worker thread handles a sizeable
-/// contiguous run — small enough that 4-core machines saturate, large
-/// enough that the per-task overhead (~µs) stays well below the
-/// per-chunk arithmetic cost.
+/// Number of pixels per parallel work chunk.  The shared primitive
+/// splits the buffer into chunks of this size so each worker thread
+/// handles a sizeable contiguous run — small enough that few-core
+/// machines saturate, large enough that the per-task overhead (~µs)
+/// stays well below the per-chunk arithmetic cost.
 const COMPOSITE_CHUNK_PIXELS: usize = 4_096;
 
 /// Composite `fg` over `bg` using `mask` as per-pixel alpha (1.0 → fg,
@@ -41,29 +41,43 @@ pub fn alpha_composite_rgb(fg: &[u8], bg: &[u8], dst: &mut [u8], mask: &[f32]) {
 ///
 /// # Panics
 ///
-/// Panics in debug builds on slice length mismatch.
+/// Panics on slice length mismatch. The check runs up front, serially,
+/// *before* any parallel work: the per-chunk closure slices `bg`/`mask`
+/// by offset, so a mismatch would otherwise panic inside a rayon worker
+/// and abort it. Failing fast here keeps the panic out of the parallel
+/// section and yields a clear message on a caller bug.
 pub fn alpha_composite_rgb_in_place(fg_dst: &mut [u8], bg: &[u8], mask: &[f32]) {
-    debug_assert_eq!(fg_dst.len(), mask.len() * 3);
-    debug_assert_eq!(bg.len(), mask.len() * 3);
-    let chunk_pixels = COMPOSITE_CHUNK_PIXELS;
-    let chunk_bytes = chunk_pixels * 3;
-    fg_dst
-        .par_chunks_mut(chunk_bytes)
-        .zip(bg.par_chunks(chunk_bytes))
-        .zip(mask.par_chunks(chunk_pixels))
-        .for_each(|((fg_chunk, bg_chunk), mask_chunk)| {
-            for (i, &alpha) in mask_chunk.iter().enumerate() {
-                let alpha = alpha.clamp(0.0, 1.0);
-                let one_minus = 1.0 - alpha;
-                let base = i * 3;
-                for c in 0..3 {
-                    let fg_v = f32::from(fg_chunk[base + c]);
-                    let bg_v = f32::from(bg_chunk[base + c]);
-                    let v = alpha * fg_v + one_minus * bg_v;
-                    fg_chunk[base + c] = v.round().clamp(0.0, 255.0) as u8;
-                }
+    assert_eq!(
+        fg_dst.len(),
+        mask.len() * 3,
+        "alpha_composite_rgb_in_place: fg_dst length must be mask.len() * 3",
+    );
+    assert_eq!(
+        bg.len(),
+        mask.len() * 3,
+        "alpha_composite_rgb_in_place: bg length must be mask.len() * 3",
+    );
+    let chunk_bytes = COMPOSITE_CHUNK_PIXELS * 3;
+    // Each pixel blends independently, so chunk boundaries never affect
+    // the result — the shared primitive picks parallel vs serial by size
+    // while `bg`/`mask` are sliced by the chunk's global byte offset.
+    // The up-front asserts guarantee both slices stay in bounds here.
+    for_each_chunk_mut(fg_dst, chunk_bytes, |byte_off, fg_chunk| {
+        let pixel_off = byte_off / 3;
+        let bg_chunk = &bg[byte_off..byte_off + fg_chunk.len()];
+        let mask_chunk = &mask[pixel_off..pixel_off + fg_chunk.len() / 3];
+        for (i, &alpha) in mask_chunk.iter().enumerate() {
+            let alpha = alpha.clamp(0.0, 1.0);
+            let one_minus = 1.0 - alpha;
+            let base = i * 3;
+            for c in 0..3 {
+                let fg_v = f32::from(fg_chunk[base + c]);
+                let bg_v = f32::from(bg_chunk[base + c]);
+                let v = alpha * fg_v + one_minus * bg_v;
+                fg_chunk[base + c] = v.round().clamp(0.0, 255.0) as u8;
             }
-        });
+        }
+    });
 }
 
 #[cfg(test)]
@@ -149,6 +163,17 @@ mod tests {
         let mask = vec![2.5_f32];
         alpha_composite_rgb_in_place(&mut fg_dst, &bg, &mask);
         assert_eq!(fg_dst, vec![100u8, 100, 100]);
+    }
+
+    #[test]
+    #[should_panic(expected = "bg length must be")]
+    fn in_place_fails_fast_on_length_mismatch() {
+        // A caller bug (bg shorter than fg_dst) must panic up front with a
+        // clear message, not deep inside a rayon worker mid-blend.
+        let mut fg_dst = vec![0_u8; 6];
+        let bg = vec![0_u8; 3];
+        let mask = vec![0.5_f32; 2];
+        alpha_composite_rgb_in_place(&mut fg_dst, &bg, &mask);
     }
 
     #[test]
