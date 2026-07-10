@@ -222,6 +222,62 @@ mod tests {
         effect.process(&mut plane, &mut ctx).expect("ok");
     }
 
+    /// Straightforward block-average with neither bands nor the shared
+    /// parallel primitive — an independent reference for the production
+    /// band-parallel implementation.
+    fn naive_pixelate(data: &[u8], width: usize, height: usize, block: usize) -> Vec<u8> {
+        let mut out = data.to_vec();
+        for by in (0..height).step_by(block) {
+            let bh = block.min(height - by);
+            for bx in (0..width).step_by(block) {
+                let bw = block.min(width - bx);
+                let (mut sum_r, mut sum_g, mut sum_b) = (0u32, 0u32, 0u32);
+                for y in by..by + bh {
+                    for x in bx..bx + bw {
+                        let idx = (y * width + x) * 3;
+                        sum_r += u32::from(out[idx]);
+                        sum_g += u32::from(out[idx + 1]);
+                        sum_b += u32::from(out[idx + 2]);
+                    }
+                }
+                let area = (bw * bh) as u32;
+                let avg = [
+                    (sum_r / area) as u8,
+                    (sum_g / area) as u8,
+                    (sum_b / area) as u8,
+                ];
+                for y in by..by + bh {
+                    for x in bx..bx + bw {
+                        let idx = (y * width + x) * 3;
+                        out[idx..idx + 3].copy_from_slice(&avg);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn parallel_band_path_matches_naive_reference() {
+        // 200×200×3 = 120_000 bytes exceeds MIN_PARALLEL_ELEMS, so the
+        // band dispatch runs in parallel. Dimensions are not multiples of
+        // the block size, exercising ragged bands and edge blocks — the
+        // only test that hits the *parallel* branch of pixelate.
+        let (w, h, block) = (200usize, 200usize, 16usize);
+        let data: Vec<u8> = (0..w * h * 3).map(|i| (i % 251) as u8).collect();
+        let expected = naive_pixelate(&data, w, h, block);
+        let mut effect = PixelateEffect::new();
+        effect
+            .configure(toml::from_str(&format!("block_size = {block}")).unwrap())
+            .expect("configure");
+        let mut actual = data.clone();
+        run(&mut effect, &mut actual, w as u32, h as u32);
+        assert_eq!(
+            actual, expected,
+            "parallel band output must match naive reference"
+        );
+    }
+
     #[test]
     fn defaults_when_no_params() {
         let mut effect = PixelateEffect::new();

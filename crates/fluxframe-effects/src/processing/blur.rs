@@ -117,6 +117,12 @@ fn blur_row_horizontal(
 /// Mirror of `blur_horizontal`: column-major running sum slides down
 /// one row at a time, subtracting the topmost row and adding the new
 /// bottom row (both clamped to `[0, h-1]`).
+///
+/// Deliberately serial: the O(h) running sum is per-column, and columns
+/// are strided (non-contiguous) in a row-major buffer, so it does not
+/// fit the row-/chunk-contiguous `for_each_*` primitives. Parallelising
+/// it would need a column-strip decomposition or a transpose; deferred
+/// as a follow-up since `blur` is not in the default preset's hot path.
 fn blur_vertical(src: &[u8], dst: &mut [u8], width: u32, height: u32, radius: u32) {
     let w = width as usize;
     let h = height as usize;

@@ -187,4 +187,27 @@ mod tests {
         alpha_composite_rgb_in_place(&mut fg_dst, &bg, &mask);
         assert_eq!(fg_dst, dst_oop);
     }
+
+    #[test]
+    fn in_place_parallel_path_matches_serial_reference() {
+        // 40_000 pixels = 120_000 bytes exceeds MIN_PARALLEL_ELEMS
+        // (50_000), so the in-place path dispatches to rayon. The
+        // out-of-place variant is a plain serial loop and is an
+        // independent reference for the chunk/offset arithmetic — this is
+        // the only test that exercises the *parallel* branch of compose.
+        let pixels = 40_000usize;
+        let fg: Vec<u8> = (0..pixels * 3).map(|i| (i % 251) as u8).collect();
+        let bg: Vec<u8> = (0..pixels * 3)
+            .map(|i| ((i * 7 + 13) % 251) as u8)
+            .collect();
+        let mask: Vec<f32> = (0..pixels).map(|i| (i % 101) as f32 / 100.0).collect();
+        let mut dst_ref = vec![0u8; pixels * 3];
+        alpha_composite_rgb(&fg, &bg, &mut dst_ref, &mask);
+        let mut fg_dst = fg.clone();
+        alpha_composite_rgb_in_place(&mut fg_dst, &bg, &mask);
+        assert_eq!(
+            fg_dst, dst_ref,
+            "parallel in-place must match serial reference"
+        );
+    }
 }
