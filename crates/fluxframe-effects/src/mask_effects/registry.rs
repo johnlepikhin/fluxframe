@@ -161,8 +161,8 @@ mod tests {
     #[test]
     fn build_chain_fails_on_unknown() {
         let reg = default_registry();
-        let res = reg.build_chain(&["nonexistent"]);
-        assert!(res.is_err());
+        let outcome = reg.build_chain(&["nonexistent"]);
+        assert!(outcome.is_err());
     }
 
     #[test]
