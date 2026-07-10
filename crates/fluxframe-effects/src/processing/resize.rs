@@ -172,7 +172,12 @@ pub fn resize_mask_bilinear(
     let sh = src_h as f32;
     let dw = dst_w as f32;
     let dh = dst_h as f32;
-    for y in 0..dst_h {
+    // Output rows are independent (each reads the shared `src`), so
+    // dispatch them row-parallel — same structure as the RGB resize.
+    // This is the per-frame model→frame mask upscale in the composite.
+    let dst_row_len = dst_w as usize;
+    for_each_row_mut(dst, dst_row_len, |y_row, dst_row| {
+        let y = y_row as u32;
         let sy = ((y as f32 + 0.5) * sh / dh - 0.5).max(0.0);
         let y0 = (sy.floor() as u32).min(src_h - 1);
         let y1 = (y0 + 1).min(src_h - 1);
@@ -186,13 +191,12 @@ pub fn resize_mask_bilinear(
             let v01 = src[(y0 * src_w + x1) as usize];
             let v10 = src[(y1 * src_w + x0) as usize];
             let v11 = src[(y1 * src_w + x1) as usize];
-            let dst_idx = (y * dst_w + x) as usize;
-            dst[dst_idx] = (1.0 - wx) * (1.0 - wy) * v00
+            dst_row[x as usize] = (1.0 - wx) * (1.0 - wy) * v00
                 + wx * (1.0 - wy) * v01
                 + (1.0 - wx) * wy * v10
                 + wx * wy * v11;
         }
-    }
+    });
 }
 
 #[cfg(test)]
