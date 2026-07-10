@@ -2,6 +2,8 @@
 //! (`&[f32]`) buffers.  Letterbox mapping for non-matching aspect
 //! ratios.
 
+use super::parallel::for_each_row_mut;
+
 /// Description of how a model-input rectangle was placed inside a
 /// frame after letterboxing.
 ///
@@ -67,7 +69,12 @@ pub fn resize_rgb_bilinear(
     let sh = src_h as f32;
     let dw = dst_w as f32;
     let dh = dst_h as f32;
-    for y in 0..dst_h {
+    // Output rows are independent — each reads the shared `src` and
+    // writes only its own row — so dispatch them row-parallel; the inner
+    // per-pixel bilinear sample is unchanged, keeping output identical.
+    let dst_row_bytes = dst_w as usize * 3;
+    for_each_row_mut(dst, dst_row_bytes, |y_row, dst_row| {
+        let y = y_row as u32;
         let sy = ((y as f32 + 0.5) * sh / dh - 0.5).max(0.0);
         let y0 = (sy.floor() as u32).min(src_h - 1);
         let y1 = (y0 + 1).min(src_h - 1);
@@ -81,16 +88,16 @@ pub fn resize_rgb_bilinear(
             let i01 = ((y0 * src_w + x1) * 3) as usize;
             let i10 = ((y1 * src_w + x0) * 3) as usize;
             let i11 = ((y1 * src_w + x1) * 3) as usize;
-            let dst_idx = ((y * dst_w + x) * 3) as usize;
+            let dst_idx = (x * 3) as usize;
             for c in 0..3 {
                 let v = (1.0 - wx) * (1.0 - wy) * f32::from(src[i00 + c])
                     + wx * (1.0 - wy) * f32::from(src[i01 + c])
                     + (1.0 - wx) * wy * f32::from(src[i10 + c])
                     + wx * wy * f32::from(src[i11 + c]);
-                dst[dst_idx + c] = v.round().clamp(0.0, 255.0) as u8;
+                dst_row[dst_idx + c] = v.round().clamp(0.0, 255.0) as u8;
             }
         }
-    }
+    });
 }
 
 /// Nearest-neighbour resize for a packed RGB buffer.  Fast and
