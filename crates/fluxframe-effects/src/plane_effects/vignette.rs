@@ -22,6 +22,7 @@ use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
 use super::helpers::reject_out_of_range;
+use crate::processing::parallel::for_each_row_mut;
 
 /// Default maximum darkening at the frame corners for the `strength` field.
 pub const DEFAULT_STRENGTH: f32 = 0.4;
@@ -247,19 +248,24 @@ impl PlaneEffect for VignetteEffect {
             width * height,
             "LUT size diverged from prepared dimensions",
         );
-        // Walk the plane and the LUT in lockstep. The 3-byte chunks
-        // make the per-pixel multiply auto-vectorisable and remove the
-        // manual row/column indexing.
-        for (pixel, &m) in plane.data.chunks_exact_mut(3).zip(self.lut.iter()) {
-            let m = u16::from(m);
-            // Integer multiply-divide: `(c * m + 127) / 255` rounds to
-            // the nearest integer; max value is 255 * 255 = 65 025
-            // which fits in u16.
-            for c in pixel.iter_mut() {
-                let v = u16::from(*c);
-                *c = ((v * m + 127) / 255) as u8;
+        // Walk the plane and the LUT in lockstep, one row per parallel
+        // chunk (rows are independent). The 3-byte inner chunks keep the
+        // per-pixel multiply auto-vectorisable; the LUT row is sliced by
+        // the row index so both stay aligned.
+        let lut = &self.lut;
+        for_each_row_mut(plane.data, width * 3, |y, row| {
+            let lut_row = &lut[y * width..y * width + width];
+            for (pixel, &m) in row.chunks_exact_mut(3).zip(lut_row.iter()) {
+                let m = u16::from(m);
+                // Integer multiply-divide: `(c * m + 127) / 255` rounds to
+                // the nearest integer; max value is 255 * 255 = 65 025
+                // which fits in u16.
+                for c in pixel.iter_mut() {
+                    let v = u16::from(*c);
+                    *c = ((v * m + 127) / 255) as u8;
+                }
             }
-        }
+        });
         Ok(())
     }
 }

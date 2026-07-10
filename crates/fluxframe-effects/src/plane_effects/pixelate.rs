@@ -19,6 +19,8 @@ use fluxframe_core::plane::{FramePlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
+use crate::processing::parallel::for_each_chunk_mut;
+
 /// Smallest accepted `block_size`. `1` would be a no-op (each pixel
 /// is its own block); rejecting it surfaces the misconfiguration
 /// instead of silently doing nothing.
@@ -160,8 +162,13 @@ impl PlaneEffect for PixelateEffect {
         // well under `u32::MAX ≈ 4.29e9`. If `MAX_BLOCK_SIZE` is ever
         // raised above ~4095, widen the accumulator to `u64`.
         let row_stride = width * 3;
-        for by in (0..height).step_by(block) {
-            let block_h = block.min(height - by);
+        // Bands of `block` rows are independent (disjoint row sets), so
+        // dispatch them in parallel; each band handles all its `bx`
+        // sub-blocks serially. The last band may be shorter than `block`
+        // rows — its row count comes from the chunk length, matching the
+        // original `block.min(height - by)`.
+        for_each_chunk_mut(plane.data, block * row_stride, |_off, band| {
+            let block_h = band.len() / row_stride;
             for bx in (0..width).step_by(block) {
                 let block_w = block.min(width - bx);
                 let pixel_offset = bx * 3;
@@ -173,9 +180,9 @@ impl PlaneEffect for PixelateEffect {
                 let mut sum_r: u32 = 0;
                 let mut sum_g: u32 = 0;
                 let mut sum_b: u32 = 0;
-                for y in by..(by + block_h) {
+                for y in 0..block_h {
                     let row_start = y * row_stride + pixel_offset;
-                    let row = &plane.data[row_start..row_start + pixel_len];
+                    let row = &band[row_start..row_start + pixel_len];
                     for px in row.chunks_exact(3) {
                         sum_r += u32::from(px[0]);
                         sum_g += u32::from(px[1]);
@@ -190,9 +197,9 @@ impl PlaneEffect for PixelateEffect {
                 let avg_b = (sum_b / area) as u8;
                 // Broadcast — same row-slice hoisting as the accumulate
                 // pass.
-                for y in by..(by + block_h) {
+                for y in 0..block_h {
                     let row_start = y * row_stride + pixel_offset;
-                    let row = &mut plane.data[row_start..row_start + pixel_len];
+                    let row = &mut band[row_start..row_start + pixel_len];
                     for px in row.chunks_exact_mut(3) {
                         px[0] = avg_r;
                         px[1] = avg_g;
@@ -200,7 +207,7 @@ impl PlaneEffect for PixelateEffect {
                     }
                 }
             }
-        }
+        });
         Ok(())
     }
 }
