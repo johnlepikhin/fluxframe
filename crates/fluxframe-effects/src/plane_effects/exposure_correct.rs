@@ -26,6 +26,13 @@ use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
 use super::helpers::{luma_rec601, reject_out_of_range};
+use crate::processing::parallel::{for_each_chunk_mut, map_reduce_chunks};
+
+/// RGB bytes per parallel chunk for the histogram/LUT passes. A multiple
+/// of 3 so each chunk holds whole pixels (`chunks_exact(3)` leaves no
+/// remainder); the exact size does not affect output — integer bin sums
+/// are associative and the LUT map is per-byte.
+const EXPOSURE_CHUNK_BYTES: usize = 3 * 4_096;
 
 /// Dynamic-range gate. If `p_high - p_low` is at least this many code
 /// values the frame is already well-exposed and the effect short-circuits.
@@ -262,13 +269,30 @@ fn build_lut(p_low: u8, p_high: u8, mean: f32, cfg: &ExposureCorrectConfig) -> O
 /// 8-bit luminance values and `mean_luma` is the histogram's centre of
 /// mass in `[0, 255]`.
 fn analyse_histogram(data: &[u8], cfg: &ExposureCorrectConfig) -> (u8, u8, f32) {
-    let mut hist = [0u32; 256];
-    // Rec.601 luma weights are encapsulated in `luma_rec601`; the
-    // helper guarantees output in `0..=255`, so the index is sound.
-    for chunk in data.chunks_exact(3) {
-        let y = luma_rec601([chunk[0], chunk[1], chunk[2]]);
-        hist[y as usize] += 1;
-    }
+    // Per-chunk local histograms merged by integer addition. Addition is
+    // associative and commutative, so the merged histogram — and every
+    // percentile/mean derived from it — is bit-identical to a serial
+    // pass regardless of thread count. Rec.601 luma is in `0..=255`, so
+    // the bin index is always sound.
+    let hist: [u32; 256] = map_reduce_chunks(
+        data,
+        EXPOSURE_CHUNK_BYTES,
+        || [0u32; 256],
+        |chunk| {
+            let mut local = [0u32; 256];
+            for px in chunk.chunks_exact(3) {
+                let y = luma_rec601([px[0], px[1], px[2]]);
+                local[y as usize] += 1;
+            }
+            local
+        },
+        |mut a, b| {
+            for (slot, add) in a.iter_mut().zip(b.iter()) {
+                *slot += *add;
+            }
+            a
+        },
+    );
     let total: u32 = hist.iter().sum();
     if total == 0 {
         return (0, 255, 127.5);
@@ -362,9 +386,13 @@ impl PlaneEffect for ExposureCorrectEffect {
             // Frame already well-exposed: short-circuit.
             return Ok(());
         };
-        for byte in plane.data.iter_mut() {
-            *byte = lut[*byte as usize];
-        }
+        // Per-byte LUT remap: every byte is independent, so dispatch it
+        // in parallel chunks (identical output for any chunking).
+        for_each_chunk_mut(plane.data, EXPOSURE_CHUNK_BYTES, |_off, chunk| {
+            for byte in chunk.iter_mut() {
+                *byte = lut[*byte as usize];
+            }
+        });
         Ok(())
     }
 }

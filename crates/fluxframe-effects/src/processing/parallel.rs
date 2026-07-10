@@ -91,6 +91,41 @@ where
     }
 }
 
+/// Map each contiguous `chunk_len`-element chunk of `data` to a partial
+/// `T`, then combine the partials with `merge`. Runs on the global pool
+/// above the cutoff, serially below it.
+///
+/// `merge` MUST be associative **and** commutative — rayon does not
+/// guarantee chunk order — for the result to be deterministic and match
+/// the serial path bit-for-bit (e.g. integer histogram summation or a
+/// bounding-box min/max fold). `identity` returns the fold seed / rayon
+/// reduce identity.
+pub fn map_reduce_chunks<E, T, I, M, R>(
+    data: &[E],
+    chunk_len: usize,
+    identity: I,
+    map: M,
+    merge: R,
+) -> T
+where
+    E: Sync,
+    T: Send,
+    I: Fn() -> T + Sync,
+    M: Fn(&[E]) -> T + Sync,
+    R: Fn(T, T) -> T + Sync,
+{
+    if chunk_len == 0 || data.is_empty() {
+        return identity();
+    }
+    if should_parallelize(data.len()) {
+        data.par_chunks(chunk_len)
+            .map(&map)
+            .reduce(&identity, &merge)
+    } else {
+        data.chunks(chunk_len).map(&map).fold(identity(), &merge)
+    }
+}
+
 /// Apply `f(y, row)` to each row of a row-major buffer, dispatched
 /// parallel or serial per the cutoff (like [`for_each_chunk_mut`], the
 /// `for_each_` prefix does not promise parallelism). `row_len` is the
@@ -169,6 +204,31 @@ mod tests {
             Ok(())
         });
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn map_reduce_matches_serial_in_both_paths() {
+        // Sum via chunked map-reduce must equal the plain serial sum,
+        // below the cutoff (serial fold) and above it (parallel reduce).
+        for len in [30_usize, MIN_PARALLEL_ELEMS * 2 + 5] {
+            let data: Vec<u32> = (0..u32::try_from(len).unwrap()).collect();
+            let total: u64 = map_reduce_chunks(
+                &data,
+                8,
+                || 0_u64,
+                |chunk| chunk.iter().map(|&x| u64::from(x)).sum::<u64>(),
+                |a, b| a + b,
+            );
+            let expected: u64 = data.iter().map(|&x| u64::from(x)).sum();
+            assert_eq!(total, expected, "len={len}");
+        }
+    }
+
+    #[test]
+    fn map_reduce_empty_returns_identity() {
+        let data: Vec<u32> = Vec::new();
+        let total: u64 = map_reduce_chunks(&data, 8, || 7_u64, |_| 1_u64, |a, b| a + b);
+        assert_eq!(total, 7);
     }
 
     #[test]
