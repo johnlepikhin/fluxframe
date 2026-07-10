@@ -1456,6 +1456,12 @@ where
     // `BackgroundBlurEffect`'s blur backend publish transition events
     // through the same counter bundle the supervisor reads later.
     let metrics = RuntimeMetrics::new();
+    // Publish the effective effect-processing pool size (set once by
+    // `cap_rayon_pool` at startup) as a gauge so operators can confirm
+    // the cap and watch for oversubscription against `inference_p95`.
+    metrics
+        .counters
+        .set_processing_threads(rayon::current_num_threads() as u64);
 
     // Stage 16: build + start the output (loopback) producer FIRST, so
     // `/dev/video10` is enumerable by Chrome and streams a placeholder

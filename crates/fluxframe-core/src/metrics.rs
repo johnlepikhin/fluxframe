@@ -87,6 +87,11 @@ pub struct Counters {
     // browser).
     resume_failures_total: AtomicU64,
     unattributable_wakes_total: AtomicU64,
+    // Effective size of the effect-processing rayon pool. A gauge (set
+    // once at startup), not a monotonic counter — lets an operator
+    // confirm the deliberate low thread cap took effect and spot
+    // oversubscription against `inference_p95`.
+    processing_threads: AtomicU64,
 }
 
 impl Counters {
@@ -108,6 +113,7 @@ impl Counters {
             input_acquire_failures_total: AtomicU64::new(0),
             resume_failures_total: AtomicU64::new(0),
             unattributable_wakes_total: AtomicU64::new(0),
+            processing_threads: AtomicU64::new(0),
         }
     }
 
@@ -226,6 +232,16 @@ impl Counters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record the effective effect-processing rayon pool size.
+    ///
+    /// A gauge, not a counter: set once at startup from
+    /// `rayon::current_num_threads()` so an operator can confirm the
+    /// deliberate low cap (see `cap_rayon_pool`) took effect.
+    #[inline]
+    pub fn set_processing_threads(&self, threads: u64) {
+        self.processing_threads.store(threads, Ordering::Relaxed);
+    }
+
     /// Snapshot the counter values.  Each load is independent — there
     /// is no cross-counter atomicity guarantee.
     #[must_use]
@@ -249,6 +265,7 @@ impl Counters {
             input_acquire_failures_total: self.input_acquire_failures_total.load(Ordering::Relaxed),
             resume_failures_total: self.resume_failures_total.load(Ordering::Relaxed),
             unattributable_wakes_total: self.unattributable_wakes_total.load(Ordering::Relaxed),
+            processing_threads: self.processing_threads.load(Ordering::Relaxed),
         }
     }
 }
@@ -291,6 +308,8 @@ pub struct CounterValues {
     pub resume_failures_total: u64,
     /// See [`Counters::inc_unattributable_wakes`].
     pub unattributable_wakes_total: u64,
+    /// See [`Counters::set_processing_threads`].
+    pub processing_threads: u64,
 }
 
 /// Bounded ring of latency samples in microseconds.
@@ -585,6 +604,7 @@ pub fn emit_metrics_line(snap: &MetricsSnapshot, extras: Option<PeriodicExtras>)
         input_acquire_failures_total,
         resume_failures_total,
         unattributable_wakes_total,
+        processing_threads,
     } = snap.counters;
 
     let ex = extras.unwrap_or_default();
@@ -619,6 +639,7 @@ pub fn emit_metrics_line(snap: &MetricsSnapshot, extras: Option<PeriodicExtras>)
         input_acquire_failures_total = input_acquire_failures_total,
         resume_failures_total = resume_failures_total,
         unattributable_wakes_total = unattributable_wakes_total,
+        processing_threads = processing_threads,
         capture_p50_us = snap.capture.percentile_us(0.5),
         capture_p95_us = snap.capture.percentile_us(0.95),
         inference_p50_us = snap.inference.percentile_us(0.5),
