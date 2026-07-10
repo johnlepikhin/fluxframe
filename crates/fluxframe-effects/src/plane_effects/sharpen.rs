@@ -23,6 +23,7 @@ use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
 use super::helpers::reject_out_of_range;
+use crate::processing::parallel::{for_each_chunk_mut, for_each_row_mut};
 
 /// Upper bound on `amount`. Past this, the unsharp formula produces
 /// pronounced ringing halos rather than perceived sharpness; reject
@@ -122,14 +123,13 @@ impl Default for SharpenEffect {
 }
 
 /// Horizontal 3-tap Gaussian-style blur with the `[1, 2, 1] / 4` kernel
-/// and clamp-to-edge boundary. Writes one output row at a time so input
-/// and output rows can share storage byte-disjointly.
-fn gauss_h(src: &[u8], dst: &mut [u8], width: usize, height: usize) {
+/// and clamp-to-edge boundary. Output rows are independent (each reads
+/// only its own `src` row), so they are dispatched row-parallel via the
+/// shared primitive; `dst`'s row count fixes the height.
+fn gauss_h(src: &[u8], dst: &mut [u8], width: usize) {
     let row_stride = width * 3;
-    for y in 0..height {
-        let row_off = y * row_stride;
-        let src_row = &src[row_off..row_off + row_stride];
-        let dst_row = &mut dst[row_off..row_off + row_stride];
+    for_each_row_mut(dst, row_stride, |y, dst_row| {
+        let src_row = &src[y * row_stride..y * row_stride + row_stride];
         for x in 0..width {
             let xm = x.saturating_sub(1);
             let xp = (x + 1).min(width - 1);
@@ -142,16 +142,17 @@ fn gauss_h(src: &[u8], dst: &mut [u8], width: usize, height: usize) {
                 dst_row[x * 3 + c] = ((l + 2 * m + r + 2) / 4) as u8;
             }
         }
-    }
+    });
 }
 
 /// Vertical 3-tap Gaussian-style blur with the `[1, 2, 1] / 4` kernel
-/// and clamp-to-edge boundary. The loop body works on a whole row at a
-/// time via `chunks_exact_mut`, leaving auto-vectorisation room for the
-/// inner byte-wise tap-sum.
+/// and clamp-to-edge boundary. Each output row reads three `src` rows
+/// (`y-1`, `y`, `y+1`) from a separate scratch buffer, so rows are
+/// independent and dispatched row-parallel; the inner byte-wise tap-sum
+/// stays auto-vectorisable.
 fn gauss_v(src: &[u8], dst: &mut [u8], width: usize, height: usize) {
     let row_stride = width * 3;
-    for (y, dst_row) in dst.chunks_exact_mut(row_stride).enumerate().take(height) {
+    for_each_row_mut(dst, row_stride, |y, dst_row| {
         let ym = y.saturating_sub(1);
         let yp = (y + 1).min(height - 1);
         let top = &src[ym * row_stride..ym * row_stride + row_stride];
@@ -163,18 +164,38 @@ fn gauss_v(src: &[u8], dst: &mut [u8], width: usize, height: usize) {
             let r = u16::from(bot[i]);
             *out = ((l + 2 * m + r + 2) / 4) as u8;
         }
-    }
+    });
 }
 
+/// Number of RGB bytes per parallel chunk in the unsharp blend. Each
+/// byte is independent, so any chunking yields identical output; this
+/// size mirrors the compositor's per-chunk granularity.
+const COMBINE_CHUNK_BYTES: usize = 4_096 * 3;
+
 /// Final unsharp blend: `out = orig + amount * (orig - blurred)`, with
-/// channel-wise clamp to `[0, 255]`.
+/// channel-wise clamp to `[0, 255]`. Bytes are independent, so the blend
+/// is dispatched in parallel chunks; `blurred` is sliced by the chunk's
+/// global offset.
+///
+/// # Panics
+///
+/// Panics if `blurred.len() != plane_data.len()` (checked up front,
+/// before any parallel work, to keep the panic out of the rayon worker).
 fn unsharp_combine(plane_data: &mut [u8], blurred: &[u8], amount: f32) {
-    for (orig, blur) in plane_data.iter_mut().zip(blurred.iter()) {
-        let o = f32::from(*orig);
-        let b = f32::from(*blur);
-        let mixed = o + amount * (o - b);
-        *orig = mixed.clamp(0.0, 255.0) as u8;
-    }
+    assert_eq!(
+        plane_data.len(),
+        blurred.len(),
+        "unsharp_combine: blurred length must equal plane_data",
+    );
+    for_each_chunk_mut(plane_data, COMBINE_CHUNK_BYTES, |off, chunk| {
+        let blur_chunk = &blurred[off..off + chunk.len()];
+        for (orig, blur) in chunk.iter_mut().zip(blur_chunk.iter()) {
+            let o = f32::from(*orig);
+            let b = f32::from(*blur);
+            let mixed = o + amount * (o - b);
+            *orig = mixed.clamp(0.0, 255.0) as u8;
+        }
+    });
 }
 
 impl PlaneEffect for SharpenEffect {
@@ -232,7 +253,7 @@ impl PlaneEffect for SharpenEffect {
             "FramePlane invariant: data.len() must equal width * height * 3",
         );
 
-        gauss_h(plane.data, &mut self.scratch_h, width, height);
+        gauss_h(plane.data, &mut self.scratch_h, width);
         gauss_v(&self.scratch_h, &mut self.scratch_v, width, height);
         unsharp_combine(plane.data, &self.scratch_v, self.config.amount);
         Ok(())

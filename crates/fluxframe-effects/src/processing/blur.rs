@@ -4,7 +4,7 @@
 //! tunable via `passes`.  `radius` is the half-kernel size, so the
 //! kernel covers `2*radius + 1` pixels.
 
-use rayon::prelude::*;
+use super::parallel::for_each_row_mut;
 
 /// Apply a separable box blur to a packed RGB buffer.
 ///
@@ -57,14 +57,14 @@ fn blur_horizontal(src: &[u8], dst: &mut [u8], width: u32, _height: u32, radius:
     let w_last = w - 1;
     let row_bytes = w * 3;
     // Rows are independent — each output row only reads its own input
-    // row.  Parallelise across rows so multi-core CPUs absorb the cost
-    // and a heavy `box_blur_rgb` call does not serialise the entire
-    // effect chain on one thread.
-    dst.par_chunks_mut(row_bytes)
-        .zip(src.par_chunks(row_bytes))
-        .for_each(|(dst_row, src_row)| {
-            blur_row_horizontal(src_row, dst_row, w, w_last, r, r_i32, kernel);
-        });
+    // row.  Dispatch across rows through the shared primitive so multi-
+    // core CPUs absorb the cost (above the cutoff) without a heavy
+    // `box_blur_rgb` call serialising the whole effect chain on one
+    // thread, while tiny buffers skip the spawn/join overhead.
+    for_each_row_mut(dst, row_bytes, |y, dst_row| {
+        let src_row = &src[y * row_bytes..y * row_bytes + row_bytes];
+        blur_row_horizontal(src_row, dst_row, w, w_last, r, r_i32, kernel);
+    });
 }
 
 fn blur_row_horizontal(
