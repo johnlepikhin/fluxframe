@@ -29,12 +29,19 @@ use std::sync::Arc;
 
 use fluxframe_core::metrics::{Counters, EffectTelemetry, LatencyHistogram, MetricsSnapshot};
 
-/// Number of samples retained per per-stage histogram.  Sized for the
-/// periodic reporter cadence (≈5 s) and a 30 fps producer: 1024
-/// samples covers ~34 s, plenty of headroom against bursty reporter
-/// ticks.  Capacity is fixed at construction; runtime tuning would
-/// require a config plumb-through that nothing yet consumes.
-const PER_STAGE_HISTOGRAM_CAPACITY: usize = 1024;
+/// Number of samples retained per per-stage histogram.
+///
+/// The invariant that matters is `capacity >= fps * metrics_interval_secs`:
+/// below it, a tick's "p95" silently stops describing the interval and
+/// starts describing only the last `capacity` frames.  At the 30 s
+/// default cadence (`DEFAULT_METRICS_INTERVAL_SECS`) a 30 fps producer
+/// needs 900 samples, so the previous 1024 — sized back when the
+/// cadence was 5 s — had almost no headroom left.  2048 covers 30 s at
+/// 60 fps and keeps the ring at a few tens of KB.
+///
+/// Capacity is fixed at construction; runtime tuning would require a
+/// config plumb-through that nothing yet consumes.
+const PER_STAGE_HISTOGRAM_CAPACITY: usize = 2048;
 
 /// Metrics bundle owned by a single [`crate::runtime`] run.
 ///

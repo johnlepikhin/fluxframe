@@ -21,8 +21,8 @@ pub mod traits;
 
 pub use config::{
     AutoInputConfig, BackendKind, ControlConfig, FluxConfig, IdleConfig, IdlePlaceholderKind,
-    InputConfig, InputDevice, LoggingConfig, OutputConfig, OutputScale, PipelineSection, Preset,
-    RealtimeConfig,
+    IdlePresenceSource, InputConfig, InputDevice, LoggingConfig, OutputConfig, OutputScale,
+    PipelineSection, Preset, RealtimeConfig,
 };
 pub use context::{FrameContext, ProcessingContext, RuntimeState};
 pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineError};

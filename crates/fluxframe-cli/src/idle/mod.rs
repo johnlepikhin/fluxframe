@@ -43,7 +43,7 @@ pub(crate) mod state;
     unused_imports,
     reason = "Stage 15 Step 4 consumes these from runtime::run_process_loop"
 )]
-pub(crate) use detector::{ConsumerDetector, device_path};
+pub(crate) use detector::{ConsumerDetector, DetectorParams, device_path};
 #[cfg(feature = "ml")]
 #[allow(
     unused_imports,

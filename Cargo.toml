@@ -93,6 +93,11 @@ glib = "0.20"
 # (SIMD intrinsics, FFI helpers beyond the existing GStreamer/ORT
 # wrappers) the operator can downgrade this knob deliberately rather
 # than having a subtle dependency creep it in.
+#
+# One deliberate exemption exists: `fluxframe-gst` opts out of these
+# workspace lints entirely (it declares its own `[lints]`) because the
+# V4L2 event ioctls have no safe wrapper anywhere in the ecosystem.
+# That crate is the V4L2 boundary already; the other four keep `forbid`.
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]

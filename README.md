@@ -458,47 +458,64 @@ back to `Playing`. Steady-state cold-start budget on UVC cameras is
 
 ### How "no consumer" is detected
 
-The supervisor's detector thread watches `/dev/videoN` via
-`inotify` for `IN_OPEN` / `IN_CLOSE_NOWRITE` / `IN_CLOSE_WRITE`.
-In steady-state idle the per-event cost is zero — the kernel only
-wakes the thread when somebody opens or closes the device. The
-shutdown-poll window costs one nonblocking `read(2)` returning
-`EAGAIN` every ~50 ms (so the worker honours Ctrl-C within that
-budget), which is sub-microsecond and orders of magnitude cheaper
-than the prior `/proc` polling. On a real wake, the detector walks
-`/proc/[0-9]+/fd/`, reading each symlink and checking whether any
-external process (`pid != fluxframe`) holds a file descriptor
-whose target matches `/dev/videoN`. One or more → `Present`. Zero →
-`Absent`. Per-pid permission errors are skipped silently
-(steady-state expected on a multi-user system).
+The primary source is the kernel itself. v4l2loopback (≥ 0.13)
+publishes a `V4L2_EVENT_PRI_CLIENT_USAGE` event whenever a capture
+client starts or stops streaming, and the supervisor subscribes to it
+on the very file descriptor it already uses to write frames. The
+reading is **absolute** — "is a capture client streaming right now" —
+rather than a delta to accumulate, so there is nothing to drift out of
+sync and no `/proc` access is involved. Sandboxed and root-owned
+consumers are as visible as any other.
 
-The walk on event is necessary because `inotify` cannot tell us
-*which* process opened the device — fluxframe itself opens and
-closes the v4l2 sink during pipeline state transitions, and we
-have to distinguish those self-events from external ones.
+Two properties are worth knowing:
 
-If `inotify::init` or `inotify::watches::add` fails (the device
-node doesn't exist, the user is at
-`/proc/sys/fs/inotify/max_user_watches`, or a sandbox blocks
-`inotify_init`), the detector falls back to walking
-`/proc/[0-9]+/fd/` every `idle.poll_interval_ms`. Behaviour is
-identical; only the wake mechanism differs (and the steady-state
-CPU cost climbs from ~0 % to ~5 % on a typical desktop).
+- Events fire on `VIDIOC_STREAMON` / `STREAMOFF`, not on `open` /
+  `close`. An application that merely enumerates devices is therefore
+  **not** counted as a consumer.
+- The subscription asks for the initial value, so a freshly started
+  daemon knows the state immediately instead of waiting for a change.
+  Until the first reading arrives the status stays `Unknown`, which is
+  treated as "consumer present" — idle never engages on an assumption.
 
-**Limitation: root-owned consumers are invisible.** An unprivileged
-fluxframe cannot read `/proc/<root-pid>/fd`, so a root-owned process
-consuming `/dev/video10` looks identical to "no consumer". If you
-run a root-owned consumer alongside fluxframe, idle mode may tear
-down the input pipeline while a real consumer is reading. The
-pragmatic workaround is to run fluxframe as the same user as the
-consumer.
+**Fallback: `inotify` + `/proc` walk.** When the subscription is
+unavailable (v4l2loopback older than 0.13, or a sink that owns no
+device fd) the detector falls back to watching `/dev/videoN` via
+`inotify` for `IN_OPEN` / `IN_CLOSE_*` and walking `/proc/[0-9]+/fd/`
+on each event to see whether an external process holds a matching
+descriptor. If `inotify` itself is unavailable, it degrades again to
+polling `/proc` every `idle.poll_interval_ms`.
+
+This fallback cannot produce an authoritative "nobody is attached": an
+unprivileged process cannot read `/proc/<pid>/fd` of processes owned by
+other users, so "nobody holds the device" and "I am not allowed to see
+who does" are indistinguishable. It compensates with a net open/close
+balance, which is a heuristic — it is the reason the kernel-event path
+exists. Check `consumer_source` in the metrics line to see which path
+is actually live (`0` = kernel events, `1` = inotify, `2` = polling,
+`3` = detection disabled by config).
+
+**Choosing the source.** `idle.presence_source` accepts:
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | Kernel events, silently falling back to the heuristic. |
+| `kernel_event` | Kernel events only; no fallback. If the subscription fails the status stays `Unknown` and idle never engages — for diagnosing whether a fallback is masking a problem. |
+| `inotify` | Force the heuristic. |
+| `disabled` | Never report "absent"; idle never engages. The placeholder and the loopback's CAPTURE-caps heartbeat keep working, so this disables power saving without affecting device visibility. |
+
+This is the kill switch to reach for if the detector ever misbehaves —
+unlike `idle.enabled = false`, it keeps the loopback visible to
+clients.
 
 ### Compatibility notes
 
-- **Linux-only.** `/proc/[0-9]+/fd/` walking is a Linux-specific
-  interface; the detector module is `#[cfg(target_os = "linux")]`-gated.
-  On non-Linux hosts idle mode falls through to the Stage 14 path with
-  a one-shot `warn!` line.
+- **Linux-only.** Both the V4L2 event ioctls and `/proc/[0-9]+/fd/`
+  walking are Linux-specific; the detector module is
+  `#[cfg(target_os = "linux")]`-gated. On non-Linux hosts idle mode
+  falls through to the Stage 14 path with a one-shot `warn!` line.
+- **v4l2loopback ≥ 0.13 for the kernel-event path.** Older modules do
+  not implement `V4L2_EVENT_PRI_CLIENT_USAGE`; the subscription fails
+  and `presence_source = "auto"` degrades to the heuristic.
 - **V4L2 loopback sinks only.** Idle mode requires
   `OutputSink::V4l2Loopback`; `fakesink`, `autovideosink` and
   `pipewiresink` fall through with a `warn!` line explaining the
@@ -516,6 +533,13 @@ Idle transitions are logged at `info!` with `target =
 - `idle_entered_total` — Active → Idle transitions.
 - `deep_idle_entered_total` — retained for dashboard back-compat; always `0` since the `DeepIdle` state was removed in Stage 16.
 - `idle_frames_pushed_total` — placeholder frames emitted.
+- `consumer_status` — the detector's current verdict (`0` Absent, `1` Present, `2` Unknown).
+- `consumer_clients` — capture clients reported by the kernel (0/1 on v4l2loopback 0.15).
+- `consumer_source` — which detection path is live; see the table above.
+- `consumer_transitions_total` — verdict changes. A flat counter over a long uptime means the detector has stopped observing.
+- `frames_out_while_no_consumer_total` — frames composited while the detector said nobody was attached.
+- `input_reacquire_total` / `input_reacquire_failures_total` — in-place camera recoveries that did not tear the loopback down.
+- `input_down_ms_total` — wall time with no valid input inside a run.
 
 Status changes (`Present ↔ Absent` from the detector) also log at
 `info!` so a `RUST_LOG=info` operator sees consumer attach/detach

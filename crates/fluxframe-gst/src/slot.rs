@@ -41,20 +41,40 @@ struct State {
     closed: bool,
 }
 
-impl LatestFrameSlot {
-    /// Construct an empty slot.
-    ///
-    /// Crate-private: a slot is only ever instantiated by
-    /// [`crate::input::InputPipeline`], which then hands a clone to the
-    /// consumer via `InputPipeline::slot()`.
-    #[must_use]
-    pub(crate) fn new() -> Self {
+impl Default for LatestFrameSlot {
+    fn default() -> Self {
         Self {
             inner: Arc::new(Inner {
                 state: Mutex::new(State::default()),
                 cond: Condvar::new(),
             }),
         }
+    }
+}
+
+impl LatestFrameSlot {
+    /// Construct an empty slot.
+    ///
+    /// In production a slot is only ever instantiated by
+    /// [`crate::input::InputPipeline`], which then hands a clone to the
+    /// consumer via `InputPipeline::slot()`. It is public because the
+    /// slot is a self-contained data structure with no GStreamer
+    /// dependency, which lets the supervisor's tests exercise
+    /// slot-lifecycle behaviour without a live camera.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Has the slot been closed?
+    ///
+    /// Closing is one-way — there is no reopen — so this is effectively
+    /// "is this slot permanently dead". Callers that recover a pipeline
+    /// in place need to be sure they never closed it, because every
+    /// subsequent [`LatestFrameSlot::push`] would be a silent no-op.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.state.lock().closed
     }
 
     /// Publish `frame`, replacing any previous frame that has not been

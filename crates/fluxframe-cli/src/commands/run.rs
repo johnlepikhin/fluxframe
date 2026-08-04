@@ -11,7 +11,7 @@
 //! sit in the background and outlive any individual camera session.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fluxframe_core::{FluxConfig, FluxError, InputDevice};
 use tracing::{info, warn};
@@ -21,7 +21,7 @@ use crate::config_merge::{CliOverrides, apply, load, resolve_load_path, resolve_
 use crate::preset;
 use crate::runtime::{
     InputSpec, OutputSpec, classify_input, classify_output, ensure_ctrlc_handler,
-    is_shutdown_requested, run_testsrc_chain, run_v4l2_chain, wait_for_shutdown,
+    is_shutdown_requested, mark_output_down, run_testsrc_chain, run_v4l2_chain, wait_for_shutdown,
 };
 
 /// Entry point for `fluxframe run`.
@@ -54,6 +54,13 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
     let cfg = load(load_path.as_deref())?;
     let cfg = apply(cfg, &overrides);
     cfg.validate()?;
+
+    // The subscriber was installed from `-v` / `RUST_LOG` before the
+    // config existed; now that we have a validated one, let its
+    // `[logging] level` take effect for the rest of the daemon's life.
+    // Everything logged above this line (config-load failures included)
+    // still had to go through the bootstrap filter.
+    crate::logging::apply_config_level(&cfg.logging.level);
 
     // Resolve the preset once up-front so a misnamed preset fails fast
     // (before we touch any GStreamer state) and the auto input loop
@@ -111,6 +118,21 @@ fn run_auto(
     // into a single line until a device shows up.
     let mut last_failure_kind: Option<String> = None;
     let mut last_no_devices_logged = false;
+    // Backoff for *repeated* transient failures only. A camera that
+    // reports EBUSY on every attempt used to be retried at the flat
+    // `poll_interval_secs`, producing ~18 full pipeline rebuilds a
+    // minute for as long as the condition lasted; each rebuild is a
+    // window where `/dev/video10` has no producer and therefore
+    // advertises no CAPTURE caps, so clients could not see the camera
+    // for minutes at a time.
+    //
+    // Only the failure branch backs off. The "no candidate devices"
+    // branch keeps the flat poll: a camera being plugged in should be
+    // picked up promptly, and two competing timers would make that
+    // latency unpredictable.
+    let backoff_base = Duration::from_millis(u64::from(cfg.input.acquire_backoff_base_ms.max(1)));
+    let backoff_max = Duration::from_millis(u64::from(cfg.input.acquire_backoff_max_ms.max(1)));
+    let mut failure_backoff: Option<Duration> = None;
 
     loop {
         if is_shutdown_requested() {
@@ -123,9 +145,18 @@ fn run_auto(
             info!(device = %path.display(), "auto-input picked");
             let mut resolved = cfg.clone();
             resolved.input.device = InputDevice::Path(path.clone());
+            let run_started = Instant::now();
             match run_once(&resolved, preset_name, config_path) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    mark_output_down(None);
+                    return Ok(());
+                }
                 Err(e) => {
+                    // The run took the whole pipeline down with it,
+                    // loopback output included: from here until the next
+                    // successful `output.start()` the node advertises no
+                    // CAPTURE caps and clients cannot see the camera.
+                    mark_output_down(Some(&e));
                     if !e.is_transient() {
                         warn!(error = %e, "auto-input: permanent error, surfacing");
                         return Err(e);
@@ -138,10 +169,21 @@ fn run_auto(
                         );
                         last_failure_kind = Some(kind);
                     }
+                    // A run that stayed up for a while and then failed is
+                    // a fresh incident, not a tight failure loop — start
+                    // over from the base delay so an isolated flap a day
+                    // later is not punished with the maximum wait.
+                    failure_backoff = Some(next_failure_backoff(
+                        failure_backoff,
+                        run_started.elapsed(),
+                        backoff_base,
+                        backoff_max,
+                    ));
                 }
             }
         } else {
             last_failure_kind = None;
+            failure_backoff = None;
             if !last_no_devices_logged {
                 info!(
                     candidates = ?candidates,
@@ -150,10 +192,39 @@ fn run_auto(
                 last_no_devices_logged = true;
             }
         }
-        if wait_for_shutdown(interval) {
+        let wait = failure_backoff.unwrap_or(interval);
+        if wait_for_shutdown(wait) {
             info!("auto-input loop: shutdown during wait");
             return Ok(());
         }
+    }
+}
+
+/// Multiplier for deciding a run "held" long enough to count as a fresh
+/// incident rather than part of an ongoing failure loop.
+const BACKOFF_RESET_FACTOR: u32 = 4;
+
+/// Next delay before retrying after a transient run failure.
+///
+/// Doubles while failures keep arriving quickly, and resets to `base`
+/// once a run managed to stay up for `BACKOFF_RESET_FACTOR × max`.
+/// Without the reset an isolated flap a day into an otherwise healthy
+/// session would still be met with the maximum delay; without the
+/// growth, a persistently busy camera would be retried in a tight loop.
+///
+/// Pure so the escalate/reset behaviour is testable without sleeping.
+fn next_failure_backoff(
+    current: Option<Duration>,
+    run_uptime: Duration,
+    base: Duration,
+    max: Duration,
+) -> Duration {
+    if run_uptime >= max * BACKOFF_RESET_FACTOR {
+        return base.min(max);
+    }
+    match current {
+        None => base.min(max),
+        Some(prev) => (prev * 2).min(max),
     }
 }
 
@@ -210,6 +281,64 @@ fn compute_excludes(cfg: &FluxConfig) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BASE: Duration = Duration::from_millis(500);
+    const MAX: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn first_failure_waits_the_base_delay() {
+        assert_eq!(
+            next_failure_backoff(None, Duration::from_millis(10), BASE, MAX),
+            BASE
+        );
+    }
+
+    #[test]
+    fn repeated_fast_failures_double_up_to_the_ceiling() {
+        let mut d = next_failure_backoff(None, Duration::ZERO, BASE, MAX);
+        assert_eq!(d, Duration::from_millis(500));
+        d = next_failure_backoff(Some(d), Duration::ZERO, BASE, MAX);
+        assert_eq!(d, Duration::from_secs(1));
+        d = next_failure_backoff(Some(d), Duration::ZERO, BASE, MAX);
+        assert_eq!(d, Duration::from_secs(2));
+        d = next_failure_backoff(Some(d), Duration::ZERO, BASE, MAX);
+        assert_eq!(d, Duration::from_secs(4));
+        // Ceiling holds.
+        d = next_failure_backoff(Some(d), Duration::ZERO, BASE, MAX);
+        assert_eq!(d, MAX);
+        d = next_failure_backoff(Some(d), Duration::ZERO, BASE, MAX);
+        assert_eq!(d, MAX);
+    }
+
+    #[test]
+    fn a_long_lived_run_resets_the_backoff() {
+        // An isolated flap after a healthy session must not inherit the
+        // maximum delay accumulated hours earlier.
+        let long_enough = MAX * BACKOFF_RESET_FACTOR;
+        assert_eq!(
+            next_failure_backoff(Some(MAX), long_enough, BASE, MAX),
+            BASE
+        );
+        // Just under the threshold still counts as the same incident.
+        assert_eq!(
+            next_failure_backoff(
+                Some(BASE),
+                long_enough - Duration::from_millis(1),
+                BASE,
+                MAX
+            ),
+            BASE * 2
+        );
+    }
+
+    #[test]
+    fn backoff_never_exceeds_max_even_when_base_is_larger() {
+        // Misconfiguration (base > max) must not produce a delay beyond
+        // the operator's stated ceiling.
+        let base = Duration::from_secs(30);
+        let max = Duration::from_secs(5);
+        assert_eq!(next_failure_backoff(None, Duration::ZERO, base, max), max);
+    }
 
     #[test]
     fn compute_excludes_includes_output_dev_path() {

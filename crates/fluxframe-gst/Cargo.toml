@@ -19,5 +19,33 @@ parking_lot = { workspace = true }
 libc = { workspace = true }
 v4l = { workspace = true }
 
-[lints]
-workspace = true
+# NOT `[lints] workspace = true`.
+#
+# The workspace sets `unsafe_code = "forbid"`, and `forbid` cannot be
+# relaxed per-module — that is the whole point of choosing it over
+# `deny` (see the comment in the root Cargo.toml). This crate needs two
+# raw V4L2 ioctls (`VIDIOC_SUBSCRIBE_EVENT` / `VIDIOC_DQEVENT`) that no
+# safe wrapper in the ecosystem exposes: `v4l` 0.14 has no event API at
+# all, and every ioctl helper crate hands back an `unsafe fn`.
+#
+# So the exemption is scoped to this crate — the one that already owns
+# the V4L2 boundary — while the other four keep `forbid`. `unsafe` here
+# is expected to stay confined to `v4l2_events`; anything else needing
+# it should be questioned in review.
+#
+# The clippy block below is a verbatim copy of the workspace one.
+# Inheriting lints is all-or-nothing, so opting out of the rust lints
+# would silently drop `pedantic` too. Keep the two in sync.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"

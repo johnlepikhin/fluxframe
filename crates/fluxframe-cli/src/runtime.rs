@@ -11,7 +11,7 @@
 //! itself only juggles `std::sync` primitives.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,7 @@ use fluxframe_effects::EffectChain;
 use fluxframe_gst::input::{InputParams, InputPipeline};
 use fluxframe_gst::output::{OutputParams, OutputPipeline, OutputSink};
 use fluxframe_gst::{BusEvent, BusListener, BusSource, LatestFrameSlot, WatchedPipeline};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::control::{
     self, Command as ControlCommand, ListenerHandle, Response as ControlResponse,
@@ -1132,6 +1132,75 @@ fn tokens_registry() -> &'static Mutex<Vec<Weak<RunToken>>> {
     REGISTERED_TOKENS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+// ---------------------------------------------------------------------------
+// Loopback visibility tracking
+// ---------------------------------------------------------------------------
+//
+// How long `/dev/video10` had no producer holding it open. With
+// `exclusive_caps=1` the node only advertises CAPTURE capabilities while
+// a producer is attached, so this window is exactly the time a client
+// enumerating devices does not see the camera at all — the operator-
+// visible symptom behind "the app can't find FluxFrame, restart it".
+//
+// It is deliberately process-global rather than part of `RuntimeMetrics`:
+// the window lives *between* runs, and a per-run metrics bundle is
+// created after the output is already back up. A storm of 164 restarts
+// would have reset a per-run counter 164 times and reported zero.
+
+/// Wall-clock ms accumulated across every completed invisible window.
+static OUTPUT_INVISIBLE_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Number of times the output pipeline was (re)built from scratch.
+static OUTPUT_REBUILDS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Monotonic ms since process start marking when the output went down,
+/// or `0` when the output is currently live. Stored as a scalar rather
+/// than an `Instant` so it can live in a plain atomic.
+static OUTPUT_DOWN_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Process start, the epoch for [`OUTPUT_DOWN_SINCE_MS`].
+fn process_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+fn elapsed_ms_since_epoch() -> u64 {
+    u64::try_from(process_epoch().elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Record that the loopback output is live and advertising CAPTURE caps.
+/// Closes any open invisible window and logs its duration.
+pub(crate) fn mark_output_live() {
+    OUTPUT_REBUILDS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let since = OUTPUT_DOWN_SINCE_MS.swap(0, Ordering::Relaxed);
+    if since == 0 {
+        // First start of the process — there was no preceding window.
+        return;
+    }
+    let down_ms = elapsed_ms_since_epoch().saturating_sub(since);
+    OUTPUT_INVISIBLE_MS_TOTAL.fetch_add(down_ms, Ordering::Relaxed);
+    info!(
+        down_ms,
+        invisible_ms_total = OUTPUT_INVISIBLE_MS_TOTAL.load(Ordering::Relaxed),
+        rebuilds_total = OUTPUT_REBUILDS_TOTAL.load(Ordering::Relaxed),
+        "loopback output back up — clients can enumerate the camera again"
+    );
+}
+
+/// Record that the loopback output has been torn down, starting an
+/// invisible window. `reason` is the error (or `None` for a clean exit)
+/// that ended the run.
+pub(crate) fn mark_output_down(reason: Option<&FluxError>) {
+    // Keep the earliest down-edge if this is called twice without an
+    // intervening `mark_output_live` — the window is "since the output
+    // last worked", not "since the last teardown".
+    let now = elapsed_ms_since_epoch().max(1);
+    let _ = OUTPUT_DOWN_SINCE_MS.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+    if let Some(e) = reason {
+        warn!(error = %e, "loopback output torn down — camera unavailable to clients");
+    } else {
+        info!("loopback output torn down (clean exit)");
+    }
+}
+
 /// Returns `true` if Ctrl-C has been received since process start.
 #[must_use]
 pub(crate) fn is_shutdown_requested() -> bool {
@@ -1496,6 +1565,9 @@ where
     );
 
     output.start()?;
+    // From here the node advertises CAPTURE caps again; close any
+    // invisible window opened by the previous run's teardown.
+    mark_output_live();
 
     // Stage 16: acquire the input AFTER the output is live. On the
     // supervised path a busy/absent camera streams the placeholder and
@@ -1515,13 +1587,17 @@ where
 
     // Bus listener relays GStreamer fatal errors and EOS into the shared
     // shutdown flag, and surfaces any captured error back to the caller.
+    // Input-side failures are split off into `input_failure` so they can
+    // be recovered in place instead of taking the loopback down.
     let bus_error: Arc<Mutex<Option<FluxError>>> = Arc::new(Mutex::new(None));
+    let input_failure = Arc::new(InputFailureSignal::new(supervised_acquire(cfg)));
     let _bus_listener = build_bus_listener(
         &input,
         &output,
         Arc::clone(&running),
         Arc::clone(&bus_error),
         slot.clone(),
+        Arc::clone(&input_failure),
     );
 
     // `metrics` was constructed above (before `prepare_all`) so the
@@ -1543,22 +1619,26 @@ where
     // Stage 15 idle runtime: detector spawn + state machine + cached
     // placeholder. Returns `None` (Stage 14 fallthrough) when idle
     // mode is disabled, the sink is non-V4L2, or the host is non-Linux.
-    let idle_runtime = build_idle_runtime(cfg, &input, &running, &metrics.counters);
+    let mut idle_runtime = build_idle_runtime(cfg, &input, &output, &running, &metrics.counters);
 
-    let process_result = run_process_loop(
+    let process_result = run_supervised_loop(
         WorkerDeps {
             cfg,
             config_path,
             initial_preset_name: preset_name,
             processing_ctx: &processing_ctx,
             metrics: &metrics,
+            control_rx: control_rx.as_ref(),
         },
         &running,
         &slot,
         &mut chain,
         &output,
-        control_rx.as_ref(),
-        idle_runtime,
+        &mut idle_runtime,
+        SupervisedInput {
+            pipeline: &input,
+            failure: &input_failure,
+        },
     );
 
     drop(control_handle);
@@ -1743,7 +1823,21 @@ where
             cfg.input.format,
         );
         // build + start in one shot; both can surface a busy device.
-        let attempt = input_builder(params).and_then(|input| input.start().map(|()| input));
+        //
+        // On a failed `start` the pipeline has usually reached Ready or
+        // Paused, which means `v4l2src` already holds a device fd and
+        // its streaming threads exist. `InputPipeline` has no `Drop`, so
+        // simply dropping it here would leak both. That was survivable
+        // when this ran once at startup; the supervised path retries in
+        // a loop, so a camera missing for minutes would leak one
+        // pipeline per attempt.
+        let attempt = input_builder(params).and_then(|input| match input.start() {
+            Ok(()) => Ok(input),
+            Err(e) => {
+                let _ = input.set_state_null();
+                Err(e)
+            }
+        });
         match attempt {
             Ok(input) => return Ok(Some(input)),
             Err(e) => {
@@ -1838,6 +1932,7 @@ fn build_bus_listener(
     running: Arc<AtomicBool>,
     bus_error: Arc<Mutex<Option<FluxError>>>,
     slot: LatestFrameSlot,
+    input_failure: Arc<InputFailureSignal>,
 ) -> BusListener {
     let pipelines = vec![
         WatchedPipeline {
@@ -1850,8 +1945,277 @@ fn build_bus_listener(
         },
     ];
     BusListener::spawn(pipelines, move |event| {
-        on_bus_event(&event, &running, &bus_error, &slot);
+        on_bus_event(&event, &running, &bus_error, &slot, &input_failure);
     })
+}
+
+/// Upper bound on how long we keep trying to recover the camera in
+/// place before giving up and letting the run restart.
+///
+/// Escalation is not a defeat, it is the second half of the strategy:
+/// `InputPipeline::reacquire` reopens *the same* device node, so a
+/// camera that came back on a different `/dev/videoN` (very common after
+/// a physical replug) can only be found by the auto-input loop
+/// re-enumerating. Retrying in place forever would turn that case into a
+/// permanent hang — the exact self-healing behaviour this path must not
+/// regress.
+///
+/// It also bounds how long control-socket commands go unanswered: the
+/// recovery runs on the worker thread, so nothing drains the command
+/// channel until it finishes one way or the other.
+const INPUT_RECOVERY_BUDGET: Duration = Duration::from_secs(60);
+
+/// What [`run_supervised_loop`] should do after the worker loop returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopAction {
+    /// Recover the camera in place; the output pipeline stays up.
+    ReacquireInput,
+    /// Hand control back to the caller (and thus to the auto-input
+    /// loop, which rebuilds everything and re-selects the device).
+    TeardownAll,
+    /// Normal shutdown — Ctrl-C or a clean end of stream.
+    Exit,
+}
+
+/// Decide what to do after the worker loop returned.
+///
+/// Pure so the matrix can be tested without GStreamer: building an
+/// `OutputPipeline` needs a live `/dev/video10`, which no unit test has.
+fn next_action(running: bool, input_failed: bool, worker_failed: bool) -> LoopAction {
+    if worker_failed {
+        // A chain/output error is not something reacquiring the camera
+        // can fix.
+        return LoopAction::TeardownAll;
+    }
+    if !running {
+        return LoopAction::Exit;
+    }
+    if input_failed {
+        LoopAction::ReacquireInput
+    } else {
+        LoopAction::Exit
+    }
+}
+
+/// Run the worker loop, recovering from input-side failures in place.
+///
+/// The loopback output, the effect chain, the control socket, the
+/// metrics reporter and the consumer detector are all created by the
+/// caller and deliberately live *outside* this loop: recreating the
+/// detector on every camera hiccup would reset its verdict to `Unknown`
+/// (read as "consumer present"), so idle would stop engaging until the
+/// consumer next reconnected.
+fn run_supervised_loop(
+    deps: WorkerDeps<'_>,
+    running: &AtomicBool,
+    slot: &LatestFrameSlot,
+    chain: &mut EffectChain,
+    output: &OutputPipeline,
+    idle: &mut Option<IdleRuntime>,
+    input: SupervisedInput<'_>,
+) -> Result<(), FluxError> {
+    loop {
+        let watch = InputFailureWatch {
+            signal: input.failure,
+            entry_generation: input.failure.generation(),
+        };
+        let worker_result = run_process_loop(
+            WorkerDeps { ..deps },
+            running,
+            slot,
+            chain,
+            output,
+            idle.as_mut(),
+            watch,
+        );
+        let worker_failed = worker_result.is_err();
+        let action = next_action(
+            running.load(Ordering::Acquire),
+            watch.tripped(),
+            worker_failed,
+        );
+        match action {
+            LoopAction::Exit | LoopAction::TeardownAll => return worker_result,
+            LoopAction::ReacquireInput => {
+                recover_input(
+                    deps.cfg,
+                    input.pipeline,
+                    output,
+                    idle.as_mut(),
+                    deps.metrics,
+                    slot,
+                )?;
+            }
+        }
+    }
+}
+
+/// Bring the camera back without touching the output pipeline.
+///
+/// Uses `InputPipeline::reacquire` — the same object, so the worker's
+/// frame slot and the bus watch stay valid. Building a fresh
+/// `InputPipeline` here would create a new slot and a new bus that
+/// nothing is subscribed to, orphaning both.
+///
+/// Returns `Err` once [`INPUT_RECOVERY_BUDGET`] is spent, so the caller
+/// escalates to a full restart and the auto-input loop can re-select the
+/// device.
+fn recover_input(
+    cfg: &FluxConfig,
+    input: &Arc<InputPipeline>,
+    output: &OutputPipeline,
+    idle: Option<&mut IdleRuntime>,
+    metrics: &RuntimeMetrics,
+    slot: &LatestFrameSlot,
+) -> Result<(), FluxError> {
+    let started = Instant::now();
+
+    // Snapshot what the retry loop needs from the idle runtime, so the
+    // `&mut` borrow ends here rather than spanning the whole loop.
+    let placeholder = idle.as_ref().map(|rt| {
+        (
+            Arc::clone(&rt.placeholder),
+            rt.output_w,
+            rt.output_h,
+            rt.output_format,
+        )
+    });
+
+    if let Some(rt) = idle {
+        // Join any in-flight idle-resume reload before touching the
+        // pipeline: both paths drive `set_state(Null/Playing)` on the
+        // same `gst::Pipeline`, and racing those transitions wedges the
+        // input. This is why recovery has a single owner.
+        if let Some(handle) = rt.reload_handle.take() {
+            debug!("joining an in-flight reload before recovering the input");
+            let _ = handle.join();
+        }
+        // The engine itself is fine, but no frames are coming; make sure
+        // no tick observes "active and ready" while the input is down.
+        rt.engine_ready.store(false, Ordering::Release);
+    }
+
+    // Publish a placeholder before anything else. Until we do, the
+    // output writer thread keeps re-pushing the last composite it saw,
+    // so the consumer stares at a frozen frame that looks exactly like a
+    // working camera.
+    let push_fill = |metrics: &RuntimeMetrics| {
+        if let Some((ph, w, h, fmt)) = placeholder.as_ref() {
+            if let Err(e) = push_placeholder(ph.as_ref(), *w, *h, *fmt, output, metrics) {
+                warn!(error = %e, "placeholder push failed during input recovery");
+            }
+        }
+    };
+    push_fill(metrics);
+
+    if let Err(e) = input.set_state_null() {
+        warn!(error = %e, "set_state_null failed while recovering the input");
+    }
+    // Drop whatever the dying device published last — a torn or
+    // half-written frame would otherwise be the first thing the
+    // consumer sees after recovery.
+    slot.clear();
+
+    let base = Duration::from_millis(u64::from(cfg.input.acquire_backoff_base_ms));
+    let max = Duration::from_millis(u64::from(cfg.input.acquire_backoff_max_ms));
+    let mut backoff = base;
+    let mut attempt: u32 = 0;
+
+    loop {
+        if is_shutdown_requested() {
+            return Ok(());
+        }
+        attempt += 1;
+        metrics.counters.inc_input_reacquire();
+        match input.reacquire() {
+            Ok(()) => {
+                let down = started.elapsed();
+                metrics
+                    .counters
+                    .add_input_down_ms(u64::try_from(down.as_millis()).unwrap_or(u64::MAX));
+                // Clear again: `reacquire` may have let a first frame
+                // land while we were still deciding.
+                slot.clear();
+                info!(
+                    attempt,
+                    down_ms = down.as_millis() as u64,
+                    "camera reacquired — output was never interrupted"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                metrics.counters.inc_input_reacquire_failures();
+                if started.elapsed() >= INPUT_RECOVERY_BUDGET {
+                    warn!(
+                        attempt,
+                        elapsed_secs = started.elapsed().as_secs(),
+                        error = %e,
+                        "in-place camera recovery budget exhausted — restarting the run \
+                         so the device can be re-selected"
+                    );
+                    return Err(FluxError::from(e));
+                }
+                debug!(attempt, error = %e, "reacquire failed; will retry");
+                // Keep the loopback's ring buffer fresh while we retry:
+                // consumers that filter on capabilities drop a node that
+                // stops producing.
+                push_fill(metrics);
+                if wait_for_shutdown(backoff) {
+                    return Ok(());
+                }
+                backoff = (backoff * 2).min(max);
+            }
+        }
+    }
+}
+
+/// Shared "the input died" signal between the bus listener and the
+/// worker loop.
+///
+/// A generation counter rather than a flag. The GStreamer bus is drained
+/// on a timer, so losing a camera delivers a burst of messages: with a
+/// boolean, clearing it after handling the first would immediately be
+/// re-raised by the rest of the burst (an endless reacquire loop), while
+/// clearing it before draining would swallow a genuinely new failure
+/// that arrived during recovery. Comparing generations makes "has
+/// anything failed since I started recovering?" exactly answerable.
+///
+/// `enabled` is false when the run has no supervised recovery path
+/// (`idle.enabled = false`, or a sink with no placeholder). There an
+/// input failure must stay fatal: with no placeholder to publish, the
+/// writer thread would keep re-pushing the last live frame and the
+/// consumer would see a frozen picture indistinguishable from a working
+/// camera.
+#[derive(Debug)]
+pub(crate) struct InputFailureSignal {
+    generation: AtomicU64,
+    enabled: bool,
+}
+
+impl InputFailureSignal {
+    fn new(enabled: bool) -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            enabled,
+        }
+    }
+
+    /// Does this signal take responsibility for failures from `source`?
+    fn handles(&self, source: BusSource) -> bool {
+        self.enabled && source == BusSource::Input
+    }
+
+    /// Record an input failure.
+    fn raise(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Current generation. Snapshot it before recovering, and compare
+    /// afterwards to tell "the failure I already handled" from "another
+    /// one happened while I was recovering".
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
 }
 
 /// Translate a [`BusEvent`] into supervisor side-effects.  Extracted so
@@ -1866,6 +2230,7 @@ fn on_bus_event(
     running: &AtomicBool,
     bus_error: &Mutex<Option<FluxError>>,
     slot: &LatestFrameSlot,
+    input_failure: &InputFailureSignal,
 ) {
     match event {
         BusEvent::FatalError {
@@ -1874,6 +2239,32 @@ fn on_bus_event(
             debug: debug_payload,
             source,
         } => {
+            // An input-side fatal error is recoverable in place when the
+            // supervised path is active: the camera is gone, but the
+            // loopback output is not, and tearing it down is what makes
+            // clients lose the virtual camera entirely. Route it to the
+            // reacquire path instead of killing the run.
+            if input_failure.handles(*source) {
+                warn!(
+                    ?source,
+                    %element,
+                    %message,
+                    debug = ?debug_payload,
+                    action = "reacquire",
+                    "input pipeline failed — recovering without tearing the output down",
+                );
+                input_failure.raise();
+                // Deliberately NOT `slot.close()`: `LatestFrameSlot` has
+                // no reopen, so closing it here would make every frame
+                // after a successful reacquire a silent no-op. The worker
+                // wakes on its own poll timeout anyway.
+                //
+                // Deliberately NOT recorded in `bus_error` either: that
+                // latch is returned at end-of-run, so a recovered failure
+                // would still surface as the run's error and could mask a
+                // later, real one.
+                return;
+            }
             error!(
                 ?source,
                 %element,
@@ -1905,6 +2296,15 @@ fn on_bus_event(
             );
         }
         BusEvent::Eos { source } => {
+            // `v4l2src` reports a hot-unplug as EOS at least as often as
+            // it reports an error, so this needs the same treatment —
+            // otherwise the most common way to lose the camera still
+            // takes the loopback down with it.
+            if input_failure.handles(*source) {
+                warn!(?source, action = "reacquire", "input pipeline reached EOS");
+                input_failure.raise();
+                return;
+            }
             info!(?source, "pipeline EOS");
             running.store(false, Ordering::Release);
             slot.close();
@@ -2045,6 +2445,7 @@ fn process_one_frame(
     output: &OutputPipeline,
     metrics: &RuntimeMetrics,
     slot: &LatestFrameSlot,
+    no_consumer: bool,
 ) -> Result<(), FluxError> {
     let recv_at = Instant::now();
     metrics.counters.inc_frames_in();
@@ -2084,11 +2485,28 @@ fn process_one_frame(
     metrics.output.record_duration(pre_push.elapsed());
     metrics.end_to_end.record_duration(recv_at.elapsed());
     metrics.counters.inc_frames_out();
+    if no_consumer {
+        metrics.counters.inc_frames_out_while_no_consumer();
+    }
 
     if state.frames_seen % DROPPED_SYNC_INTERVAL == 0 {
         metrics.sync_dropped(slot.dropped_count());
     }
     Ok(())
+}
+
+/// Does the consumer detector currently say nobody is reading the
+/// loopback?
+///
+/// A `None` idle runtime (idle disabled, or a sink with no detector)
+/// means there is no presence signal at all, so frames are never
+/// attributed as wasted — an absent signal is not evidence of an absent
+/// consumer.
+fn no_consumer_attached(idle: Option<&IdleRuntime>) -> bool {
+    idle.is_some_and(|rt| {
+        crate::idle::ConsumerStatus::from_u8(rt.consumer_status.load(Ordering::Acquire))
+            == crate::idle::ConsumerStatus::Absent
+    })
 }
 
 /// Push a pre-rendered placeholder frame to the output, bypassing
@@ -2163,6 +2581,7 @@ struct IdleRuntime {
 fn build_idle_runtime(
     cfg: &FluxConfig,
     input: &Arc<InputPipeline>,
+    output: &OutputPipeline,
     running: &Arc<AtomicBool>,
     counters: &Arc<fluxframe_core::Counters>,
 ) -> Option<IdleRuntime> {
@@ -2202,13 +2621,44 @@ fn build_idle_runtime(
                 }
             };
 
+        // Ask the loopback for a capture-usage subscription. `None`
+        // means this sink owns no device fd (only the direct-write path
+        // does); `Err` means the driver predates the event. Neither is
+        // fatal — the detector decides what to do based on
+        // `presence_source`, and only `kernel_event` insists on it.
+        let watch = match output.subscribe_consumer_events() {
+            Some(Ok(watch)) => Some(watch),
+            Some(Err(e)) => {
+                warn!(
+                    error = %e,
+                    "could not subscribe to loopback client-usage events \
+                     (v4l2loopback older than 0.13?)"
+                );
+                None
+            }
+            None => None,
+        };
+
         let detector_running = Arc::clone(running);
         let detector = crate::idle::ConsumerDetector::spawn(
-            device_path,
-            my_pid,
-            std::time::Duration::from_millis(u64::from(cfg.idle.poll_interval_ms)),
+            crate::idle::DetectorParams {
+                device_path,
+                my_pid,
+                poll_interval: std::time::Duration::from_millis(u64::from(
+                    cfg.idle.poll_interval_ms,
+                )),
+                mode: cfg.idle.presence_source,
+                // Never decay a balance-backed verdict faster than the
+                // grace period the operator chose for entering idle:
+                // below that, the decay would race the very hysteresis
+                // it sits behind.
+                stale_balance_after: std::time::Duration::from_secs(u64::from(
+                    cfg.idle.teardown_secs.max(1),
+                )),
+            },
             detector_running,
             Arc::clone(counters),
+            watch,
         );
         // The detector handle moves into the runtime so its Drop
         // runs when the worker loop exits.
@@ -2375,6 +2825,7 @@ fn tick_idle(
     slot: &LatestFrameSlot,
     output: &OutputPipeline,
     metrics: &RuntimeMetrics,
+    input_failure: &InputFailureSignal,
 ) -> Result<IdleTickAction, FluxError> {
     let Some(idle_rt) = idle else {
         return Ok(IdleTickAction::ProcessFrame);
@@ -2405,6 +2856,24 @@ fn tick_idle(
             }
             ResumeOutcome::InputFailed(e) => {
                 metrics.counters.inc_resume_failures();
+                if input_failure.handles(fluxframe_gst::BusSource::Input) {
+                    // Hand this to the supervised recovery path instead
+                    // of unwinding the run. This is the single most
+                    // common way the camera is lost in practice — the
+                    // consumer reconnects, we resume, and the device is
+                    // not back yet — and unwinding here tore the
+                    // loopback down every time, which is precisely what
+                    // made clients lose the virtual camera.
+                    warn!(
+                        target: "fluxframe::idle",
+                        error = %e,
+                        action = "reacquire",
+                        "reload: camera reacquire failed — recovering without \
+                         tearing the output down"
+                    );
+                    input_failure.raise();
+                    return Ok(IdleTickAction::Continue);
+                }
                 warn!(
                     target: "fluxframe::idle",
                     error = %e,
@@ -2476,6 +2945,36 @@ struct WorkerDeps<'a> {
     initial_preset_name: &'a str,
     processing_ctx: &'a ProcessingContext,
     metrics: &'a RuntimeMetrics,
+    /// Control-socket receiver, or `None` when the socket is disabled.
+    control_rx: Option<&'a crossbeam_channel::Receiver<ControlEnvelope>>,
+}
+
+/// The input-failure signal paired with the generation observed when
+/// the worker loop was entered.
+///
+/// Carrying the two together makes the only meaningful question —
+/// "has the input failed *since I started*?" — a method rather than a
+/// comparison the caller could get subtly wrong.
+#[derive(Clone, Copy)]
+struct InputFailureWatch<'a> {
+    signal: &'a InputFailureSignal,
+    entry_generation: u64,
+}
+
+/// The input side of a supervised run: the pipeline to recover and the
+/// signal that says when it needs recovering. Paired because neither is
+/// useful to the supervisor without the other.
+#[derive(Clone, Copy)]
+struct SupervisedInput<'a> {
+    pipeline: &'a Arc<InputPipeline>,
+    failure: &'a InputFailureSignal,
+}
+
+impl InputFailureWatch<'_> {
+    /// Has a new input failure been raised since this watch was taken?
+    fn tripped(&self) -> bool {
+        self.signal.generation() != self.entry_generation
+    }
 }
 
 fn run_process_loop(
@@ -2484,14 +2983,19 @@ fn run_process_loop(
     slot: &LatestFrameSlot,
     chain: &mut EffectChain,
     output: &OutputPipeline,
-    control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
-    mut idle: Option<IdleRuntime>,
+    mut idle: Option<&mut IdleRuntime>,
+    input_failure: InputFailureWatch<'_>,
 ) -> Result<(), FluxError> {
     let mut state = WorkerState::new(deps.cfg, deps.initial_preset_name, deps.metrics);
-    while running.load(Ordering::Acquire) {
+    // Leaving on a *new* input failure hands control to the supervisor,
+    // which recovers the camera and calls back in. Without this the loop
+    // would spin against a dead input: `tick_idle` still reports Active
+    // while a consumer is attached, so every iteration would fall
+    // through to a `recv_timeout` that can never succeed.
+    while running.load(Ordering::Acquire) && !input_failure.tripped() {
         drain_control_commands(
             &mut state,
-            control_rx,
+            deps.control_rx,
             deps.config_path,
             deps.processing_ctx,
             chain,
@@ -2501,7 +3005,14 @@ fn run_process_loop(
         // any side-effect edge, choose between Active level (pull a
         // real frame + run chain) and Placeholder level (push the
         // cached fill).
-        match tick_idle(idle.as_mut(), &state, slot, output, deps.metrics)? {
+        match tick_idle(
+            idle.as_deref_mut(),
+            &state,
+            slot,
+            output,
+            deps.metrics,
+            input_failure.signal,
+        )? {
             IdleTickAction::Continue => continue,
             IdleTickAction::ProcessFrame => {}
         }
@@ -2511,7 +3022,15 @@ fn run_process_loop(
             // closed by shutdown.  Re-check the flag and continue.
             continue;
         };
-        process_one_frame(&mut state, frame, chain, output, deps.metrics, slot)?;
+        process_one_frame(
+            &mut state,
+            frame,
+            chain,
+            output,
+            deps.metrics,
+            slot,
+            no_consumer_attached(idle.as_deref()),
+        )?;
     }
     // Reap any in-flight reload thread so it doesn't outlive the
     // supervisor. Surface the wall-clock cost so a reload that was
@@ -2591,6 +3110,143 @@ mod tests {
         // Default Test configuration: start from `FluxConfig::default()`.
         // The fields tweaked here are the ones exercised by each test.
         FluxConfig::default()
+    }
+
+    // --- bus-event routing -------------------------------------------
+
+    fn fatal(source: BusSource) -> BusEvent {
+        BusEvent::FatalError {
+            source,
+            element: "input_src".into(),
+            message: "Device '/dev/video0' is busy".into(),
+            debug: None,
+        }
+    }
+
+    /// Run one bus event against fresh state and report what it did.
+    fn route(event: &BusEvent, supervised: bool) -> (bool, bool, u64, bool) {
+        let running = AtomicBool::new(true);
+        let bus_error = Mutex::new(None);
+        let slot = LatestFrameSlot::new();
+        let signal = InputFailureSignal::new(supervised);
+        on_bus_event(event, &running, &bus_error, &slot, &signal);
+        (
+            running.load(Ordering::Acquire),
+            slot.is_closed(),
+            signal.generation(),
+            bus_error.lock().expect("poisoned").is_some(),
+        )
+    }
+
+    #[test]
+    fn supervised_input_fatal_is_recovered_not_fatal() {
+        let (running, closed, generation, latched) = route(&fatal(BusSource::Input), true);
+        assert!(running, "an input failure must not stop the run");
+        // The load-bearing assertion: `LatestFrameSlot` has no reopen, so
+        // closing it here would silently discard every frame produced
+        // after a successful recovery.
+        assert!(!closed, "the frame slot must stay open across recovery");
+        assert_eq!(generation, 1, "the supervisor must be told to recover");
+        assert!(
+            !latched,
+            "a recovered failure must not be returned as the run's error"
+        );
+    }
+
+    #[test]
+    fn output_fatal_is_always_fatal() {
+        // Nothing about reacquiring the camera can fix the sink.
+        let (running, closed, generation, latched) = route(&fatal(BusSource::Output), true);
+        assert!(!running);
+        assert!(closed);
+        assert_eq!(generation, 0);
+        assert!(latched);
+    }
+
+    #[test]
+    fn unsupervised_input_fatal_stays_fatal() {
+        // Without a placeholder the writer thread would keep re-pushing
+        // the last live frame, so the consumer would see a frozen image
+        // instead of any indication that the camera is gone.
+        let (running, closed, generation, latched) = route(&fatal(BusSource::Input), false);
+        assert!(!running);
+        assert!(closed);
+        assert_eq!(generation, 0);
+        assert!(latched);
+    }
+
+    #[test]
+    fn supervised_input_eos_is_recovered() {
+        // `v4l2src` reports a hot-unplug as EOS at least as often as it
+        // reports an error.
+        let (running, closed, generation, _) = route(
+            &BusEvent::Eos {
+                source: BusSource::Input,
+            },
+            true,
+        );
+        assert!(running);
+        assert!(!closed);
+        assert_eq!(generation, 1);
+    }
+
+    #[test]
+    fn output_eos_still_ends_the_run() {
+        let (running, closed, generation, _) = route(
+            &BusEvent::Eos {
+                source: BusSource::Output,
+            },
+            true,
+        );
+        assert!(!running);
+        assert!(closed);
+        assert_eq!(generation, 0);
+    }
+
+    #[test]
+    fn warnings_have_no_side_effects() {
+        let (running, closed, generation, latched) = route(
+            &BusEvent::Warning {
+                source: BusSource::Input,
+                element: "input_src".into(),
+                message: "something odd".into(),
+                debug: None,
+            },
+            true,
+        );
+        assert!(running);
+        assert!(!closed);
+        assert_eq!(generation, 0);
+        assert!(!latched);
+    }
+
+    #[test]
+    fn a_burst_of_failures_raises_distinct_generations() {
+        // The bus is drained on a timer, so losing a camera delivers
+        // several messages. A boolean flag could not distinguish "the
+        // failure I am already recovering from" from "another one just
+        // happened", which is why this is a counter.
+        let signal = InputFailureSignal::new(true);
+        assert_eq!(signal.generation(), 0);
+        signal.raise();
+        signal.raise();
+        assert_eq!(signal.generation(), 2);
+    }
+
+    // --- supervisor decision matrix ----------------------------------
+
+    #[test]
+    fn next_action_recovers_only_a_live_run_with_a_failed_input() {
+        assert_eq!(next_action(true, true, false), LoopAction::ReacquireInput);
+        // Clean exit of the worker loop.
+        assert_eq!(next_action(true, false, false), LoopAction::Exit);
+        // Ctrl-C.
+        assert_eq!(next_action(false, false, false), LoopAction::Exit);
+        // Shutdown wins over a concurrent input failure.
+        assert_eq!(next_action(false, true, false), LoopAction::Exit);
+        // A chain/output error is not recoverable by reacquiring.
+        assert_eq!(next_action(true, true, true), LoopAction::TeardownAll);
+        assert_eq!(next_action(true, false, true), LoopAction::TeardownAll);
     }
 
     // --- reap_reload -------------------------------------------------

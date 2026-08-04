@@ -19,6 +19,7 @@ pub mod slot;
 pub mod util;
 pub mod v4l2;
 pub mod v4l2_caps;
+pub mod v4l2_events;
 
 pub use bus::{BusEvent, BusListener, BusSource, WatchedPipeline, translate_fatal};
 pub use slot::LatestFrameSlot;

@@ -92,6 +92,48 @@ pub struct Counters {
     // confirm the deliberate low thread cap took effect and spot
     // oversubscription against `inference_p95`.
     processing_threads: AtomicU64,
+    // Consumer-presence observability. The detector's verdict used to be
+    // invisible in steady state — a status latched to `Present` for a
+    // whole run looked exactly like a genuinely busy camera, which is how
+    // a permanently-stuck idle detector went unnoticed. These make the
+    // verdict, its provenance and its liveness all readable from one
+    // metrics line.
+    //
+    // `consumer_status` mirrors `ConsumerStatus` (0 = Absent, 1 = Present,
+    // 2 = Unknown) and `consumer_clients` is the absolute count of capture
+    // clients when the source can supply one (0 otherwise). Both are
+    // gauges. `consumer_source` records which detection path is live —
+    // see `set_consumer_source` for the encoding — so a silent
+    // degradation to the fallback path cannot masquerade as a healthy fix.
+    // `consumer_transitions_total` is the liveness signal: a flat counter
+    // with a non-zero uptime means the detector stopped observing.
+    consumer_status: AtomicU64,
+    consumer_clients: AtomicU64,
+    consumer_source: AtomicU64,
+    consumer_transitions_total: AtomicU64,
+    // Frames composited and published while the detector reported
+    // `Absent`. Every one of those ran ML segmentation and the effect
+    // chain for nobody.
+    //
+    // Scope note: this catches the state machine failing to act on an
+    // `Absent` verdict, not a detector that never produces one. A
+    // detector latched to `Present` keeps this at zero — the signal for
+    // that failure is a flat `consumer_transitions_total` across a long
+    // uptime. Steady-state expectation is a small non-zero value (the
+    // `idle.teardown_secs` grace window) that stops growing.
+    frames_out_while_no_consumer_total: AtomicU64,
+    // Mid-run input recovery. `input_reacquire_total` counts attempts to
+    // re-open the camera without tearing the loopback down;
+    // `input_reacquire_failures_total` those that failed. `input_down_ms_total`
+    // accumulates wall time with no valid input inside a run.
+    //
+    // Note this is deliberately NOT the same quantity as "time the
+    // loopback advertised no CAPTURE caps": that window lives *between*
+    // runs, outlives any per-run metrics bundle, and is tracked
+    // separately by the auto-input supervisor.
+    input_reacquire_total: AtomicU64,
+    input_reacquire_failures_total: AtomicU64,
+    input_down_ms_total: AtomicU64,
 }
 
 impl Counters {
@@ -114,6 +156,14 @@ impl Counters {
             resume_failures_total: AtomicU64::new(0),
             unattributable_wakes_total: AtomicU64::new(0),
             processing_threads: AtomicU64::new(0),
+            consumer_status: AtomicU64::new(0),
+            consumer_clients: AtomicU64::new(0),
+            consumer_source: AtomicU64::new(0),
+            consumer_transitions_total: AtomicU64::new(0),
+            frames_out_while_no_consumer_total: AtomicU64::new(0),
+            input_reacquire_total: AtomicU64::new(0),
+            input_reacquire_failures_total: AtomicU64::new(0),
+            input_down_ms_total: AtomicU64::new(0),
         }
     }
 
@@ -242,6 +292,74 @@ impl Counters {
         self.processing_threads.store(threads, Ordering::Relaxed);
     }
 
+    /// Record the consumer detector's current verdict and bump the
+    /// transition counter.
+    ///
+    /// `status` uses the detector's own encoding (0 = Absent,
+    /// 1 = Present, 2 = Unknown) so the two cannot drift apart; callers
+    /// pass the same byte they publish on the shared atomic.
+    ///
+    /// Call this only on an actual change: the transition counter is the
+    /// liveness signal, and bumping it on every poll would destroy its
+    /// meaning.
+    #[inline]
+    pub fn set_consumer_status(&self, status: u8) {
+        self.consumer_status
+            .store(u64::from(status), Ordering::Relaxed);
+        self.consumer_transitions_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the absolute number of capture clients, for detection
+    /// paths that can supply one.  A gauge; paths that only know
+    /// "someone / nobody" leave it at zero.
+    #[inline]
+    pub fn set_consumer_clients(&self, clients: u64) {
+        self.consumer_clients.store(clients, Ordering::Relaxed);
+    }
+
+    /// Record which consumer-detection path is live.
+    ///
+    /// The encoding is owned by the detector; the values in use are
+    /// `0` = kernel client-usage events, `1` = inotify + `/proc` walk,
+    /// `2` = `/proc` polling fallback.  Kept as a bare integer here so
+    /// `fluxframe-core` does not grow a dependency on the supervisor's
+    /// detector types.
+    #[inline]
+    pub fn set_consumer_source(&self, source: u64) {
+        self.consumer_source.store(source, Ordering::Relaxed);
+    }
+
+    /// Increment `frames_out_while_no_consumer_total` — one composited
+    /// frame published while the detector reported `Absent`.
+    #[inline]
+    pub fn inc_frames_out_while_no_consumer(&self) {
+        self.frames_out_while_no_consumer_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `input_reacquire_total` — one attempt to recover the
+    /// camera in-place, without tearing the loopback output down.
+    #[inline]
+    pub fn inc_input_reacquire(&self) {
+        self.input_reacquire_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `input_reacquire_failures_total`.
+    #[inline]
+    pub fn inc_input_reacquire_failures(&self) {
+        self.input_reacquire_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add a completed no-input interval, in milliseconds.
+    #[inline]
+    pub fn add_input_down_ms(&self, ms: u64) {
+        if ms != 0 {
+            self.input_down_ms_total.fetch_add(ms, Ordering::Relaxed);
+        }
+    }
+
     /// Snapshot the counter values.  Each load is independent — there
     /// is no cross-counter atomicity guarantee.
     #[must_use]
@@ -266,6 +384,18 @@ impl Counters {
             resume_failures_total: self.resume_failures_total.load(Ordering::Relaxed),
             unattributable_wakes_total: self.unattributable_wakes_total.load(Ordering::Relaxed),
             processing_threads: self.processing_threads.load(Ordering::Relaxed),
+            consumer_status: self.consumer_status.load(Ordering::Relaxed),
+            consumer_clients: self.consumer_clients.load(Ordering::Relaxed),
+            consumer_source: self.consumer_source.load(Ordering::Relaxed),
+            consumer_transitions_total: self.consumer_transitions_total.load(Ordering::Relaxed),
+            frames_out_while_no_consumer_total: self
+                .frames_out_while_no_consumer_total
+                .load(Ordering::Relaxed),
+            input_reacquire_total: self.input_reacquire_total.load(Ordering::Relaxed),
+            input_reacquire_failures_total: self
+                .input_reacquire_failures_total
+                .load(Ordering::Relaxed),
+            input_down_ms_total: self.input_down_ms_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -310,6 +440,22 @@ pub struct CounterValues {
     pub unattributable_wakes_total: u64,
     /// See [`Counters::set_processing_threads`].
     pub processing_threads: u64,
+    /// See [`Counters::set_consumer_status`].
+    pub consumer_status: u64,
+    /// See [`Counters::set_consumer_clients`].
+    pub consumer_clients: u64,
+    /// See [`Counters::set_consumer_source`].
+    pub consumer_source: u64,
+    /// See [`Counters::set_consumer_status`].
+    pub consumer_transitions_total: u64,
+    /// See [`Counters::inc_frames_out_while_no_consumer`].
+    pub frames_out_while_no_consumer_total: u64,
+    /// See [`Counters::inc_input_reacquire`].
+    pub input_reacquire_total: u64,
+    /// See [`Counters::inc_input_reacquire_failures`].
+    pub input_reacquire_failures_total: u64,
+    /// See [`Counters::add_input_down_ms`].
+    pub input_down_ms_total: u64,
 }
 
 /// Bounded ring of latency samples in microseconds.
@@ -605,6 +751,14 @@ pub fn emit_metrics_line(snap: &MetricsSnapshot, extras: Option<PeriodicExtras>)
         resume_failures_total,
         unattributable_wakes_total,
         processing_threads,
+        consumer_status,
+        consumer_clients,
+        consumer_source,
+        consumer_transitions_total,
+        frames_out_while_no_consumer_total,
+        input_reacquire_total,
+        input_reacquire_failures_total,
+        input_down_ms_total,
     } = snap.counters;
 
     let ex = extras.unwrap_or_default();
@@ -640,6 +794,14 @@ pub fn emit_metrics_line(snap: &MetricsSnapshot, extras: Option<PeriodicExtras>)
         resume_failures_total = resume_failures_total,
         unattributable_wakes_total = unattributable_wakes_total,
         processing_threads = processing_threads,
+        consumer_status = consumer_status,
+        consumer_clients = consumer_clients,
+        consumer_source = consumer_source,
+        consumer_transitions_total = consumer_transitions_total,
+        frames_out_while_no_consumer_total = frames_out_while_no_consumer_total,
+        input_reacquire_total = input_reacquire_total,
+        input_reacquire_failures_total = input_reacquire_failures_total,
+        input_down_ms_total = input_down_ms_total,
         capture_p50_us = snap.capture.percentile_us(0.5),
         capture_p95_us = snap.capture.percentile_us(0.95),
         inference_p50_us = snap.inference.percentile_us(0.5),

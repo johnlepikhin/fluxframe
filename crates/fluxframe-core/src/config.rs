@@ -45,7 +45,20 @@ pub const MAX_INFLIGHT_FRAMES: u32 = 64;
 pub const MAX_LATENCY_MS: u32 = 10_000;
 /// Default cadence of the metrics reporter (`[realtime] metrics_interval_secs`).
 /// `0` disables periodic reporting (the teardown summary still runs).
-pub const DEFAULT_METRICS_INTERVAL_SECS: u32 = 5;
+///
+/// The tick is emitted at `info` so the operator sees it without
+/// touching `RUST_LOG`, which makes the cadence the only lever on log
+/// volume: at the previous 5 s default the line accounted for ~99 % of
+/// a long-running daemon's log (335 MB over a few weeks, no rotation).
+/// 30 s keeps the fps/percentile trend readable while cutting that by
+/// ~83 %.  Operators who want the tick out of the way entirely can
+/// filter it by target: `level = "fluxframe=info,fluxframe::metrics=debug"`.
+///
+/// Keep this at or below `LATENCY_WINDOW` frames' worth of wall time —
+/// see [`crate::metrics::LatencyHistogram`], whose ring is sized so one
+/// tick's percentiles cover a whole interval rather than only the last
+/// N frames.
+pub const DEFAULT_METRICS_INTERVAL_SECS: u32 = 30;
 /// Default downscale factor applied to the output relative to input.
 /// `1.0` means "publish at exactly the input resolution"; `0.5` halves
 /// each dimension.  Values outside `[MIN_OUTPUT_SCALE, MAX_OUTPUT_SCALE]`
@@ -721,11 +734,54 @@ pub struct IdleConfig {
     #[serde(default = "default_idle_deep_secs")]
     pub deep_idle_secs: u32,
 
-    /// Sysfs `state` poll cadence in milliseconds. Lower = faster
-    /// wake on consumer reconnect; higher = cheaper steady-state. The
-    /// 250 ms default hits a ≤ 500 ms wake budget from Idle.
+    /// Fallback-path poll cadence in milliseconds. Lower = faster wake
+    /// on consumer reconnect; higher = cheaper steady-state. The 250 ms
+    /// default hits a ≤ 500 ms wake budget from Idle.
+    ///
+    /// Only the `/proc`-polling fallback uses this. The kernel-event
+    /// source is edge-driven and the inotify source blocks on its own
+    /// fd, so neither has a poll cadence to tune.
     #[serde(default = "default_idle_poll_interval_ms")]
     pub poll_interval_ms: u32,
+
+    /// Which mechanism decides whether a consumer is attached.
+    ///
+    /// The operator-facing kill switch for the detector. Unlike
+    /// `enabled = false` — which also removes the placeholder and with
+    /// it the loopback's CAPTURE-caps heartbeat — this only changes
+    /// *how* presence is determined, so a misbehaving detector can be
+    /// swapped out without giving up device visibility.
+    #[serde(default)]
+    pub presence_source: IdlePresenceSource,
+}
+
+/// Mechanism used to detect whether anything is consuming the loopback.
+///
+/// Defaults to [`IdlePresenceSource::Auto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdlePresenceSource {
+    /// Kernel `V4L2_EVENT_PRI_CLIENT_USAGE` events, falling back to the
+    /// `inotify` + `/proc` heuristic when the driver does not support
+    /// them (v4l2loopback < 0.13, or a non-loopback sink).
+    #[default]
+    Auto,
+    /// Kernel events only. If the subscription fails the detector
+    /// reports `Unknown` — which the state machine treats as "consumer
+    /// present", so idle never engages — rather than silently degrading
+    /// to the heuristic. For diagnosing whether a fallback is masking a
+    /// problem.
+    KernelEvent,
+    /// Force the pre-0.5 `inotify` + `/proc` heuristic. Cannot produce
+    /// an authoritative "nobody is attached" when consumers run as
+    /// another user (see the detector's module docs), so idle may fail
+    /// to engage. Kept as an escape hatch.
+    Inotify,
+    /// Never report "absent": idle is never entered, the camera is held
+    /// for the whole run. The placeholder machinery and the Stage-16
+    /// loopback-visibility guarantees stay intact — this disables only
+    /// the power saving, not the output.
+    Disabled,
 }
 
 impl Default for IdleConfig {
@@ -740,6 +796,7 @@ impl Default for IdleConfig {
             teardown_secs: default_idle_teardown_secs(),
             deep_idle_secs: default_idle_deep_secs(),
             poll_interval_ms: default_idle_poll_interval_ms(),
+            presence_source: IdlePresenceSource::default(),
         }
     }
 }

@@ -17,6 +17,7 @@
 //! into `appsrc` at the configured `fps` cadence so downstream sees a steady
 //! framerate even when the effect chain stalls or runs slower than the sink.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,6 +31,7 @@ use parking_lot::Mutex;
 use tracing::{debug, trace, warn};
 
 use crate::util::{build_caps, check_v4l2_output_access, make_element};
+use crate::v4l2_events::ConsumerWatch;
 
 /// Output sink selection.
 ///
@@ -175,7 +177,7 @@ pub struct OutputPipeline {
     /// V4l2Loopback direct-write path.  See [`V4lFdGuard`] for the
     /// load-bearing rationale.  Declared after `pipeline` so drop order
     /// tears the fdsink down first.
-    _fd_guard: Option<V4lFdGuard>,
+    fd_guard: Option<V4lFdGuard>,
     /// Latest composite from the effect chain.  Cloned cheaply (the
     /// inner `Arc` is bumped, not the pixel bytes) by the writer thread
     /// every tick.
@@ -206,6 +208,31 @@ pub struct OutputPipeline {
 // minimal CPU.
 
 impl OutputPipeline {
+    /// Subscribe to capture-usage events on the loopback node, so the
+    /// caller can tell whether anything is actually reading from us.
+    ///
+    /// Returns `None` when this pipeline is not on the v4l2loopback
+    /// direct-write path (`autovideosink`, `pipewiresink`, `fakesink`,
+    /// or the `v4l2sink` fallback) — those sinks own no device fd, so
+    /// there is nothing to subscribe to.
+    ///
+    /// The returned [`ConsumerWatch`] holds its own `dup(2)` of the
+    /// device fd, so it stays valid even if this pipeline is torn down
+    /// first. It reports on the node, not on this pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the subscription failure. `ENOTTY` / `EINVAL` mean the
+    /// driver predates `V4L2_EVENT_PRI_CLIENT_USAGE` (v4l2loopback
+    /// < 0.13); the caller should fall back to a heuristic detector.
+    pub fn subscribe_consumer_events(&self) -> Option<io::Result<ConsumerWatch>> {
+        let guard = self.fd_guard.as_ref()?;
+        // `handle()` hands back an `Arc<Handle>` whose fd is owned by the
+        // `v4l::Device` inside the guard — valid for this call, which is
+        // all `subscribe` needs (it dups straight away).
+        Some(ConsumerWatch::subscribe(guard.0.handle().fd()))
+    }
+
     /// Build the pipeline.
     ///
     /// # Errors
@@ -298,7 +325,7 @@ impl OutputPipeline {
             appsrc,
             started: Arc::new(AtomicBool::new(false)),
             fps: fps.max(1),
-            _fd_guard: fd_guard,
+            fd_guard,
             latest: Arc::new(Mutex::new(None)),
             writer_handle: Mutex::new(None),
             frame_counter: AtomicU64::new(1),
@@ -526,7 +553,7 @@ struct SinkChainResult {
 /// dropped first the next pipeline tick writes to a closed fd.  Do
 /// not remove the field that holds this guard — see
 /// `build_v4l2_direct_chain` for why.
-struct V4lFdGuard(#[allow(dead_code)] v4l::Device);
+struct V4lFdGuard(v4l::Device);
 
 /// Default PipeWire node name advertised when the caller does not pass
 /// one through.  Kept as a const so the magic string is named at its
