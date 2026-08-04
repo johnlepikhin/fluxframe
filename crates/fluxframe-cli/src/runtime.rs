@@ -1590,7 +1590,14 @@ where
     // Input-side failures are split off into `input_failure` so they can
     // be recovered in place instead of taking the loopback down.
     let bus_error: Arc<Mutex<Option<FluxError>>> = Arc::new(Mutex::new(None));
-    let input_failure = Arc::new(InputFailureSignal::new(supervised_acquire(cfg)));
+    // Starts disabled and is armed below, once we know an idle runtime
+    // (and therefore a placeholder) actually exists. Config alone is not
+    // enough: `build_idle_runtime` can still bail out on a bad
+    // placeholder path or an unresolvable sink, and recovering with no
+    // placeholder would leave the writer thread re-pushing the last live
+    // frame — a frozen picture the consumer cannot tell from a working
+    // camera.
+    let input_failure = Arc::new(InputFailureSignal::new());
     let _bus_listener = build_bus_listener(
         &input,
         &output,
@@ -1620,6 +1627,9 @@ where
     // placeholder. Returns `None` (Stage 14 fallthrough) when idle
     // mode is disabled, the sink is non-V4L2, or the host is non-Linux.
     let mut idle_runtime = build_idle_runtime(cfg, &input, &output, &running, &metrics.counters);
+    if supervised_acquire(cfg) && idle_runtime.is_some() {
+        input_failure.arm();
+    }
 
     let process_result = run_supervised_loop(
         WorkerDeps {
@@ -2088,11 +2098,22 @@ fn recover_input(
         // input. This is why recovery has a single owner.
         if let Some(handle) = rt.reload_handle.take() {
             debug!("joining an in-flight reload before recovering the input");
-            let _ = handle.join();
+            if handle.join().is_err() {
+                warn!(
+                    target: "fluxframe::idle",
+                    "reload thread panicked; continuing with input recovery"
+                );
+            }
         }
-        // The engine itself is fine, but no frames are coming; make sure
-        // no tick observes "active and ready" while the input is down.
-        rt.engine_ready.store(false, Ordering::Release);
+        // `engine_ready` is deliberately left alone. It tracks the ML
+        // session, which in-place recovery never unloads, and only
+        // `spawn_reload_thread` ever sets it back to `true` — on the
+        // idle Active-resume edge. Clearing it here would therefore pin
+        // it to `false` for the rest of the run whenever a consumer
+        // stayed attached across the outage, and `tick_idle` would
+        // publish the placeholder forever even though the camera came
+        // back. There is no window to protect either way: the worker
+        // loop has already returned, so nothing ticks while we recover.
     }
 
     // Publish a placeholder before anything else. Until we do, the
@@ -2189,20 +2210,30 @@ fn recover_input(
 #[derive(Debug)]
 pub(crate) struct InputFailureSignal {
     generation: AtomicU64,
-    enabled: bool,
+    enabled: AtomicBool,
 }
 
 impl InputFailureSignal {
-    fn new(enabled: bool) -> Self {
+    fn new() -> Self {
         Self {
             generation: AtomicU64::new(0),
-            enabled,
+            enabled: AtomicBool::new(false),
         }
+    }
+
+    /// Take responsibility for input-side failures from now on.
+    ///
+    /// Separate from construction because the bus listener has to exist
+    /// before the idle runtime it depends on, and only the idle runtime
+    /// can tell us whether a placeholder is available to cover the
+    /// outage.
+    fn arm(&self) {
+        self.enabled.store(true, Ordering::Release);
     }
 
     /// Does this signal take responsibility for failures from `source`?
     fn handles(&self, source: BusSource) -> bool {
-        self.enabled && source == BusSource::Input
+        self.enabled.load(Ordering::Acquire) && source == BusSource::Input
     }
 
     /// Record an input failure.
@@ -2493,6 +2524,18 @@ fn process_one_frame(
         metrics.sync_dropped(slot.dropped_count());
     }
     Ok(())
+}
+
+/// May the worker pull a real frame and run the effect chain?
+///
+/// Both conditions are load-bearing, and the second one is a trap worth
+/// naming: `engine_ready` is only ever set back to `true` by the idle
+/// Active-resume edge. Anything that clears it outside that flow pins
+/// the daemon to the placeholder for the rest of the run — the camera
+/// keeps working, the logs look healthy, and the consumer sees a still
+/// image. Clear it only where a resume edge is guaranteed to follow.
+fn active_allowed(level: crate::idle::IdleLevel, engine_ready: bool) -> bool {
+    matches!(level, crate::idle::IdleLevel::Active) && engine_ready
 }
 
 /// Does the consumer detector currently say nobody is reading the
@@ -2889,8 +2932,7 @@ fn tick_idle(
         .state_machine
         .tick(status, Instant::now(), &state.working_cfg.idle);
     handle_idle_edge(idle_rt, tick.edge, slot, output, metrics);
-    let active_allowed = matches!(tick.level, crate::idle::IdleLevel::Active)
-        && idle_rt.engine_ready.load(Ordering::Acquire);
+    let active_allowed = active_allowed(tick.level, idle_rt.engine_ready.load(Ordering::Acquire));
     if !active_allowed {
         if let Err(e) = push_placeholder(
             idle_rt.placeholder.as_ref(),
@@ -3128,7 +3170,10 @@ mod tests {
         let running = AtomicBool::new(true);
         let bus_error = Mutex::new(None);
         let slot = LatestFrameSlot::new();
-        let signal = InputFailureSignal::new(supervised);
+        let signal = InputFailureSignal::new();
+        if supervised {
+            signal.arm();
+        }
         on_bus_event(event, &running, &bus_error, &slot, &signal);
         (
             running.load(Ordering::Acquire),
@@ -3226,7 +3271,8 @@ mod tests {
         // several messages. A boolean flag could not distinguish "the
         // failure I am already recovering from" from "another one just
         // happened", which is why this is a counter.
-        let signal = InputFailureSignal::new(true);
+        let signal = InputFailureSignal::new();
+        signal.arm();
         assert_eq!(signal.generation(), 0);
         signal.raise();
         signal.raise();
@@ -3234,6 +3280,30 @@ mod tests {
     }
 
     // --- supervisor decision matrix ----------------------------------
+
+    #[test]
+    fn an_unarmed_signal_leaves_input_failures_fatal() {
+        // Config may say "supervised", but if `build_idle_runtime` bailed
+        // out there is no placeholder to cover the outage, and recovering
+        // would leave the consumer staring at a frozen frame.
+        let signal = InputFailureSignal::new();
+        assert!(!signal.handles(BusSource::Input));
+        signal.arm();
+        assert!(signal.handles(BusSource::Input));
+        // Arming never claims the output side.
+        assert!(!signal.handles(BusSource::Output));
+    }
+
+    #[test]
+    fn active_frames_need_both_an_active_level_and_a_ready_engine() {
+        use crate::idle::IdleLevel;
+        assert!(active_allowed(IdleLevel::Active, true));
+        // Regression guard: anything that clears `engine_ready` outside
+        // the idle resume edge pins the daemon to the placeholder for the
+        // rest of the run, because only that edge ever sets it back.
+        assert!(!active_allowed(IdleLevel::Active, false));
+        assert!(!active_allowed(IdleLevel::Placeholder, true));
+    }
 
     #[test]
     fn next_action_recovers_only_a_live_run_with_a_failed_input() {

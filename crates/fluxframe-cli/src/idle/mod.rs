@@ -10,12 +10,13 @@
 //! * [`state`] — pure state machine driving [`IdleEdge`]/[`IdleLevel`]
 //!   transitions; no I/O. Wired into the worker loop in
 //!   `runtime::run_process_loop`.
-//! * `detector` — inotify-driven consumer presence detector with a
-//!   `/proc/*/fd/` walk on every open/close event; polling fallback
-//!   for environments where inotify is unavailable. Linux-only —
-//!   `/proc/*/fd/` and `inotify` are both Linux interfaces; the
-//!   module is `cfg`-gated and the supervisor consults the same
-//!   gate when wiring it.
+//! * `detector` — consumer-presence detector. Primary source is the
+//!   kernel's `V4L2_EVENT_PRI_CLIENT_USAGE`; an inotify + `/proc/*/fd/`
+//!   heuristic (itself falling back to `/proc` polling) covers drivers
+//!   that do not implement it. Selectable via `idle.presence_source`;
+//!   see the module docs for why the heuristic cannot be authoritative
+//!   on its own. Linux-only, `cfg`-gated, and the supervisor consults
+//!   the same gate when wiring it.
 //! * `placeholder` (Step 2) — pre-rendered frame cache.
 //! * `managed_composite` (Step 2) — lifecycle wrapper around
 //!   `CompositeEffect` that owns the engine slot.

@@ -35,6 +35,15 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
+/// Sentinel for `consumer_status` before the detector has published a
+/// verdict. Distinct from every `ConsumerStatus` discriminant (0..=2).
+pub const CONSUMER_STATUS_UNSET: u64 = u64::MAX;
+
+/// Sentinel for `consumer_source` before a detection path has been
+/// chosen — including runs with no detector at all (idle disabled, or a
+/// sink that has none).
+pub const CONSUMER_SOURCE_UNSET: u64 = u64::MAX;
+
 /// Process-wide event counters.
 ///
 /// Shared between the supervisor (writer) and any metrics readers via
@@ -105,6 +114,11 @@ pub struct Counters {
     // gauges. `consumer_source` records which detection path is live —
     // see `set_consumer_source` for the encoding — so a silent
     // degradation to the fallback path cannot masquerade as a healthy fix.
+    //
+    // Both start at "not measured yet" rather than at zero: zero is a
+    // meaningful value for each (Absent / the authoritative source), and
+    // a run with no detector at all would otherwise print "no consumer,
+    // kernel events live" before anything had been observed.
     // `consumer_transitions_total` is the liveness signal: a flat counter
     // with a non-zero uptime means the detector stopped observing.
     consumer_status: AtomicU64,
@@ -156,9 +170,9 @@ impl Counters {
             resume_failures_total: AtomicU64::new(0),
             unattributable_wakes_total: AtomicU64::new(0),
             processing_threads: AtomicU64::new(0),
-            consumer_status: AtomicU64::new(0),
+            consumer_status: AtomicU64::new(CONSUMER_STATUS_UNSET),
             consumer_clients: AtomicU64::new(0),
-            consumer_source: AtomicU64::new(0),
+            consumer_source: AtomicU64::new(CONSUMER_SOURCE_UNSET),
             consumer_transitions_total: AtomicU64::new(0),
             frames_out_while_no_consumer_total: AtomicU64::new(0),
             input_reacquire_total: AtomicU64::new(0),
@@ -322,7 +336,9 @@ impl Counters {
     ///
     /// The encoding is owned by the detector; the values in use are
     /// `0` = kernel client-usage events, `1` = inotify + `/proc` walk,
-    /// `2` = `/proc` polling fallback.  Kept as a bare integer here so
+    /// `2` = `/proc` polling fallback, `3` = detection disabled by
+    /// config.  Until one is chosen the gauge reads
+    /// [`CONSUMER_SOURCE_UNSET`].  Kept as a bare integer here so
     /// `fluxframe-core` does not grow a dependency on the supervisor's
     /// detector types.
     #[inline]

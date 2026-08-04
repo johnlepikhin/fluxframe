@@ -225,12 +225,19 @@ impl OutputPipeline {
     /// Propagates the subscription failure. `ENOTTY` / `EINVAL` mean the
     /// driver predates `V4L2_EVENT_PRI_CLIENT_USAGE` (v4l2loopback
     /// < 0.13); the caller should fall back to a heuristic detector.
+    #[allow(
+        unsafe_code,
+        reason = "`v4l::Handle` exposes only a raw fd (no AsFd impl), so borrowing it \
+                  is unavoidable; this is the one site that knows the fd's provenance"
+    )]
     pub fn subscribe_consumer_events(&self) -> Option<io::Result<ConsumerWatch>> {
         let guard = self.fd_guard.as_ref()?;
-        // `handle()` hands back an `Arc<Handle>` whose fd is owned by the
-        // `v4l::Device` inside the guard — valid for this call, which is
-        // all `subscribe` needs (it dups straight away).
-        Some(ConsumerWatch::subscribe(guard.0.handle().fd()))
+        let handle = guard.0.handle();
+        // SAFETY: the fd is owned by the `v4l::Device` inside `guard`,
+        // which this `&self` borrow keeps alive; `subscribe` only needs
+        // it for the duration of the call (it dups straight away).
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(handle.fd()) };
+        Some(ConsumerWatch::subscribe(borrowed))
     }
 
     /// Build the pipeline.

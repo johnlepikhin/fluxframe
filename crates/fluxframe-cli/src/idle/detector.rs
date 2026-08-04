@@ -1,23 +1,56 @@
-//! Process-fd consumer presence detector for v4l2loopback devices.
+//! Consumer-presence detection for v4l2loopback devices.
 //!
-//! Linux-only — `/proc/*/fd` is a Linux interface. On other targets
-//! this module is not compiled, and the supervisor (`build_idle_runtime`
-//! in `runtime.rs`) gates its wiring through the same `cfg`.
+//! Linux-only. On other targets this module is not compiled, and the
+//! supervisor (`build_idle_runtime` in `runtime.rs`) gates its wiring
+//! through the same `cfg`.
 //!
-//! ## Why not sysfs?
+//! ## Sources, in order of preference
 //!
-//! The first Stage 15 implementation polled
-//! `/sys/class/video4linux/<videoN>/state`, on the assumption that
-//! `"capture"` means "a reader has called `STREAMON`". That was wrong:
-//! the v4l2loopback attribute actually reflects the producer's
-//! `ready_for_capture` flag — the moment fluxframe itself starts
-//! writing frames, `state` reads `"capture"` regardless of whether
-//! anyone is reading. The detector pinned `Present` and idle mode
-//! never engaged. The clean alternative (`VIDIOC_DQEVENT` +
-//! `V4L2_EVENT_PRI_CLIENT_USAGE`) requires raw ioctls, which collide
-//! with the workspace `#![forbid(unsafe_code)]`.
+//! | `idle.presence_source` | Behaviour |
+//! |---|---|
+//! | `auto` (default) | Kernel `V4L2_EVENT_PRI_CLIENT_USAGE` events, degrading to the heuristic below when the subscription is unavailable. |
+//! | `kernel_event` | Kernel events only. On failure the status stays `Unknown` (read as "present"), so idle never engages — for telling a working fix apart from a silent fallback. |
+//! | `inotify` | Force the heuristic. |
+//! | `disabled` | Pin the status to `Present`; idle never engages. |
 //!
-//! ## How the inotify + walk hybrid works
+//! The live choice is published as the `consumer_source` gauge, because
+//! a silent degradation is otherwise indistinguishable from a healthy
+//! run.
+//!
+//! ## Why the kernel event is the primary source
+//!
+//! Two earlier designs failed, and their failure modes are the reason
+//! the current one looks the way it does.
+//!
+//! Stage 15 polled `/sys/class/video4linux/<videoN>/state`, assuming
+//! `"capture"` meant "a reader called `STREAMON`". It does not — the
+//! attribute reflects the *producer's* `ready_for_capture` flag, so it
+//! read `"capture"` the moment fluxframe itself started writing. The
+//! detector pinned `Present` and idle never engaged.
+//!
+//! The `inotify` + `/proc`-walk hybrid that replaced it assumed the
+//! walk was authoritative whenever it was readable. It never is: an
+//! unprivileged process gets `EACCES` on every other user's
+//! `/proc/<pid>/fd`, so "nobody holds the device" and "I may not see
+//! who does" are indistinguishable. `CleanAbsent` — the only outcome
+//! that cleared the open balance — was therefore unreachable, and a
+//! single lost `IN_CLOSE` latched `Present` for the rest of the
+//! process. Filtering the candidate set does not rescue it: on a
+//! typical desktop dozens of unreadable processes can genuinely open
+//! the device.
+//!
+//! `V4L2_EVENT_PRI_CLIENT_USAGE` (see
+//! [`fluxframe_gst::v4l2_events`]) sidesteps both: the driver reports
+//! capture usage as an absolute value, so there is no state to
+//! accumulate and drift, and no `/proc` access is involved. It also
+//! fires on `STREAMON`/`STREAMOFF` rather than `open`/`close`, so
+//! device enumeration no longer counts as a consumer.
+//!
+//! Until the first reading arrives the status stays `Unknown`, which
+//! the state machine treats as "present": idle must never engage on an
+//! assumption.
+//!
+//! ## How the inotify + walk fallback works
 //!
 //! The detector watches `/dev/videoN` for `IN_OPEN`,
 //! `IN_CLOSE_NOWRITE` and `IN_CLOSE_WRITE` via `inotify`. In
@@ -783,7 +816,7 @@ fn run_detector(
     // `count_external_consumers` for the actual presence test, so
     // the public contract is identical — only the wake mechanism
     // differs.
-    if run_presence_source(mode, watch, poll_interval, &device_path, &ctx, &mut state) {
+    if run_presence_source(mode, watch, &ctx, &mut state) {
         run_heuristic_detector(poll_interval, &device_path, &ctx, &mut state);
     }
 
@@ -798,18 +831,27 @@ fn run_detector(
 fn run_presence_source(
     mode: IdlePresenceSource,
     watch: Option<ConsumerWatch>,
-    poll_interval: Duration,
-    device_path: &Path,
     ctx: &DetectorContext<'_>,
     state: &mut DetectorState<'_>,
 ) -> bool {
-    let _ = (poll_interval, device_path);
     match mode {
         IdlePresenceSource::Disabled => {
             run_detector_disabled(ctx, state);
             false
         }
-        IdlePresenceSource::Inotify => true,
+        IdlePresenceSource::Inotify => {
+            // Drop the subscription we may have been handed: the
+            // operator asked for the heuristic explicitly, and holding a
+            // dup of the device fd would keep the loopback's open file
+            // description alive for no reason.
+            debug!(
+                target: "fluxframe::idle",
+                subscription = watch.is_some(),
+                "presence_source = inotify — using the heuristic path"
+            );
+            drop(watch);
+            true
+        }
         IdlePresenceSource::Auto | IdlePresenceSource::KernelEvent => {
             let strict = mode == IdlePresenceSource::KernelEvent;
             let Some(mut watch) = watch else {

@@ -41,13 +41,17 @@
 //!
 //! ## Unsafe
 //!
-//! This is the only module in the workspace allowed to use `unsafe`
-//! (see the `[lints]` block in this crate's `Cargo.toml`). It is
-//! confined to two ioctls whose argument types are checked by
-//! compile-time size assertions against the bindgen-generated structs.
+//! This module is the reason the crate opts out of the workspace's
+//! `unsafe_code = "forbid"` (see the `[lints]` block in `Cargo.toml`,
+//! and the `#![deny(unsafe_code)]` in `lib.rs` that keeps the
+//! exemption scoped to this module). The unsafe surface is four
+//! things: the two ioctls, a `poll(2)`, and reading the event union
+//! through its byte view. The ioctl argument types are pinned by
+//! compile-time size assertions against the bindgen-generated structs,
+//! so a layout drift is a build error rather than a silent `ENOTTY`.
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 
 use v4l::v4l_sys::{
     V4L2_EVENT_PRIVATE_START, V4L2_EVENT_SUB_FL_SEND_INITIAL, v4l2_event, v4l2_event_subscription,
@@ -103,8 +107,20 @@ const VIDIOC_SUBSCRIBE_EVENT: u64 = ioc(
 // The kernel encodes these sizes into the request number; if bindgen
 // ever produces a differently-sized struct the ioctls would silently
 // start returning ENOTTY at runtime. Fail the build instead.
-const _: () = assert!(size_of::<v4l2_event>() == 136);
-const _: () = assert!(size_of::<v4l2_event_subscription>() == 32);
+//
+// `v4l2_event` embeds a `timespec`, so its size is pointer-width
+// dependent; the literal below is the 64-bit layout. `ioc()` derives
+// the request number from `size_of` either way, so a 32-bit build is
+// still correct — it just cannot be checked against this constant.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(
+    size_of::<v4l2_event>() == 136,
+    "unexpected v4l2_event layout: VIDIOC_DQEVENT would encode the wrong size"
+);
+const _: () = assert!(
+    size_of::<v4l2_event_subscription>() == 32,
+    "unexpected v4l2_event_subscription layout: VIDIOC_SUBSCRIBE_EVENT would encode the wrong size"
+);
 
 /// A capture-usage reading taken from the driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,22 +157,18 @@ impl ConsumerWatch {
     /// Requests `V4L2_EVENT_SUB_FL_SEND_INITIAL` so the driver reports
     /// the current state immediately instead of only on the next change.
     ///
+    /// The descriptor is duplicated immediately, so the borrow ends when
+    /// this returns — the watch does not keep `fd` alive, it keeps its
+    /// own duplicate.
+    ///
     /// # Errors
     ///
     /// Returns the OS error if `dup` or `VIDIOC_SUBSCRIBE_EVENT` fails.
     /// `ENOTTY` / `EINVAL` mean the node does not implement the event
     /// (a non-loopback sink, or v4l2loopback older than 0.13) and the
     /// caller should fall back to a heuristic detector.
-    /// # Safety contract
-    ///
-    /// `fd` must be an open V4L2 descriptor for the duration of this
-    /// call. It is duplicated immediately, so the caller may close it
-    /// afterwards — the watch does not borrow it.
-    pub fn subscribe(fd: RawFd) -> io::Result<Self> {
-        // SAFETY: `fd` is open for the duration of the call per the
-        // contract above, and the borrow ends with `try_clone_to_owned`.
-        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-        let owned = borrowed.try_clone_to_owned()?;
+    pub fn subscribe(fd: BorrowedFd<'_>) -> io::Result<Self> {
+        let owned = fd.try_clone_to_owned()?;
 
         let mut sub = v4l2_event_subscription {
             type_: V4L2_EVENT_PRI_CLIENT_USAGE,
@@ -242,6 +254,11 @@ impl ConsumerWatch {
         // Zeroed rather than uninitialised: `VIDIOC_DQEVENT` is `_IOR`,
         // so the kernel fills the struct, but zeroing keeps the value
         // valid Rust even on the error path.
+        // SAFETY: `v4l2_event` is a `repr(C)` POD whose union variants
+        // are all integer/array types, so the all-zero bit pattern is a
+        // valid value. Zeroed rather than uninitialised because
+        // `VIDIOC_DQEVENT` is `_IOR` — the kernel fills the struct, but
+        // zeroing keeps the value valid Rust on the error path too.
         let mut ev: v4l2_event = unsafe { std::mem::zeroed() };
         // SAFETY: `ev` is a live, fully-initialised `v4l2_event`, and
         // `VIDIOC_DQEVENT` writes exactly `size_of::<v4l2_event>()`
@@ -301,6 +318,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
     fn ioctl_request_numbers_match_videodev2_h() {
         // _IOR('V', 89, struct v4l2_event) with sizeof == 136, and
         // _IOW('V', 90, struct v4l2_event_subscription) with sizeof == 32.
