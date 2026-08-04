@@ -21,7 +21,7 @@ use crate::config_merge::{CliOverrides, apply, load, resolve_load_path, resolve_
 use crate::preset;
 use crate::runtime::{
     InputSpec, OutputSpec, classify_input, classify_output, ensure_ctrlc_handler,
-    is_shutdown_requested, mark_output_down, run_testsrc_chain, run_v4l2_chain, wait_for_shutdown,
+    is_shutdown_requested, run_testsrc_chain, run_v4l2_chain, wait_for_shutdown,
 };
 
 /// Entry point for `fluxframe run`.
@@ -146,17 +146,16 @@ fn run_auto(
             let mut resolved = cfg.clone();
             resolved.input.device = InputDevice::Path(path.clone());
             let run_started = Instant::now();
+            // The run takes the whole pipeline down with it, loopback
+            // output included: from the teardown until the next
+            // successful `output.start()` the node advertises no CAPTURE
+            // caps and clients cannot see the camera. That window is
+            // opened by `runtime::run_chain` at the point the output
+            // actually stops, so every device form (not just `auto`)
+            // reports it.
             match run_once(&resolved, preset_name, config_path) {
-                Ok(()) => {
-                    mark_output_down(None);
-                    return Ok(());
-                }
+                Ok(()) => return Ok(()),
                 Err(e) => {
-                    // The run took the whole pipeline down with it,
-                    // loopback output included: from here until the next
-                    // successful `output.start()` the node advertises no
-                    // CAPTURE caps and clients cannot see the camera.
-                    mark_output_down(Some(&e));
                     if !e.is_transient() {
                         warn!(error = %e, "auto-input: permanent error, surfacing");
                         return Err(e);

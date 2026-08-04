@@ -108,17 +108,28 @@ pub struct Counters {
     // verdict, its provenance and its liveness all readable from one
     // metrics line.
     //
-    // `consumer_status` mirrors `ConsumerStatus` (0 = Absent, 1 = Present,
-    // 2 = Unknown) and `consumer_clients` is the absolute count of capture
-    // clients when the source can supply one (0 otherwise). Both are
-    // gauges. `consumer_source` records which detection path is live —
-    // see `set_consumer_source` for the encoding — so a silent
-    // degradation to the fallback path cannot masquerade as a healthy fix.
+    // All three of `consumer_status` / `consumer_clients` /
+    // `consumer_source` are gauges:
     //
-    // Both start at "not measured yet" rather than at zero: zero is a
-    // meaningful value for each (Absent / the authoritative source), and
-    // a run with no detector at all would otherwise print "no consumer,
-    // kernel events live" before anything had been observed.
+    // * `consumer_status` mirrors `ConsumerStatus` (0 = Absent,
+    //   1 = Present, 2 = Unknown), or [`CONSUMER_STATUS_UNSET`]
+    //   (`u64::MAX`) before the detector has published a first verdict.
+    // * `consumer_source` records which detection path is live (0 =
+    //   kernel client-usage events, 1 = inotify + `/proc`, 2 = `/proc`
+    //   polling, 3 = detection disabled), or [`CONSUMER_SOURCE_UNSET`]
+    //   (`u64::MAX`) before a path has been chosen — so a silent
+    //   degradation to the fallback path cannot masquerade as a healthy
+    //   run. See `set_consumer_source`.
+    // * `consumer_clients` is the absolute count of capture clients for
+    //   the paths that can supply one (only the kernel-event source
+    //   today); it stays at 0 for every other path. It has no sentinel:
+    //   0 already reads as "nobody, or not counted here", and
+    //   `consumer_source` says which of the two it is.
+    //
+    // The two sentinels exist because zero is a meaningful value for
+    // both fields (Absent / the authoritative kernel source), so a run
+    // that has observed nothing yet — or has no detector at all — would
+    // otherwise print "no consumer, kernel events live".
     // `consumer_transitions_total` is the liveness signal: a flat counter
     // with a non-zero uptime means the detector stopped observing.
     consumer_status: AtomicU64,
@@ -311,7 +322,9 @@ impl Counters {
     ///
     /// `status` uses the detector's own encoding (0 = Absent,
     /// 1 = Present, 2 = Unknown) so the two cannot drift apart; callers
-    /// pass the same byte they publish on the shared atomic.
+    /// pass the same byte they publish on the shared atomic.  Until the
+    /// first call the gauge reads [`CONSUMER_STATUS_UNSET`], which is
+    /// outside that range by construction.
     ///
     /// Call this only on an actual change: the transition counter is the
     /// liveness signal, and bumping it on every poll would destroy its
@@ -325,8 +338,10 @@ impl Counters {
     }
 
     /// Record the absolute number of capture clients, for detection
-    /// paths that can supply one.  A gauge; paths that only know
-    /// "someone / nobody" leave it at zero.
+    /// paths that can supply one (the kernel client-usage source today).
+    /// A gauge; paths that only know "someone / nobody" leave it at
+    /// zero, as does a run before any observation — there is no
+    /// sentinel here, read `consumer_source` to tell the cases apart.
     #[inline]
     pub fn set_consumer_clients(&self, clients: u64) {
         self.consumer_clients.store(clients, Ordering::Relaxed);
@@ -334,10 +349,11 @@ impl Counters {
 
     /// Record which consumer-detection path is live.
     ///
-    /// The encoding is owned by the detector; the values in use are
-    /// `0` = kernel client-usage events, `1` = inotify + `/proc` walk,
-    /// `2` = `/proc` polling fallback, `3` = detection disabled by
-    /// config.  Until one is chosen the gauge reads
+    /// The encoding is owned by the detector; the four values in use
+    /// are `0` = kernel client-usage events, `1` = inotify + `/proc`
+    /// walk, `2` = `/proc` polling fallback, `3` = detection disabled by
+    /// config.  Until one is chosen — including for the whole of a run
+    /// with no detector at all — the gauge reads
     /// [`CONSUMER_SOURCE_UNSET`].  Kept as a bare integer here so
     /// `fluxframe-core` does not grow a dependency on the supervisor's
     /// detector types.

@@ -1169,12 +1169,17 @@ fn elapsed_ms_since_epoch() -> u64 {
 /// Record that the loopback output is live and advertising CAPTURE caps.
 /// Closes any open invisible window and logs its duration.
 pub(crate) fn mark_output_live() {
-    OUTPUT_REBUILDS_TOTAL.fetch_add(1, Ordering::Relaxed);
     let since = OUTPUT_DOWN_SINCE_MS.swap(0, Ordering::Relaxed);
     if since == 0 {
-        // First start of the process — there was no preceding window.
+        // First start of the process — there was no preceding window,
+        // so this start is not a *re*build. Counting it here (the
+        // previous behaviour) made `rebuilds_total` permanently one
+        // larger than the number of outages an operator can observe.
+        // Incrementing only after a recorded down-edge keeps the
+        // counter paired 1:1 with `mark_output_down`.
         return;
     }
+    OUTPUT_REBUILDS_TOTAL.fetch_add(1, Ordering::Relaxed);
     let down_ms = elapsed_ms_since_epoch().saturating_sub(since);
     OUTPUT_INVISIBLE_MS_TOTAL.fetch_add(down_ms, Ordering::Relaxed);
     info!(
@@ -1572,12 +1577,23 @@ where
     // Stage 16: acquire the input AFTER the output is live. On the
     // supervised path a busy/absent camera streams the placeholder and
     // retries with backoff instead of tearing the loopback down.
-    // `prepare_input` tears the output + chain down itself on a clean
-    // shutdown (`None`) or a permanent error (`Err`).
-    let Some(input) = prepare_input(cfg, &input_builder, &output, &metrics, &mut chain)? else {
-        // Shutdown requested while waiting for the camera; prepare_input
-        // already tore the output + chain down.
-        return Ok(());
+    //
+    // `prepare_input` tears the output + chain down itself on both
+    // non-`Some` arms (clean shutdown, or a permanent error), so the
+    // invisible window opens here rather than in `run_auto` — which
+    // only ever sees `device = "auto"`.
+    let input = match prepare_input(cfg, &input_builder, &output, &metrics, &mut chain) {
+        Ok(Some(input)) => input,
+        Ok(None) => {
+            // Shutdown requested while waiting for the camera;
+            // prepare_input already tore the output + chain down.
+            mark_output_down(None);
+            return Ok(());
+        }
+        Err(e) => {
+            mark_output_down(Some(&e));
+            return Err(e);
+        }
     };
 
     let slot = input.slot();
@@ -1675,10 +1691,21 @@ where
     // Surface bus-reported errors when the processing loop itself was
     // clean, so the operator sees the real cause of shutdown.
     let bus_err = bus_error.lock().expect("bus_error mutex poisoned").take();
-    match (process_result, bus_err) {
+    let outcome = match (process_result, bus_err) {
         (Ok(()), Some(e)) | (Err(e), _) => Err(e),
         (Ok(()), None) => Ok(()),
-    }
+    };
+
+    // The output stopped in `teardown` a few lines above; open the
+    // invisible window here, once the run's real cause of death is
+    // known (it may have arrived via the bus rather than from the
+    // worker loop). This lives in `run_chain` — not in `run_auto` —
+    // because every backend and every device form (`auto` or a fixed
+    // `/dev/videoN`) passes through here, whereas `run_auto` only ever
+    // sees `device = "auto"`. `mark_output_down` keeps the earliest
+    // down-edge, so the pairing with `mark_output_live` stays 1:1.
+    mark_output_down(outcome.as_ref().err());
+    outcome
 }
 
 /// Stop the already-started output and shut the effect chain down —
@@ -2024,10 +2051,20 @@ fn run_supervised_loop(
     idle: &mut Option<IdleRuntime>,
     input: SupervisedInput<'_>,
 ) -> Result<(), FluxError> {
+    // Snapshotted once here and thereafter *returned by*
+    // `recover_input`, which takes it immediately before the successful
+    // `reacquire()` attempt. Re-snapshotting at the top of each
+    // iteration would race the bus drain in both directions: the tail of
+    // the burst that killed the camera would arrive after the snapshot
+    // and trigger an immediate second recovery of a healthy device,
+    // while a genuinely new failure landing between `reacquire`'s
+    // success and the snapshot would be swallowed, leaving the worker
+    // spinning on a `recv_timeout` that can never yield a frame.
+    let mut entry_generation = input.failure.generation();
     loop {
         let watch = InputFailureWatch {
             signal: input.failure,
-            entry_generation: input.failure.generation(),
+            entry_generation,
         };
         let worker_result = run_process_loop(
             WorkerDeps { ..deps },
@@ -2047,13 +2084,15 @@ fn run_supervised_loop(
         match action {
             LoopAction::Exit | LoopAction::TeardownAll => return worker_result,
             LoopAction::ReacquireInput => {
-                recover_input(
+                entry_generation = recover_input(
                     deps.cfg,
                     input.pipeline,
                     output,
                     idle.as_mut(),
                     deps.metrics,
                     slot,
+                    input.failure,
+                    running,
                 )?;
             }
         }
@@ -2070,6 +2109,14 @@ fn run_supervised_loop(
 /// Returns `Err` once [`INPUT_RECOVERY_BUDGET`] is spent, so the caller
 /// escalates to a full restart and the auto-input loop can re-select the
 /// device.
+///
+/// On success returns the input-failure generation observed immediately
+/// before the winning `reacquire()` attempt — see [`retry_reacquire`]
+/// for why the caller must adopt it verbatim.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "recovery context: every argument is a distinct collaborator the retry loop needs"
+)]
 fn recover_input(
     cfg: &FluxConfig,
     input: &Arc<InputPipeline>,
@@ -2077,7 +2124,9 @@ fn recover_input(
     idle: Option<&mut IdleRuntime>,
     metrics: &RuntimeMetrics,
     slot: &LatestFrameSlot,
-) -> Result<(), FluxError> {
+    signal: &InputFailureSignal,
+    running: &AtomicBool,
+) -> Result<u64, FluxError> {
     let started = Instant::now();
 
     // Snapshot what the retry loop needs from the idle runtime, so the
@@ -2137,36 +2186,116 @@ fn recover_input(
     // consumer sees after recovery.
     slot.clear();
 
-    let base = Duration::from_millis(u64::from(cfg.input.acquire_backoff_base_ms));
-    let max = Duration::from_millis(u64::from(cfg.input.acquire_backoff_max_ms));
-    let mut backoff = base;
-    let mut attempt: u32 = 0;
+    let policy = RecoveryPolicy {
+        budget: INPUT_RECOVERY_BUDGET,
+        backoff_base: Duration::from_millis(u64::from(cfg.input.acquire_backoff_base_ms)),
+        backoff_max: Duration::from_millis(u64::from(cfg.input.acquire_backoff_max_ms)),
+    };
+    let generation = retry_reacquire(
+        &**input,
+        signal,
+        running,
+        &metrics.counters,
+        policy,
+        started,
+        |backoff| {
+            // Keep the loopback's ring buffer fresh while we retry:
+            // consumers that filter on capabilities drop a node that
+            // stops producing.
+            push_fill(metrics);
+            wait_for_shutdown(backoff)
+        },
+    )?;
+    // Clear again: `reacquire` may have let a first frame land while we
+    // were still deciding.
+    slot.clear();
+    Ok(generation)
+}
 
+/// Reopening the camera device, behind a trait so the retry loop can be
+/// unit-tested without a live GStreamer pipeline and a real `/dev/video*`.
+/// Mirrors the `UsageSource` seam in [`crate::idle::detector`].
+trait Reacquire {
+    /// Take the input pipeline to `Null` and start it again.
+    fn reacquire(&self) -> Result<(), FluxError>;
+}
+
+impl Reacquire for InputPipeline {
+    fn reacquire(&self) -> Result<(), FluxError> {
+        // Inherent method wins name resolution here, so this is the real
+        // pipeline transition rather than an infinite recursion.
+        InputPipeline::reacquire(self).map_err(FluxError::from)
+    }
+}
+
+/// Timing policy for [`retry_reacquire`]. Parameterised rather than read
+/// from [`INPUT_RECOVERY_BUDGET`] / the config directly so tests can drive
+/// the loop with millisecond-scale values.
+#[derive(Debug, Clone, Copy)]
+struct RecoveryPolicy {
+    /// Wall-clock budget measured from `started`; once spent the loop
+    /// gives up so the caller can escalate to a full restart.
+    budget: Duration,
+    /// First delay between attempts.
+    backoff_base: Duration,
+    /// Ceiling the doubling backoff saturates at.
+    backoff_max: Duration,
+}
+
+/// Retry `target.reacquire()` until it succeeds, the budget is spent, or
+/// the run is asked to stop.
+///
+/// Returns the input-failure generation observed **immediately before**
+/// the winning attempt started. The supervisor adopts that value as the
+/// next worker loop's entry generation, which makes the
+/// failure-absorption window exact: everything raised before the attempt
+/// belongs to the outage we just handled, everything raised after it is a
+/// genuinely new failure that must trigger another recovery. Snapshotting
+/// after the call returns instead would both re-trigger on the tail of
+/// the original message burst and swallow a real new failure landing in
+/// the gap.
+///
+/// Early exits (shutdown or `running` cleared) return the current
+/// generation: the caller is on its way out and no window matters.
+///
+/// GStreamer-free: the pipeline arrives as `&dyn Reacquire`, and pushing
+/// the placeholder plus sleeping the backoff are delegated to `pause`,
+/// which returns `true` when shutdown was requested during the wait.
+fn retry_reacquire(
+    target: &dyn Reacquire,
+    signal: &InputFailureSignal,
+    running: &AtomicBool,
+    counters: &fluxframe_core::metrics::Counters,
+    policy: RecoveryPolicy,
+    started: Instant,
+    mut pause: impl FnMut(Duration) -> bool,
+) -> Result<u64, FluxError> {
+    let mut backoff = policy.backoff_base;
+    let mut attempt: u32 = 0;
     loop {
-        if is_shutdown_requested() {
-            return Ok(());
+        // `running` is the per-run token flag; `is_shutdown_requested`
+        // the process-wide Ctrl-C. A run torn down through the token
+        // alone used to sit here until the budget expired.
+        if is_shutdown_requested() || !running.load(Ordering::Acquire) {
+            return Ok(signal.generation());
         }
         attempt += 1;
-        metrics.counters.inc_input_reacquire();
-        match input.reacquire() {
+        counters.inc_input_reacquire();
+        let generation = signal.generation();
+        match target.reacquire() {
             Ok(()) => {
                 let down = started.elapsed();
-                metrics
-                    .counters
-                    .add_input_down_ms(u64::try_from(down.as_millis()).unwrap_or(u64::MAX));
-                // Clear again: `reacquire` may have let a first frame
-                // land while we were still deciding.
-                slot.clear();
+                counters.add_input_down_ms(u64::try_from(down.as_millis()).unwrap_or(u64::MAX));
                 info!(
                     attempt,
                     down_ms = down.as_millis() as u64,
                     "camera reacquired — output was never interrupted"
                 );
-                return Ok(());
+                return Ok(generation);
             }
             Err(e) => {
-                metrics.counters.inc_input_reacquire_failures();
-                if started.elapsed() >= INPUT_RECOVERY_BUDGET {
+                counters.inc_input_reacquire_failures();
+                if started.elapsed() >= policy.budget {
                     warn!(
                         attempt,
                         elapsed_secs = started.elapsed().as_secs(),
@@ -2174,17 +2303,13 @@ fn recover_input(
                         "in-place camera recovery budget exhausted — restarting the run \
                          so the device can be re-selected"
                     );
-                    return Err(FluxError::from(e));
+                    return Err(e);
                 }
                 debug!(attempt, error = %e, "reacquire failed; will retry");
-                // Keep the loopback's ring buffer fresh while we retry:
-                // consumers that filter on capabilities drop a node that
-                // stops producing.
-                push_fill(metrics);
-                if wait_for_shutdown(backoff) {
-                    return Ok(());
+                if pause(backoff) {
+                    return Ok(signal.generation());
                 }
-                backoff = (backoff * 2).min(max);
+                backoff = (backoff * 2).min(policy.backoff_max);
             }
         }
     }
@@ -3317,6 +3442,268 @@ mod tests {
         // A chain/output error is not recoverable by reacquiring.
         assert_eq!(next_action(true, true, true), LoopAction::TeardownAll);
         assert_eq!(next_action(true, false, true), LoopAction::TeardownAll);
+    }
+
+    // --- retry_reacquire ---------------------------------------------
+    //
+    // The in-place recovery loop is the most dangerous code in this
+    // module (it is what keeps the loopback output alive across a camera
+    // outage) and the least reachable from a test: the real
+    // `InputPipeline` needs a live GStreamer and a real `/dev/video*`.
+    // The `Reacquire` seam removes both, exactly like `UsageSource` does
+    // for the idle detector.
+
+    /// A `Reacquire` that fails a scripted number of times before
+    /// succeeding, counts attempts, and can run a side effect *during*
+    /// an attempt (used to simulate a bus burst landing mid-recovery).
+    struct ScriptedReacquire<'a> {
+        failures_before_success: usize,
+        attempts: std::cell::Cell<usize>,
+        during_attempt: Option<&'a dyn Fn()>,
+    }
+
+    impl ScriptedReacquire<'_> {
+        fn new(failures_before_success: usize) -> Self {
+            Self {
+                failures_before_success,
+                attempts: std::cell::Cell::new(0),
+                during_attempt: None,
+            }
+        }
+    }
+
+    impl Reacquire for ScriptedReacquire<'_> {
+        fn reacquire(&self) -> Result<(), FluxError> {
+            let n = self.attempts.get() + 1;
+            self.attempts.set(n);
+            if let Some(hook) = self.during_attempt {
+                hook();
+            }
+            if n > self.failures_before_success {
+                Ok(())
+            } else {
+                Err(FluxError::Config {
+                    reason: "device busy".into(),
+                    hint: None,
+                })
+            }
+        }
+    }
+
+    fn policy(budget_ms: u64, base_ms: u64, max_ms: u64) -> RecoveryPolicy {
+        RecoveryPolicy {
+            budget: Duration::from_millis(budget_ms),
+            backoff_base: Duration::from_millis(base_ms),
+            backoff_max: Duration::from_millis(max_ms),
+        }
+    }
+
+    #[test]
+    fn retry_reacquire_succeeds_on_the_first_attempt() {
+        let target = ScriptedReacquire::new(0);
+        let signal = InputFailureSignal::new();
+        // Two bus messages from the outage we are recovering from.
+        signal.raise();
+        signal.raise();
+        let running = AtomicBool::new(true);
+        let counters = fluxframe_core::metrics::Counters::new();
+        // Pretend the outage started 50 ms ago so `down_ms` is non-zero.
+        let started = Instant::now()
+            .checked_sub(Duration::from_millis(50))
+            .expect("monotonic clock is well past 50 ms since boot");
+
+        let generation = retry_reacquire(
+            &target,
+            &signal,
+            &running,
+            &counters,
+            policy(60_000, 1, 8),
+            started,
+            |_| panic!("a first-attempt success must never pause"),
+        )
+        .expect("recovery should succeed");
+
+        // The whole burst was raised before the attempt, so it is
+        // absorbed: the next worker loop must not treat it as new.
+        assert_eq!(generation, 2);
+        assert_eq!(generation, signal.generation());
+        assert_eq!(target.attempts.get(), 1);
+        let snap = counters.snapshot();
+        assert_eq!(snap.input_reacquire_total, 1);
+        assert_eq!(snap.input_reacquire_failures_total, 0);
+        assert!(snap.input_down_ms_total >= 50);
+    }
+
+    #[test]
+    fn retry_reacquire_succeeds_on_the_third_attempt_with_growing_backoff() {
+        let target = ScriptedReacquire::new(2);
+        let signal = InputFailureSignal::new();
+        let running = AtomicBool::new(true);
+        let counters = fluxframe_core::metrics::Counters::new();
+        let mut pauses: Vec<Duration> = Vec::new();
+
+        let generation = retry_reacquire(
+            &target,
+            &signal,
+            &running,
+            &counters,
+            policy(60_000, 1, 8),
+            Instant::now(),
+            |backoff| {
+                pauses.push(backoff);
+                false
+            },
+        )
+        .expect("third attempt should succeed");
+
+        assert_eq!(generation, 0);
+        assert_eq!(target.attempts.get(), 3);
+        // Two failed attempts → two paused waits, doubling from the base.
+        assert_eq!(
+            pauses,
+            vec![Duration::from_millis(1), Duration::from_millis(2)]
+        );
+        let snap = counters.snapshot();
+        assert_eq!(snap.input_reacquire_total, 3);
+        assert_eq!(snap.input_reacquire_failures_total, 2);
+    }
+
+    #[test]
+    fn retry_reacquire_backoff_doubles_up_to_the_ceiling() {
+        // Never succeeds; we stop it via `running` after six waits so the
+        // whole doubling curve is observable without a real sleep.
+        let target = ScriptedReacquire::new(usize::MAX);
+        let signal = InputFailureSignal::new();
+        let running = AtomicBool::new(true);
+        let counters = fluxframe_core::metrics::Counters::new();
+        let mut pauses: Vec<Duration> = Vec::new();
+
+        let result = retry_reacquire(
+            &target,
+            &signal,
+            &running,
+            &counters,
+            policy(60_000, 1, 8),
+            Instant::now(),
+            |backoff| {
+                pauses.push(backoff);
+                if pauses.len() >= 6 {
+                    running.store(false, Ordering::Release);
+                }
+                false
+            },
+        );
+
+        assert!(result.is_ok(), "stopping via `running` is not an error");
+        assert_eq!(
+            pauses,
+            vec![
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+                Duration::from_millis(4),
+                Duration::from_millis(8),
+                Duration::from_millis(8),
+                Duration::from_millis(8),
+            ]
+        );
+    }
+
+    #[test]
+    fn retry_reacquire_gives_up_when_the_budget_is_spent() {
+        let target = ScriptedReacquire::new(usize::MAX);
+        let signal = InputFailureSignal::new();
+        let running = AtomicBool::new(true);
+        let counters = fluxframe_core::metrics::Counters::new();
+
+        // A 20 ms budget with a 5 ms base: the loop really sleeps, but
+        // the whole test still finishes in tens of milliseconds.
+        let result = retry_reacquire(
+            &target,
+            &signal,
+            &running,
+            &counters,
+            policy(20, 5, 10),
+            Instant::now(),
+            |backoff| {
+                std::thread::sleep(backoff);
+                false
+            },
+        );
+
+        assert!(result.is_err(), "an exhausted budget must escalate");
+        let snap = counters.snapshot();
+        assert!(snap.input_reacquire_total >= 2);
+        assert_eq!(
+            snap.input_reacquire_total,
+            snap.input_reacquire_failures_total
+        );
+        // No success, so no completed outage was accounted.
+        assert_eq!(snap.input_down_ms_total, 0);
+    }
+
+    #[test]
+    fn retry_reacquire_returns_immediately_when_the_run_is_stopping() {
+        // Previously the loop only watched the process-wide Ctrl-C flag,
+        // so a run torn down through its own token sat here for the full
+        // recovery budget.
+        let target = ScriptedReacquire::new(usize::MAX);
+        let signal = InputFailureSignal::new();
+        signal.raise();
+        let running = AtomicBool::new(false);
+        let counters = fluxframe_core::metrics::Counters::new();
+
+        let generation = retry_reacquire(
+            &target,
+            &signal,
+            &running,
+            &counters,
+            policy(60_000, 1, 8),
+            Instant::now(),
+            |_| panic!("must not even attempt a reacquire"),
+        )
+        .expect("a stopping run exits cleanly");
+
+        assert_eq!(generation, 1);
+        assert_eq!(target.attempts.get(), 0);
+        assert_eq!(counters.snapshot().input_reacquire_total, 0);
+    }
+
+    #[test]
+    fn a_failure_raised_during_the_winning_attempt_is_not_absorbed() {
+        // The exact race the returned generation exists to close: the
+        // camera dies again while `reacquire()` is running. Snapshotting
+        // after the call would swallow it and leave the worker spinning
+        // on a `recv_timeout` that can never yield a frame.
+        let signal = InputFailureSignal::new();
+        signal.raise();
+        let raise_again = || signal.raise();
+        let target = ScriptedReacquire {
+            failures_before_success: 0,
+            attempts: std::cell::Cell::new(0),
+            during_attempt: Some(&raise_again),
+        };
+        let running = AtomicBool::new(true);
+        let counters = fluxframe_core::metrics::Counters::new();
+
+        let generation = retry_reacquire(
+            &target,
+            &signal,
+            &running,
+            &counters,
+            policy(60_000, 1, 8),
+            Instant::now(),
+            |_| false,
+        )
+        .expect("recovery should succeed");
+
+        assert_eq!(generation, 1, "snapshot is taken before the attempt");
+        assert_eq!(signal.generation(), 2);
+        // The supervisor's watch therefore trips and recovers again.
+        let watch = InputFailureWatch {
+            signal: &signal,
+            entry_generation: generation,
+        };
+        assert!(watch.tripped());
     }
 
     // --- reap_reload -------------------------------------------------

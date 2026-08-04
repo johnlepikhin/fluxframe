@@ -54,10 +54,13 @@ pub const MAX_LATENCY_MS: u32 = 10_000;
 /// ~83 %.  Operators who want the tick out of the way entirely can
 /// filter it by target: `level = "fluxframe=info,fluxframe::metrics=debug"`.
 ///
-/// Keep this at or below `LATENCY_WINDOW` frames' worth of wall time —
-/// see [`crate::metrics::LatencyHistogram`], whose ring is sized so one
-/// tick's percentiles cover a whole interval rather than only the last
-/// N frames.
+/// Invariant to preserve when tuning this: the per-stage
+/// [`crate::metrics::LatencyHistogram`] rings must hold at least
+/// `fps * metrics_interval_secs` samples, otherwise a tick's percentiles
+/// describe only the tail of the interval instead of the whole of it.
+/// The ring capacity is not a core constant — it is chosen by the
+/// runtime-metrics module in the `fluxframe-cli` crate, which owns the
+/// histograms; bump it there in step with any large increase here.
 pub const DEFAULT_METRICS_INTERVAL_SECS: u32 = 30;
 /// Default downscale factor applied to the output relative to input.
 /// `1.0` means "publish at exactly the input resolution"; `0.5` halves

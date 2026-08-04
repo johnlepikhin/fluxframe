@@ -217,10 +217,16 @@ impl OutputPipeline {
     /// there is nothing to subscribe to.
     ///
     /// The returned [`ConsumerWatch`] holds its own `dup(2)` of the
-    /// device fd, so it stays valid even if this pipeline is torn down
-    /// first. It reports on the node, not on this pipeline.
+    /// device fd, so it never dangles. But `dup` shares the open file
+    /// description: while the watch is alive the driver's
+    /// `v4l2_loopback_close()` does not run and the OUTPUT token stays
+    /// taken, so rebuilding the output pipeline would fail with
+    /// `EBUSY`. **Drop the watch before dropping this pipeline.**
     ///
     /// # Errors
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if the device fd is not
+    /// `O_NONBLOCK` (see [`ConsumerWatch::subscribe`]).
     ///
     /// Propagates the subscription failure. `ENOTTY` / `EINVAL` mean the
     /// driver predates `V4L2_EVENT_PRI_CLIENT_USAGE` (v4l2loopback

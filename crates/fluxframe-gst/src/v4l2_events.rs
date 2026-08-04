@@ -44,11 +44,21 @@
 //! This module is the reason the crate opts out of the workspace's
 //! `unsafe_code = "forbid"` (see the `[lints]` block in `Cargo.toml`,
 //! and the `#![deny(unsafe_code)]` in `lib.rs` that keeps the
-//! exemption scoped to this module). The unsafe surface is four
-//! things: the two ioctls, a `poll(2)`, and reading the event union
-//! through its byte view. The ioctl argument types are pinned by
-//! compile-time size assertions against the bindgen-generated structs,
-//! so a layout drift is a build error rather than a silent `ENOTTY`.
+//! exemption scoped to this module). There are six `unsafe` blocks,
+//! all of them single libc/ioctl calls:
+//!
+//! 1. `fcntl(fd, F_GETFL)` in [`ConsumerWatch::subscribe`], to verify
+//!    the descriptor is `O_NONBLOCK`.
+//! 2. `VIDIOC_SUBSCRIBE_EVENT` in [`ConsumerWatch::subscribe`].
+//! 3. `poll(2)` in [`ConsumerWatch::poll`].
+//! 4. `mem::zeroed::<v4l2_event>()` in `ConsumerWatch::dequeue`.
+//! 5. `VIDIOC_DQEVENT` in `ConsumerWatch::dequeue`.
+//! 6. Reading the event union through its byte view (`ev.u.data`) in
+//!    `ConsumerWatch::dequeue`.
+//!
+//! The ioctl argument types are pinned by compile-time size assertions
+//! against the bindgen-generated structs, so a layout drift is a build
+//! error rather than a silent `ENOTTY`.
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
@@ -72,7 +82,9 @@ const V4L2_EVENT_PRI_CLIENT_USAGE: u32 = V4L2_EVENT_PRIVATE_START + 0x08E0_0000 
 // encoding is reproduced here. It is shared by every architecture Linux
 // supports except alpha/mips/powerpc/sparc, none of which this crate
 // targets (the whole crate is `compile_error!`-gated to Linux and the
-// daemon ships on x86_64/aarch64).
+// daemon ships on x86_64/aarch64). The architectures that use a
+// different layout are rejected explicitly below rather than silently
+// building code that would issue the wrong ioctl.
 //
 // The size of the payload struct is part of the request number, so a
 // mismatched struct definition does not corrupt memory — it produces a
@@ -80,14 +92,40 @@ const V4L2_EVENT_PRI_CLIENT_USAGE: u32 = V4L2_EVENT_PRIVATE_START + 0x08E0_0000 
 // assertions below turn that silent-degradation failure mode into a
 // build error instead.
 
+#[cfg(any(
+    target_arch = "mips",
+    target_arch = "mips64",
+    target_arch = "powerpc",
+    target_arch = "powerpc64",
+    target_arch = "sparc",
+    target_arch = "sparc64"
+))]
+compile_error!(
+    "this module hard-codes the asm-generic ioctl encoding; mips/powerpc/sparc use a \
+     different direction-bit layout and would issue the wrong request number"
+);
+
 const IOC_NRSHIFT: u32 = 0;
 const IOC_TYPESHIFT: u32 = IOC_NRSHIFT + 8;
 const IOC_SIZESHIFT: u32 = IOC_TYPESHIFT + 8;
-const IOC_DIRSHIFT: u32 = IOC_SIZESHIFT + 14;
+const IOC_DIRSHIFT: u32 = IOC_SIZESHIFT + IOC_SIZEBITS;
 const IOC_WRITE: u32 = 1;
 const IOC_READ: u32 = 2;
 
+/// Number of bits the size field occupies in the request number.
+const IOC_SIZEBITS: u32 = 14;
+
+/// # Panics
+///
+/// Panics if `size` does not fit in the 14-bit size field: an oversized
+/// payload would overflow into the direction bits and silently produce a
+/// different — and wrong — request number. Every call site is a `const`,
+/// so this is a build error, not a runtime one.
 const fn ioc(dir: u32, ty: u32, nr: u32, size: usize) -> u64 {
+    assert!(
+        size < (1 << IOC_SIZEBITS),
+        "ioctl payload does not fit the 14-bit size field"
+    );
     ((dir as u64) << IOC_DIRSHIFT)
         | ((ty as u64) << IOC_TYPESHIFT)
         | ((nr as u64) << IOC_NRSHIFT)
@@ -122,6 +160,14 @@ const _: () = assert!(
     "unexpected v4l2_event_subscription layout: VIDIOC_SUBSCRIBE_EVENT would encode the wrong size"
 );
 
+/// Upper bound on `VIDIOC_DQEVENT` calls per [`ConsumerWatch::poll`].
+///
+/// The queue is normally at most one event deep (the driver collapses it
+/// via its `replace`/`merge` ops), so this only caps the pathological
+/// case where something else queues events on the shared file
+/// description faster than we drain them.
+const MAX_DRAIN: usize = 64;
+
 /// A capture-usage reading taken from the driver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientUsage {
@@ -140,12 +186,20 @@ impl ClientUsage {
 
 /// An armed `V4L2_EVENT_PRI_CLIENT_USAGE` subscription.
 ///
-/// Owns a `dup(2)` of the producer's fd rather than borrowing it. The
-/// original lives inside the output pipeline and is closed when that
-/// pipeline drops; a borrowed raw fd would let this watch outlive it and
-/// end up polling a descriptor the kernel has since handed to something
-/// else. `dup` also shares the underlying open file description, so it
-/// does not consume one of v4l2loopback's `max_openers` slots.
+/// Owns a `dup(2)` of the producer's fd rather than borrowing it: a
+/// borrowed raw fd would let this watch outlive the pipeline and end up
+/// polling a descriptor the kernel has since handed to something else.
+///
+/// `dup` shares the underlying *open file description*, so the watch
+/// costs no extra `max_openers` slot — but it also **prolongs the life
+/// of that description**. As long as a `ConsumerWatch` exists,
+/// `v4l2_loopback_close()` does not run and the OUTPUT token is not
+/// released, so rebuilding the output pipeline would fail with `EBUSY`.
+/// A `ConsumerWatch` must therefore be dropped *before* the
+/// `OutputPipeline` it was subscribed on.
+///
+/// Sharing the file status flags is also why `O_NONBLOCK` cannot be set
+/// on the duplicate independently — see [`ConsumerWatch::subscribe`].
 #[derive(Debug)]
 pub struct ConsumerWatch {
     fd: OwnedFd,
@@ -161,14 +215,44 @@ impl ConsumerWatch {
     /// this returns — the watch does not keep `fd` alive, it keeps its
     /// own duplicate.
     ///
+    /// # Requirements
+    ///
+    /// **`fd` must already be open with `O_NONBLOCK`.** The kernel's
+    /// `v4l2_event_dequeue()` blocks in `wait_event_interruptible()`
+    /// instead of returning `ENOENT` when the file is not non-blocking,
+    /// which would wedge the drain loop in [`poll`](Self::poll)
+    /// forever — and, because the detector thread is joined on drop,
+    /// deadlock shutdown. `dup(2)` shares file status flags with the
+    /// original, so this cannot be fixed up locally; it is checked and
+    /// rejected instead. (`v4l::Device::with_path` does open with
+    /// `O_NONBLOCK`, but that is an implementation detail of another
+    /// crate, hence the explicit check.)
+    ///
     /// # Errors
     ///
-    /// Returns the OS error if `dup` or `VIDIOC_SUBSCRIBE_EVENT` fails.
-    /// `ENOTTY` / `EINVAL` mean the node does not implement the event
-    /// (a non-loopback sink, or v4l2loopback older than 0.13) and the
-    /// caller should fall back to a heuristic detector.
+    /// Returns the OS error if `dup`, `fcntl(F_GETFL)` or
+    /// `VIDIOC_SUBSCRIBE_EVENT` fails. `EINVAL` with
+    /// [`io::ErrorKind::InvalidInput`] means `fd` is a blocking
+    /// descriptor (see above). `ENOTTY` / `EINVAL` from the ioctl mean
+    /// the node does not implement the event (a non-loopback sink, or
+    /// v4l2loopback older than 0.13) and the caller should fall back to
+    /// a heuristic detector.
     pub fn subscribe(fd: BorrowedFd<'_>) -> io::Result<Self> {
         let owned = fd.try_clone_to_owned()?;
+
+        // SAFETY: `owned` is a live descriptor; `F_GETFL` takes no
+        // argument and only reads the file status flags.
+        let flags = unsafe { libc::fcntl(owned.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if flags & libc::O_NONBLOCK == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "loopback fd is not O_NONBLOCK; VIDIOC_DQEVENT would block forever \
+                 instead of reporting an empty queue",
+            ));
+        }
 
         let mut sub = v4l2_event_subscription {
             type_: V4L2_EVENT_PRI_CLIENT_USAGE,
@@ -208,7 +292,7 @@ impl ConsumerWatch {
     /// (device removed, module unloaded) or if `VIDIOC_DQEVENT` fails
     /// for a reason other than "queue empty". Either way the
     /// subscription is dead and the caller must fall back; retrying
-    /// would spin, because `poll` returns immediately on a errored fd.
+    /// would spin, because `poll` returns immediately on an errored fd.
     pub fn poll(&self, timeout_ms: i32) -> io::Result<Option<ClientUsage>> {
         let mut pfd = libc::pollfd {
             fd: self.fd.as_raw_fd(),
@@ -230,14 +314,26 @@ impl ConsumerWatch {
             return Ok(None);
         }
         if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-            return Err(io::Error::other(format!(
-                "loopback event fd is no longer usable (revents={:#x})",
-                pfd.revents
-            )));
+            // `ENODEV` so the caller can tell "the node went away" from
+            // any other I/O failure via `raw_os_error()`; the raw
+            // `revents` stays in the message for diagnostics.
+            let err = io::Error::from_raw_os_error(libc::ENODEV);
+            tracing::debug!(
+                revents = format_args!("{:#x}", pfd.revents),
+                "loopback event fd is no longer usable"
+            );
+            return Err(err);
         }
 
         let mut latest = None;
-        loop {
+        // Bounded drain (see `MAX_DRAIN`). The driver's `replace`/`merge` ops collapse the
+        // queue to a single usage event, so one or two iterations is the
+        // realistic case; the cap only exists so that a foreign producer
+        // queueing events on the shared file description faster than we
+        // dequeue cannot pin this call — and therefore the detector
+        // thread's join in `Drop` — indefinitely. Whatever we have read
+        // by then is returned; the rest is picked up by the next `poll`.
+        for _ in 0..MAX_DRAIN {
             match self.dequeue()? {
                 Dequeued::Usage(usage) => latest = Some(usage),
                 // Keep draining: stopping on a foreign event would leave
@@ -247,9 +343,21 @@ impl ConsumerWatch {
                 Dequeued::Empty => return Ok(latest),
             }
         }
+        tracing::debug!(
+            max_drain = MAX_DRAIN,
+            "event queue still non-empty after the drain cap; resuming on the next poll"
+        );
+        Ok(latest)
     }
 
     /// Dequeue exactly one event from the driver's queue.
+    ///
+    /// Relies on the descriptor being `O_NONBLOCK` (enforced in
+    /// [`subscribe`](Self::subscribe)): the kernel's
+    /// `v4l2_event_dequeue()` only reports the empty queue as
+    /// `EAGAIN`/`ENOENT` for non-blocking files, and otherwise sleeps in
+    /// `wait_event_interruptible()` — which would turn the terminating
+    /// drain call in [`poll`](Self::poll) into an unbounded block.
     fn dequeue(&self) -> io::Result<Dequeued> {
         // Zeroed rather than uninitialised: `VIDIOC_DQEVENT` is `_IOR`,
         // so the kernel fills the struct, but zeroing keeps the value
@@ -280,7 +388,14 @@ impl ConsumerWatch {
         }
         if ev.type_ != V4L2_EVENT_PRI_CLIENT_USAGE {
             // We never subscribe to anything else, but the event queue
-            // belongs to the file handle and is shared in principle.
+            // belongs to the file handle and is shared in principle —
+            // log it, because draining it here means whoever did
+            // subscribe will never see it.
+            tracing::debug!(
+                event_type = format_args!("{:#x}", ev.type_),
+                event_id = ev.id,
+                "discarding a foreign V4L2 event while draining the usage queue"
+            );
             return Ok(Dequeued::Other);
         }
         // Read the payload out of the union's raw byte view rather than

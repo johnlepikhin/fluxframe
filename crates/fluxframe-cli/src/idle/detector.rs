@@ -160,7 +160,7 @@ use std::time::{Duration, Instant};
 
 use fluxframe_core::{Counters, IdlePresenceSource};
 use fluxframe_gst::output::OutputSink;
-use fluxframe_gst::v4l2_events::ConsumerWatch;
+use fluxframe_gst::v4l2_events::{ClientUsage, ConsumerWatch};
 use tracing::{debug, info, warn};
 
 use super::state::ConsumerStatus;
@@ -226,12 +226,17 @@ pub(crate) trait UsageSource {
     /// `Ok(None)` means the wait expired with nothing new — not "no
     /// consumer". `Err` means the subscription is dead and the caller
     /// must stop using this source.
-    fn wait(&mut self, timeout_ms: i32) -> io::Result<Option<u32>>;
+    ///
+    /// Yields the driver's [`ClientUsage`] unchanged rather than a bare
+    /// count: the "is anybody streaming" rule belongs to that type
+    /// ([`ClientUsage::attached`]), and re-deriving it here would fork
+    /// the same domain rule across two crates.
+    fn wait(&mut self, timeout_ms: i32) -> io::Result<Option<ClientUsage>>;
 }
 
-impl UsageSource for fluxframe_gst::v4l2_events::ConsumerWatch {
-    fn wait(&mut self, timeout_ms: i32) -> io::Result<Option<u32>> {
-        Ok(self.poll(timeout_ms)?.map(|usage| usage.count))
+impl UsageSource for ConsumerWatch {
+    fn wait(&mut self, timeout_ms: i32) -> io::Result<Option<ClientUsage>> {
+        self.poll(timeout_ms)
     }
 }
 
@@ -564,6 +569,36 @@ pub(crate) struct DetectorParams {
     pub(crate) stale_balance_after: Duration,
 }
 
+/// The shared handles the detector thread reports *through*, as opposed
+/// to the [`DetectorParams`] that say what to watch.
+///
+/// Bundled for the same reason as `DetectorParams`: `running` and
+/// `stopped` are both `Arc<AtomicBool>` and a transposed pair would
+/// compile silently while inverting the shutdown logic.
+struct DetectorHandles {
+    /// The supervisor's shared Ctrl-C flag. Clearing it stops the thread.
+    running: Arc<AtomicBool>,
+    /// Where the detector publishes its [`ConsumerStatus`].
+    status: Arc<AtomicU8>,
+    /// Drop-only kill signal owned by [`ConsumerDetector`].
+    stopped: Arc<AtomicBool>,
+    /// Process-wide metrics.
+    counters: Arc<Counters>,
+}
+
+/// Injection points that production code fixes to constants and only
+/// tests vary. Kept off [`DetectorParams`] so test-only knobs never leak
+/// into the type the supervisor constructs.
+pub(crate) struct DetectorTestKnobs {
+    /// `/proc` in production; a tempdir in the walk tests.
+    proc_root: PathBuf,
+    /// [`RESTAT_INTERVAL_POLLS`] in production.
+    restat_interval_polls: u32,
+    /// Per-detector activation counter for the inotify path.
+    #[cfg(test)]
+    inotify_activations: Arc<AtomicU64>,
+}
+
 impl ConsumerDetector {
     /// Spawn the detector thread. The thread watches the device via
     /// inotify; the `poll_interval` is used only by the
@@ -586,73 +621,45 @@ impl ConsumerDetector {
         counters: Arc<Counters>,
         watch: Option<ConsumerWatch>,
     ) -> Self {
-        Self::spawn_with_proc_root(
+        Self::spawn_with_knobs(
             params,
-            PathBuf::from("/proc"),
+            DetectorTestKnobs {
+                proc_root: PathBuf::from("/proc"),
+                restat_interval_polls: RESTAT_INTERVAL_POLLS,
+                #[cfg(test)]
+                inotify_activations: Arc::new(AtomicU64::new(0)),
+            },
             running,
-            RESTAT_INTERVAL_POLLS,
             counters,
             watch,
-            #[cfg(test)]
-            Arc::new(AtomicU64::new(0)),
         )
     }
 
-    /// Test-only constructor that lets tests inject a tempdir as
+    /// Test-oriented constructor that lets tests inject a tempdir as
     /// `/proc`, tune the re-arm cadence, and observe how often the
     /// inotify path activated. Production code uses [`Self::spawn`]
     /// which fixes the defaults.
-    // `too_many_arguments` fires only in the test build (the extra
-    // `inotify_activations` arg is `#[cfg(test)]`), so `allow` rather
-    // than `expect` — the latter would be unfulfilled in non-test builds.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "test-seam constructor: the extra knobs (proc root, re-arm cadence, \
-                  activation counter) exist only so tests can drive the detector; \
-                  folding them into DetectorParams would push test-only fields into \
-                  the production type"
-    )]
-    pub(crate) fn spawn_with_proc_root(
+    pub(crate) fn spawn_with_knobs(
         params: DetectorParams,
-        proc_root: PathBuf,
+        knobs: DetectorTestKnobs,
         running: Arc<AtomicBool>,
-        restat_interval_polls: u32,
         counters: Arc<Counters>,
         watch: Option<ConsumerWatch>,
-        #[cfg(test)] inotify_activations: Arc<AtomicU64>,
     ) -> Self {
-        let DetectorParams {
-            device_path,
-            my_pid,
-            poll_interval,
-            mode,
-            stale_balance_after,
-        } = params;
         let status = Arc::new(AtomicU8::new(ConsumerStatus::Unknown.as_u8()));
         let stopped = Arc::new(AtomicBool::new(false));
-        let status_for_thread = Arc::clone(&status);
-        let stopped_for_thread = Arc::clone(&stopped);
         #[cfg(test)]
-        let activations_for_thread = Arc::clone(&inotify_activations);
+        let inotify_activations = Arc::clone(&knobs.inotify_activations);
+        let handles = DetectorHandles {
+            running,
+            status: Arc::clone(&status),
+            stopped: Arc::clone(&stopped),
+            counters,
+        };
         let handle = thread::Builder::new()
             .name("fluxframe-detector".into())
             .spawn(move || {
-                run_detector(
-                    device_path,
-                    proc_root,
-                    my_pid,
-                    poll_interval,
-                    running,
-                    status_for_thread,
-                    stopped_for_thread,
-                    restat_interval_polls,
-                    counters,
-                    mode,
-                    watch,
-                    stale_balance_after,
-                    #[cfg(test)]
-                    activations_for_thread,
-                );
+                run_detector(params, handles, knobs, watch);
             })
             .expect("spawn detector thread");
         Self {
@@ -742,28 +749,36 @@ fn publish_if_changed(
     *last_status = Some(new_status);
 }
 
-#[allow(
-    clippy::needless_pass_by_value,
-    clippy::too_many_arguments,
-    reason = "thread entry-point: values are moved into the spawned thread on construction; \
-              taking them by reference would require lifetime gymnastics across the thread \
-              boundary, and bundling the owned values into a struct here only adds noise"
-)]
+/// Detector thread entry point. Owns everything it was handed (the
+/// bundles are moved across the thread boundary) and destructures them
+/// exactly once, here, so no call site ever has to keep a dozen
+/// same-typed positional arguments in the right order.
 fn run_detector(
-    device_path: PathBuf,
-    proc_root: PathBuf,
-    my_pid: u32,
-    poll_interval: Duration,
-    running: Arc<AtomicBool>,
-    status: Arc<AtomicU8>,
-    stopped: Arc<AtomicBool>,
-    restat_interval_polls: u32,
-    counters: Arc<Counters>,
-    mode: IdlePresenceSource,
+    params: DetectorParams,
+    handles: DetectorHandles,
+    knobs: DetectorTestKnobs,
     watch: Option<ConsumerWatch>,
-    stale_balance_after: Duration,
-    #[cfg(test)] inotify_activations: Arc<AtomicU64>,
 ) {
+    let DetectorParams {
+        device_path,
+        my_pid,
+        poll_interval,
+        mode,
+        stale_balance_after,
+    } = params;
+    let DetectorHandles {
+        running,
+        status,
+        stopped,
+        counters,
+    } = handles;
+    let DetectorTestKnobs {
+        proc_root,
+        restat_interval_polls,
+        #[cfg(test)]
+        inotify_activations,
+    } = knobs;
+
     // Resolved once outside the loop — `file_name()` allocates `OsStr`
     // borrows from the underlying PathBuf and we want to avoid the
     // walk-time path manipulation.
@@ -923,7 +938,7 @@ fn run_heuristic_detector(
     ctx: &DetectorContext<'_>,
     state: &mut DetectorState<'_>,
 ) {
-    if let Some(exit) = run_detector_inotify(device_path, ctx, state).err() {
+    if let Err(exit) = run_detector_inotify(device_path, ctx, state) {
         match &exit {
             DetectorExit::WatchRemoved => warn!(
                 target: "fluxframe::idle",
@@ -956,10 +971,11 @@ fn park_until_stopped(ctx: &DetectorContext<'_>) {
 
 /// Drive the detector from absolute kernel capture-usage readings.
 ///
-/// The whole loop is three lines of logic because the signal needs no
-/// interpretation: the driver reports whether a capture client is
-/// streaming, and we publish that. No balance to accumulate, no `/proc`
-/// to walk, and therefore no way to drift into a latched verdict.
+/// The loop does not interpret the signal: it takes each reading the
+/// driver hands it, asks the reading itself whether a capture client is
+/// streaming ([`ClientUsage::attached`]), and publishes that. No balance
+/// to accumulate, no `/proc` to walk, and therefore no way to drift into
+/// a latched verdict.
 ///
 /// Blocks in `wait` for at most [`SHUTDOWN_POLL_GRANULARITY`] so the
 /// thread stays responsive to `running` / `stopped` — the handle's
@@ -986,18 +1002,18 @@ fn run_detector_client_usage<S: UsageSource>(
     );
 
     while ctx.running.load(Ordering::Acquire) && !ctx.stopped.load(Ordering::Acquire) {
-        let Some(count) = source.wait(timeout_ms)? else {
+        let Some(usage) = source.wait(timeout_ms)? else {
             continue;
         };
-        ctx.counters.set_consumer_clients(u64::from(count));
-        let status = if count > 0 {
+        ctx.counters.set_consumer_clients(u64::from(usage.count));
+        let status = if usage.attached() {
             ConsumerStatus::Present
         } else {
             ConsumerStatus::Absent
         };
         debug!(
             target: "fluxframe::idle",
-            count,
+            count = usage.count,
             ?status,
             "client-usage event"
         );
@@ -1494,40 +1510,63 @@ mod tests {
     /// Scripted [`UsageSource`] standing in for a real v4l2loopback
     /// subscription, which needs a live device fd no unit test has.
     ///
-    /// Yields each scripted reading once, then blocks forever from the
-    /// loop's point of view by reporting "nothing new" — mirroring a
-    /// quiet device rather than ending the loop, so a test can assert on
-    /// the *last* published status.
-    struct FakeUsage {
-        script: std::collections::VecDeque<io::Result<Option<u32>>>,
+    /// Yields each scripted reading once. When the script runs out it
+    /// flips the detector's `stopped` flag and reports "nothing new", so
+    /// the loop exits deterministically after consuming exactly the
+    /// script — no sleeps, no timer to race — and the test can assert on
+    /// the last published status and the resulting counters.
+    struct FakeUsage<'a> {
+        script: std::collections::VecDeque<io::Result<Option<ClientUsage>>>,
+        stopped: &'a AtomicBool,
     }
 
-    impl FakeUsage {
-        fn new(script: Vec<io::Result<Option<u32>>>) -> Self {
+    impl<'a> FakeUsage<'a> {
+        fn new(script: Vec<io::Result<Option<ClientUsage>>>, stopped: &'a AtomicBool) -> Self {
             Self {
                 script: script.into(),
+                stopped,
             }
         }
     }
 
-    impl UsageSource for FakeUsage {
-        fn wait(&mut self, _timeout_ms: i32) -> io::Result<Option<u32>> {
-            self.script.pop_front().unwrap_or(Ok(None))
+    impl UsageSource for FakeUsage<'_> {
+        fn wait(&mut self, _timeout_ms: i32) -> io::Result<Option<ClientUsage>> {
+            let Some(reading) = self.script.pop_front() else {
+                self.stopped.store(true, Ordering::Release);
+                return Ok(None);
+            };
+            reading
         }
     }
 
+    /// Build a scripted reading with the given client count.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the Result/Option wrapper is the point: scripts mix readings with \
+                  Ok(None) timeouts and Err subscription deaths"
+    )]
+    fn usage(count: u32) -> io::Result<Option<ClientUsage>> {
+        Ok(Some(ClientUsage { count }))
+    }
+
+    /// What one scripted client-usage run produced: the last published
+    /// status, the loop's own result, and the metrics snapshot. The
+    /// counters matter as much as the status — `set_consumer_status` is
+    /// documented as "call only on an actual change", so
+    /// `consumer_transitions_total` is what pins de-duplication.
+    struct ClientUsageRun {
+        last_status: Option<ConsumerStatus>,
+        result: io::Result<()>,
+        counters: fluxframe_core::CounterValues,
+    }
+
     /// Run the client-usage loop against a scripted source until the
-    /// script is exhausted, then stop it. Returns the last published
-    /// status and the loop's own result.
-    fn drive_client_usage(
-        script: Vec<io::Result<Option<u32>>>,
-    ) -> (Option<ConsumerStatus>, io::Result<()>) {
-        let script_len = script.len();
+    /// script is exhausted, then stop it.
+    fn drive_client_usage(script: Vec<io::Result<Option<ClientUsage>>>) -> ClientUsageRun {
         let running = AtomicBool::new(true);
         let status = AtomicU8::new(ConsumerStatus::Unknown.as_u8());
-        // Stop after the script is consumed: `stopped` is checked once
-        // per iteration, so allowing exactly `script_len` iterations
-        // drains it and exits deterministically — no sleeps, no flake.
+        // `FakeUsage` sets this once the script is drained, so the loop
+        // exits deterministically after consuming exactly the script.
         let stopped = AtomicBool::new(false);
         let counters = Counters::new();
         let device_basename = OsString::from("video10");
@@ -1555,72 +1594,82 @@ mod tests {
             presence: &mut presence,
         };
 
-        let mut source = CountingFake {
-            inner: FakeUsage::new(script),
-            remaining: script_len,
-            stopped: &stopped,
-        };
+        let mut source = FakeUsage::new(script, &stopped);
         let result = run_detector_client_usage(&mut source, &ctx, &mut state);
-        (last_status, result)
-    }
-
-    /// Wraps [`FakeUsage`] so the loop terminates once the script is
-    /// drained, without the test having to race a timer.
-    struct CountingFake<'a> {
-        inner: FakeUsage,
-        remaining: usize,
-        stopped: &'a AtomicBool,
-    }
-
-    impl UsageSource for CountingFake<'_> {
-        fn wait(&mut self, timeout_ms: i32) -> io::Result<Option<u32>> {
-            let out = self.inner.wait(timeout_ms);
-            self.remaining = self.remaining.saturating_sub(1);
-            if self.remaining == 0 {
-                self.stopped.store(true, Ordering::Release);
-            }
-            out
+        ClientUsageRun {
+            last_status,
+            result,
+            counters: counters.snapshot(),
         }
     }
 
     #[test]
     fn client_usage_zero_means_absent() {
-        let (status, result) = drive_client_usage(vec![Ok(Some(0))]);
-        assert!(result.is_ok());
-        assert_eq!(status, Some(ConsumerStatus::Absent));
+        let run = drive_client_usage(vec![usage(0)]);
+        assert!(run.result.is_ok());
+        assert_eq!(run.last_status, Some(ConsumerStatus::Absent));
+        assert_eq!(run.counters.consumer_clients, 0);
     }
 
     #[test]
     fn client_usage_nonzero_means_present() {
-        let (status, result) = drive_client_usage(vec![Ok(Some(1))]);
-        assert!(result.is_ok());
-        assert_eq!(status, Some(ConsumerStatus::Present));
+        let run = drive_client_usage(vec![usage(1)]);
+        assert!(run.result.is_ok());
+        assert_eq!(run.last_status, Some(ConsumerStatus::Present));
+        assert_eq!(run.counters.consumer_clients, 1);
     }
 
     #[test]
     fn client_usage_counts_above_one_still_mean_present() {
         // v4l2loopback 0.15 reports 0/1, but the field is a `count` and
         // a future driver may report a real client count.
-        let (status, result) = drive_client_usage(vec![Ok(Some(3))]);
-        assert!(result.is_ok());
-        assert_eq!(status, Some(ConsumerStatus::Present));
+        let run = drive_client_usage(vec![usage(3)]);
+        assert!(run.result.is_ok());
+        assert_eq!(run.last_status, Some(ConsumerStatus::Present));
+        assert_eq!(
+            run.counters.consumer_clients, 3,
+            "the gauge carries the raw count, not the boolean"
+        );
     }
 
     #[test]
     fn client_usage_tracks_transitions_in_order() {
-        let (status, result) =
-            drive_client_usage(vec![Ok(Some(1)), Ok(Some(1)), Ok(Some(0)), Ok(Some(1))]);
-        assert!(result.is_ok());
-        assert_eq!(status, Some(ConsumerStatus::Present));
+        // Unknown → Present → (repeat, no-op) → Absent → Present.
+        // The transition counter is what distinguishes "processed every
+        // reading in order" from "only looked at the last one": the end
+        // status alone is identical for `[1]` and `[1, 1, 0, 1]`.
+        let run = drive_client_usage(vec![usage(1), usage(1), usage(0), usage(1)]);
+        assert!(run.result.is_ok());
+        assert_eq!(run.last_status, Some(ConsumerStatus::Present));
+        assert_eq!(
+            run.counters.consumer_transitions_total, 3,
+            "three actual changes; the repeated `1` must not be published twice"
+        );
+        assert_eq!(run.counters.consumer_clients, 1);
+    }
+
+    #[test]
+    fn client_usage_deduplicates_repeated_readings() {
+        // Same terminal status as the script above, but only one change:
+        // `set_consumer_status` is documented as "call only on an actual
+        // change", so a repeat must not bump the transition counter.
+        let run = drive_client_usage(vec![usage(1), usage(1)]);
+        assert!(run.result.is_ok());
+        assert_eq!(run.last_status, Some(ConsumerStatus::Present));
+        assert_eq!(run.counters.consumer_transitions_total, 1);
     }
 
     #[test]
     fn client_usage_timeout_does_not_change_the_verdict() {
         // `Ok(None)` is "nothing new", NOT "no consumer" — conflating
         // the two would tear the camera down on a quiet device.
-        let (status, result) = drive_client_usage(vec![Ok(Some(1)), Ok(None), Ok(None)]);
-        assert!(result.is_ok());
-        assert_eq!(status, Some(ConsumerStatus::Present));
+        let run = drive_client_usage(vec![usage(1), Ok(None), Ok(None)]);
+        assert!(run.result.is_ok());
+        assert_eq!(run.last_status, Some(ConsumerStatus::Present));
+        assert_eq!(
+            run.counters.consumer_transitions_total, 1,
+            "a timeout is not a transition"
+        );
     }
 
     #[test]
@@ -1628,9 +1677,13 @@ mod tests {
         // Before any event the status must remain `Unknown`, which the
         // state machine treats as "present" — idle must never engage on
         // an assumption.
-        let (status, result) = drive_client_usage(vec![Ok(None)]);
-        assert!(result.is_ok());
-        assert_eq!(status, None, "no verdict may be published without evidence");
+        let run = drive_client_usage(vec![Ok(None)]);
+        assert!(run.result.is_ok());
+        assert_eq!(
+            run.last_status, None,
+            "no verdict may be published without evidence"
+        );
+        assert_eq!(run.counters.consumer_transitions_total, 0);
     }
 
     #[test]
@@ -1641,8 +1694,8 @@ mod tests {
         // unloaded or the node disappears. Spelled numerically because
         // this crate does not depend on `libc`.
         const ENODEV: i32 = 19;
-        let (_, result) = drive_client_usage(vec![Err(io::Error::from_raw_os_error(ENODEV))]);
-        let err = result.expect_err("a dead subscription must surface");
+        let run = drive_client_usage(vec![Err(io::Error::from_raw_os_error(ENODEV))]);
+        let err = run.result.expect_err("a dead subscription must surface");
         assert_eq!(err.raw_os_error(), Some(ENODEV));
     }
 
@@ -2090,7 +2143,7 @@ mod tests {
         // per-detector activations counter is checked at end-of-test
         // to confirm the inotify path never activated.
         let activations = Arc::new(AtomicU64::new(0));
-        let detector = ConsumerDetector::spawn_with_proc_root(
+        let detector = ConsumerDetector::spawn_with_knobs(
             DetectorParams {
                 device_path: PathBuf::from("/dev/this-device-does-not-exist"),
                 my_pid: 9999,
@@ -2098,12 +2151,14 @@ mod tests {
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
             },
-            proc_root.clone(),
+            DetectorTestKnobs {
+                proc_root: proc_root.clone(),
+                restat_interval_polls: RESTAT_INTERVAL_POLLS,
+                inotify_activations: Arc::clone(&activations),
+            },
             Arc::clone(&running),
-            RESTAT_INTERVAL_POLLS,
             Arc::new(Counters::new()),
             None,
-            Arc::clone(&activations),
         );
         let status = detector.status_handle();
 
@@ -2149,7 +2204,7 @@ mod tests {
     fn shutdown_completes_quickly_even_with_long_poll_interval() {
         let dir = tempfile::tempdir().expect("tempdir");
         let running = Arc::new(AtomicBool::new(true));
-        let detector = ConsumerDetector::spawn_with_proc_root(
+        let detector = ConsumerDetector::spawn_with_knobs(
             DetectorParams {
                 device_path: PathBuf::from("/dev/video10"),
                 my_pid: 9999,
@@ -2157,12 +2212,14 @@ mod tests {
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
             },
-            dir.path().to_path_buf(),
+            DetectorTestKnobs {
+                proc_root: dir.path().to_path_buf(),
+                restat_interval_polls: RESTAT_INTERVAL_POLLS,
+                inotify_activations: Arc::new(AtomicU64::new(0)),
+            },
             Arc::clone(&running),
-            RESTAT_INTERVAL_POLLS,
             Arc::new(Counters::new()),
             None,
-            Arc::new(AtomicU64::new(0)),
         );
 
         // Wait briefly to ensure the detector entered its sleep loop.
@@ -2221,7 +2278,7 @@ mod tests {
     #[test]
     fn run_detector_rearms_log_flag_at_restat_boundary() {
         let running = Arc::new(AtomicBool::new(true));
-        let detector = ConsumerDetector::spawn_with_proc_root(
+        let detector = ConsumerDetector::spawn_with_knobs(
             DetectorParams {
                 device_path: PathBuf::from("/dev/video10"),
                 my_pid: 9999,
@@ -2229,12 +2286,14 @@ mod tests {
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
             },
-            PathBuf::from("/no/such/proc/path"),
+            DetectorTestKnobs {
+                proc_root: PathBuf::from("/no/such/proc/path"),
+                restat_interval_polls: 1, // rearm on EVERY poll
+                inotify_activations: Arc::new(AtomicU64::new(0)),
+            },
             Arc::clone(&running),
-            1, // rearm on EVERY poll
             Arc::new(Counters::new()),
             None,
-            Arc::new(AtomicU64::new(0)),
         );
         let status = detector.status_handle();
 
@@ -2294,7 +2353,7 @@ mod tests {
         make_proc_entry(&proc_root, 1234, 3, &device_path);
 
         let running = Arc::new(AtomicBool::new(true));
-        let detector = ConsumerDetector::spawn_with_proc_root(
+        let detector = ConsumerDetector::spawn_with_knobs(
             DetectorParams {
                 device_path: device_path.clone(),
                 my_pid: 9999,
@@ -2302,12 +2361,14 @@ mod tests {
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
             },
-            proc_root.clone(),
+            DetectorTestKnobs {
+                proc_root: proc_root.clone(),
+                restat_interval_polls: RESTAT_INTERVAL_POLLS,
+                inotify_activations: Arc::new(AtomicU64::new(0)),
+            },
             Arc::clone(&running),
-            RESTAT_INTERVAL_POLLS,
             Arc::new(Counters::new()),
             None,
-            Arc::new(AtomicU64::new(0)),
         );
         let status = detector.status_handle();
         // Per-detector activation counter — no global, no cross-test race.
@@ -2379,7 +2440,7 @@ mod tests {
         let device_path = device.path().to_path_buf();
 
         let running = Arc::new(AtomicBool::new(true));
-        let detector = ConsumerDetector::spawn_with_proc_root(
+        let detector = ConsumerDetector::spawn_with_knobs(
             DetectorParams {
                 device_path: device_path.clone(),
                 my_pid: 9999,
@@ -2387,12 +2448,14 @@ mod tests {
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
             },
-            proc_root.clone(),
+            DetectorTestKnobs {
+                proc_root: proc_root.clone(),
+                restat_interval_polls: RESTAT_INTERVAL_POLLS,
+                inotify_activations: Arc::new(AtomicU64::new(0)),
+            },
             Arc::clone(&running),
-            RESTAT_INTERVAL_POLLS,
             Arc::new(Counters::new()),
             None,
-            Arc::new(AtomicU64::new(0)),
         );
         let status = detector.status_handle();
 
@@ -2443,7 +2506,7 @@ mod tests {
         make_proc_entry(&proc_root, 1234, 3, &device_path);
 
         let running = Arc::new(AtomicBool::new(true));
-        let detector = ConsumerDetector::spawn_with_proc_root(
+        let detector = ConsumerDetector::spawn_with_knobs(
             DetectorParams {
                 device_path: device_path.clone(),
                 my_pid: 9999,
@@ -2451,12 +2514,14 @@ mod tests {
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
             },
-            proc_root.clone(),
+            DetectorTestKnobs {
+                proc_root: proc_root.clone(),
+                restat_interval_polls: RESTAT_INTERVAL_POLLS,
+                inotify_activations: Arc::new(AtomicU64::new(0)),
+            },
             Arc::clone(&running),
-            RESTAT_INTERVAL_POLLS,
             Arc::new(Counters::new()),
             None,
-            Arc::new(AtomicU64::new(0)),
         );
         let status = detector.status_handle();
 

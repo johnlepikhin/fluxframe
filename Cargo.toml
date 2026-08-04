@@ -44,7 +44,17 @@ rayon = "1"
 # `v4l2sink` for OUTPUT has an unimplemented `io-mode=rw` and only
 # offers MMAP, which races against the consumer; see
 # <https://github.com/umlaeute/v4l2loopback/issues/191>).
-v4l = "0.14"
+#
+# Features are pinned explicitly instead of riding on `v4l`'s defaults.
+# `v4l2` selects the `v4l2-sys` backend, which is what re-exports
+# `v4l::v4l_sys` — the module `fluxframe-gst::v4l2_events` imports for
+# its raw event ioctls.  The alternative `libv4l` backend re-exports a
+# different sys crate whose structs have different layouts, and the
+# V4L2 ioctl request numbers encode the struct size, so silently
+# switching backends would not fail to compile in every case — it would
+# issue the wrong ioctl.  `default-features = false` + explicit `v4l2`
+# is byte-for-byte equivalent to today's defaults, but pins the choice.
+v4l = { version = "0.14", default-features = false, features = ["v4l2"] }
 # Safe cross-platform GPU API.  Stage 7 uses it to run the box-blur
 # stage on the Intel iGPU via Vulkan compute shaders.  Pinned to the
 # minor version because wgpu still ships breaking API changes between
