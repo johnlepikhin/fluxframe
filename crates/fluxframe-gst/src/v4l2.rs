@@ -132,6 +132,98 @@ pub fn enumerate_devices_status_in(sys_root: &Path, dev_root: &Path) -> Enumerat
     EnumerationStatus::Found(out)
 }
 
+/// What v4l2loopback's `state` attribute says about the **producer**.
+///
+/// The attribute's wording is the driver's, and it is the opposite of
+/// what it looks like: `attr_show_state` prints `"capture"` when the
+/// OUTPUT stream token is taken (somebody is writing frames, so the node
+/// can be captured from) and `"output"` when it is free (nobody is
+/// writing). It says nothing about capture-side clients — assuming
+/// otherwise is what made the Stage 15 presence detector pin itself to
+/// "consumer present" forever, and that mistake must not be repeated
+/// here.
+///
+/// `#[non_exhaustive]` for the same reason as [`EnumerationStatus`]: the
+/// "could not tell" cases are load-bearing and may need to grow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LoopbackState {
+    /// The producer holds the OUTPUT stream (attribute reads `capture`).
+    ///
+    /// Also what a node loaded with `keep_format=1` reports permanently,
+    /// which is one reason idle mode is unsupported in that mode.
+    ProducerStreaming,
+    /// Nobody is writing to the node (attribute reads `output`).
+    ///
+    /// Every capture client's `VIDIOC_STREAMON` fails with `EIO` while
+    /// this holds, so for a daemon that believes it is publishing frames
+    /// this is an internal fault, not an observation about consumers.
+    ProducerStopped,
+    /// The attribute could not be read: no such node, not a
+    /// v4l2loopback device, a device path that is not a `videoN` name,
+    /// or a permission failure. Never an assertion about the stream.
+    Unreadable(io::ErrorKind),
+    /// The attribute was read but held something this driver version
+    /// does not define.
+    Unparseable,
+}
+
+/// Read the loopback `state` attribute for `device` (e.g. `/dev/video10`).
+///
+/// See [`LoopbackState`] for the driver's inverted wording. Returns an
+/// outcome rather than a `Result` because "unreadable" is a routine,
+/// non-fatal answer here — the sink may not be a loopback node at all.
+#[must_use]
+pub fn read_loopback_state(device: &Path) -> LoopbackState {
+    read_loopback_state_in(Path::new("/sys/class/video4linux"), device)
+}
+
+/// Testable form of [`read_loopback_state`] — `sys_root` is the
+/// directory holding per-device attribute directories (production:
+/// `/sys/class/video4linux`).
+///
+/// `device` contributes only its file name, and only if that name looks
+/// like `videoN`: the path comes from operator-supplied config, and
+/// joining it unchecked would turn this into an arbitrary-file reader
+/// under `/sys` for a path like `/dev/../class/net/eth0/address`.
+#[must_use]
+pub fn read_loopback_state_in(sys_root: &Path, device: &Path) -> LoopbackState {
+    let Some(name) = device.file_name().and_then(|n| n.to_str()) else {
+        return LoopbackState::Unreadable(io::ErrorKind::InvalidInput);
+    };
+    if !is_video_node_name(name) {
+        return LoopbackState::Unreadable(io::ErrorKind::InvalidInput);
+    }
+    let attr = sys_root.join(name).join("state");
+    match fs::read_to_string(&attr) {
+        Ok(s) => match s.trim() {
+            "capture" => LoopbackState::ProducerStreaming,
+            "output" => LoopbackState::ProducerStopped,
+            other => {
+                tracing::debug!(
+                    path = %attr.display(),
+                    value = other,
+                    "unrecognised v4l2loopback state attribute"
+                );
+                LoopbackState::Unparseable
+            }
+        },
+        Err(e) => {
+            tracing::trace!(path = %attr.display(), error = %e, "loopback state attribute unreadable");
+            LoopbackState::Unreadable(e.kind())
+        }
+    }
+}
+
+/// `videoN` with at least one digit and nothing else — the shape of a
+/// V4L2 node basename.
+fn is_video_node_name(name: &str) -> bool {
+    match name.strip_prefix("video") {
+        Some(digits) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
 fn inspect_entry(entry: &Path, dev_root: &Path) -> Option<V4l2Device> {
     let basename = entry.file_name()?.to_str()?.to_string();
     let path = dev_root.join(&basename);
@@ -225,6 +317,63 @@ mod tests {
             &root.join("video10/device/modalias"),
             "platform:v4l2loopback\n",
         );
+    }
+
+    #[test]
+    fn loopback_state_maps_the_drivers_two_words() {
+        let sys = TempDirGuard::new("sys-state");
+        write(&sys.path().join("video10/state"), "capture\n");
+        write(&sys.path().join("video11/state"), "output\n");
+        assert_eq!(
+            read_loopback_state_in(sys.path(), Path::new("/dev/video10")),
+            LoopbackState::ProducerStreaming
+        );
+        assert_eq!(
+            read_loopback_state_in(sys.path(), Path::new("/dev/video11")),
+            LoopbackState::ProducerStopped
+        );
+    }
+
+    #[test]
+    fn loopback_state_reports_unparseable_content_separately() {
+        let sys = TempDirGuard::new("sys-state-junk");
+        write(&sys.path().join("video10/state"), "banana\n");
+        assert_eq!(
+            read_loopback_state_in(sys.path(), Path::new("/dev/video10")),
+            LoopbackState::Unparseable
+        );
+    }
+
+    #[test]
+    fn loopback_state_missing_attribute_is_unreadable_not_stopped() {
+        // The distinction matters: `ProducerStopped` is an internal
+        // fault worth a warning, "no such file" is a non-loopback sink.
+        let sys = TempDirGuard::new("sys-state-missing");
+        assert_eq!(
+            read_loopback_state_in(sys.path(), Path::new("/dev/video10")),
+            LoopbackState::Unreadable(io::ErrorKind::NotFound)
+        );
+    }
+
+    #[test]
+    fn loopback_state_rejects_paths_that_are_not_video_nodes() {
+        let sys = TempDirGuard::new("sys-state-traversal");
+        // Would resolve to `<sys>/../etc/passwd` if the name were joined
+        // unchecked; also covers plain non-`videoN` sinks.
+        write(&sys.path().join("video10/state"), "capture\n");
+        for path in [
+            Path::new("/dev/../etc/passwd"),
+            Path::new("/dev/videoX"),
+            Path::new("/dev/video"),
+            Path::new("/dev/"),
+        ] {
+            assert_eq!(
+                read_loopback_state_in(sys.path(), path),
+                LoopbackState::Unreadable(io::ErrorKind::InvalidInput),
+                "{}",
+                path.display()
+            );
+        }
     }
 
     #[test]

@@ -158,9 +158,15 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use fluxframe_core::{Counters, IdlePresenceSource};
+use fluxframe_core::{
+    CONSUMER_EVENT_AGE_UNSET, Counters, EXTERNAL_OPENERS_UNSET, IdlePresenceSource,
+    OUTPUT_STREAM_UNKNOWN,
+};
 use fluxframe_gst::output::OutputSink;
-use fluxframe_gst::v4l2_events::{ClientUsage, ConsumerWatch};
+use fluxframe_gst::v4l2::{LoopbackState, read_loopback_state};
+use fluxframe_gst::v4l2_events::{
+    ClientUsage, ConsumerWatch, ProbeFailure, classify_probe_error, probe_client_usage,
+};
 use tracing::{debug, info, warn};
 
 use super::state::ConsumerStatus;
@@ -237,6 +243,60 @@ pub(crate) trait UsageSource {
 impl UsageSource for ConsumerWatch {
     fn wait(&mut self, timeout_ms: i32) -> io::Result<Option<ClientUsage>> {
         self.poll(timeout_ms)
+    }
+}
+
+/// On-demand, authoritative readings about the loopback node — the
+/// level-triggered counterpart to the edge-triggered [`UsageSource`].
+///
+/// Both methods answer "what is true right now", which is what makes a
+/// latched verdict recoverable: the event stream can go silent, but a
+/// fresh read cannot.
+///
+/// A trait for the same reason as [`UsageSource`] — the production
+/// implementation needs a real v4l2loopback node, which no unit test has.
+pub(crate) trait NodeProbe {
+    /// Re-read capture usage from the driver.
+    ///
+    /// Total by design: "the kernel did not answer" is an `Err`, never a
+    /// reading, so it can never be mistaken for "nobody is streaming".
+    ///
+    /// # Errors
+    ///
+    /// See [`fluxframe_gst::v4l2_events::probe_client_usage`]; callers
+    /// must treat `ENOTTY`/`EINVAL`/`EACCES` as permanent and everything
+    /// else as worth retrying.
+    fn client_usage(&self) -> io::Result<ClientUsage>;
+
+    /// Does the producer still hold the node's OUTPUT stream?
+    ///
+    /// This is a self-check, not an observation about consumers — see
+    /// [`LoopbackState`].
+    fn output_state(&self) -> LoopbackState;
+}
+
+/// [`NodeProbe`] against a real `/dev/videoN`.
+pub(crate) struct DeviceProbe {
+    device: PathBuf,
+}
+
+impl DeviceProbe {
+    pub(crate) fn new(device: PathBuf) -> Self {
+        Self { device }
+    }
+}
+
+impl NodeProbe for DeviceProbe {
+    fn client_usage(&self) -> io::Result<ClientUsage> {
+        // The driver answers `SEND_INITIAL` synchronously, so the wait is
+        // a formality — but it still runs on the thread `Drop` joins, so
+        // it gets the same budget as every other blocking call here.
+        let timeout_ms = i32::try_from(SHUTDOWN_POLL_GRANULARITY.as_millis()).unwrap_or(i32::MAX);
+        probe_client_usage(&self.device, timeout_ms)
+    }
+
+    fn output_state(&self) -> LoopbackState {
+        read_loopback_state(&self.device)
     }
 }
 
@@ -567,6 +627,13 @@ pub(crate) struct DetectorParams {
     /// Quiet period after which a `Present` verdict resting only on an
     /// unattributable open balance is discarded.
     pub(crate) stale_balance_after: Duration,
+    /// How often to re-read the driver's absolute capture-usage value
+    /// instead of trusting the event stream. `None` disables it.
+    ///
+    /// Honoured only by the kernel-event source. The heuristic paths
+    /// cannot use it: the probe's `open`/`close` would land in their own
+    /// `IN_OPEN`/`IN_CLOSE` balance and read as a consumer attaching.
+    pub(crate) resync_interval: Option<Duration>,
 }
 
 /// The shared handles the detector thread reports *through*, as opposed
@@ -765,6 +832,7 @@ fn run_detector(
         poll_interval,
         mode,
         stale_balance_after,
+        resync_interval,
     } = params;
     let DetectorHandles {
         running,
@@ -825,13 +893,19 @@ fn run_detector(
         presence: &mut presence,
     };
 
+    // The probe re-opens the same node the watch was taken on; it is
+    // built here so the kernel-event path gets it without knowing how a
+    // device path becomes a probe.
+    let probe = DeviceProbe::new(device_path.clone());
+    let schedule = resync_interval.map_or(ResyncSchedule::Off, ResyncSchedule::Every);
+
     // Try the inotify event-driven path first. On failure (watch
     // limit, sandbox restriction, device-node deleted mid-run, …)
     // fall back to the polling path. Both share
     // `count_external_consumers` for the actual presence test, so
     // the public contract is identical — only the wake mechanism
     // differs.
-    if run_presence_source(mode, watch, &ctx, &mut state) {
+    if run_presence_source(mode, watch, &probe, schedule, &ctx, &mut state) {
         run_heuristic_detector(poll_interval, &device_path, &ctx, &mut state);
     }
 
@@ -843,9 +917,11 @@ fn run_detector(
 /// Returns `true` when the caller should run the `inotify`/`/proc`
 /// heuristic — either because it was asked for, or because the
 /// authoritative source was unavailable and the mode permits degrading.
-fn run_presence_source(
+fn run_presence_source<P: NodeProbe>(
     mode: IdlePresenceSource,
     watch: Option<ConsumerWatch>,
+    probe: &P,
+    schedule: ResyncSchedule,
     ctx: &DetectorContext<'_>,
     state: &mut DetectorState<'_>,
 ) -> bool {
@@ -890,7 +966,7 @@ fn run_presence_source(
                 );
                 return true;
             };
-            match run_detector_client_usage(&mut watch, ctx, state) {
+            match run_detector_client_usage(&mut watch, probe, schedule, ctx, state) {
                 Ok(()) => false,
                 Err(e) if strict => {
                     warn!(
@@ -989,8 +1065,10 @@ fn park_until_stopped(ctx: &DetectorContext<'_>) {
 ///
 /// Returns `Err` when the subscription dies (device removed, module
 /// unloaded); the caller decides whether to fall back.
-fn run_detector_client_usage<S: UsageSource>(
+fn run_detector_client_usage<S: UsageSource, P: NodeProbe>(
     source: &mut S,
+    probe: &P,
+    schedule: ResyncSchedule,
     ctx: &DetectorContext<'_>,
     state: &mut DetectorState<'_>,
 ) -> io::Result<()> {
@@ -1000,26 +1078,500 @@ fn run_detector_client_usage<S: UsageSource>(
         target: "fluxframe::idle",
         "consumer detection using kernel client-usage events"
     );
+    let mut resync = ResyncState::new(schedule, ctx.stale_balance_after);
 
     while ctx.running.load(Ordering::Acquire) && !ctx.stopped.load(Ordering::Acquire) {
-        let Some(usage) = source.wait(timeout_ms)? else {
-            continue;
-        };
-        ctx.counters.set_consumer_clients(u64::from(usage.count));
-        let status = if usage.attached() {
-            ConsumerStatus::Present
-        } else {
-            ConsumerStatus::Absent
-        };
-        debug!(
-            target: "fluxframe::idle",
-            count = usage.count,
-            ?status,
-            "client-usage event"
-        );
-        publish_if_changed(status, ctx.status, state.last_status, ctx.counters);
+        if let Some(usage) = source.wait(timeout_ms)? {
+            debug!(
+                target: "fluxframe::idle",
+                count = usage.count,
+                "client-usage event"
+            );
+            resync.note_external_event();
+            apply_usage(usage, ctx, state);
+        }
+        // Re-check the shutdown flags before the tick: `wait` may have
+        // just consumed the whole timeout, and the tick opens the device.
+        if !ctx.running.load(Ordering::Acquire) || ctx.stopped.load(Ordering::Acquire) {
+            break;
+        }
+        if resync.due() {
+            resync_tick(source, probe, ctx, state, &mut resync);
+        }
     }
     Ok(())
+}
+
+/// Publish one absolute reading: both the verdict and the client count.
+///
+/// Single entry point on purpose. The event path and the resync path
+/// used to be free to update one and not the other, and a metrics line
+/// that says `consumer_status=1 consumer_clients=0` is exactly the kind
+/// of self-contradiction that costs an hour when reading logs after an
+/// incident.
+fn apply_usage(usage: ClientUsage, ctx: &DetectorContext<'_>, state: &mut DetectorState<'_>) {
+    ctx.counters.set_consumer_clients(u64::from(usage.count));
+    let status = if usage.attached() {
+        ConsumerStatus::Present
+    } else {
+        ConsumerStatus::Absent
+    };
+    publish_if_changed(status, ctx.status, state.last_status, ctx.counters);
+}
+
+/// How often the client-usage loop takes an authoritative re-read.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ResyncSchedule {
+    /// Never — `idle.resync_interval_secs = 0`. The verdict is then only
+    /// as good as the event stream, which is what the incidents this
+    /// mechanism exists for looked like.
+    Off,
+    /// Wall-clock cadence; what the supervisor builds from config.
+    Every(Duration),
+    /// Fire every `n`-th loop iteration.
+    ///
+    /// Test-only seam: the scripted [`UsageSource`] fakes drain in a few
+    /// iterations and stop the loop, so a wall-clock cadence would never
+    /// fire and the resync path would go untested.
+    #[cfg(test)]
+    EveryIterations(u32),
+}
+
+/// Backoff ceiling after `EBUSY` from the probe's `open`.
+///
+/// `EBUSY` means the node is at `max_openers` — the one moment when one
+/// more opener is actively harmful, because a real consumer trying to
+/// attach right then gets the same error. So the diagnostic backs off
+/// instead of competing for the last slot.
+const RESYNC_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// Everything the resync tick has to remember between firings.
+///
+/// All of it is edge state: the counters answer "how often", this
+/// answers "has anything changed since last time" — which is what keeps
+/// a persistent fault from filling the log with one line per tick.
+struct ResyncState {
+    schedule: ResyncSchedule,
+    last_tick: Instant,
+    iterations: u32,
+    /// Set once a probe error proves permanent; stops the ticking for
+    /// the rest of the run rather than retrying 120 times an hour.
+    disabled: bool,
+    /// Deadline set after `EBUSY`, and the current backoff step.
+    backoff_until: Option<Instant>,
+    backoff: Duration,
+    /// Consecutive re-reads that said "nobody" while the verdict says
+    /// somebody. Two are required before acting — see [`Self::observe`].
+    absent_streak: u8,
+    /// Edge trackers for the three conditions worth one log line each.
+    probe_failing: bool,
+    output_down: Option<bool>,
+    external_holder: Option<bool>,
+    /// When the last event we did NOT cause ourselves arrived, and the
+    /// baseline to measure against before any has.
+    last_external_event: Option<Instant>,
+    started_at: Instant,
+    /// How long the node may stay event-silent before saying so, and
+    /// whether that has already been said.
+    stale_after: Duration,
+    stale_warned: bool,
+}
+
+impl ResyncState {
+    fn new(schedule: ResyncSchedule, teardown_grace: Duration) -> Self {
+        let now = Instant::now();
+        let interval = if let ResyncSchedule::Every(d) = schedule {
+            d
+        } else {
+            Duration::ZERO
+        };
+        // Say which of the two it is at startup: a disabled safety net
+        // that looks armed is worse than no safety net at all.
+        if matches!(schedule, ResyncSchedule::Off) {
+            warn!(
+                target: "fluxframe::idle",
+                "consumer resync disabled by config — a lost kernel event will latch \
+                 the verdict until the daemon restarts"
+            );
+        } else {
+            info!(
+                target: "fluxframe::idle",
+                resync_interval_secs = interval.as_secs(),
+                "consumer resync armed"
+            );
+        }
+        Self {
+            schedule,
+            last_tick: now,
+            iterations: 0,
+            disabled: false,
+            backoff_until: None,
+            backoff: interval,
+            absent_streak: 0,
+            probe_failing: false,
+            output_down: None,
+            external_holder: None,
+            last_external_event: None,
+            started_at: now,
+            // Three intervals of silence is not yet suspicious on a
+            // healthy but unused node; below the idle grace period the
+            // warning would race the hysteresis it is describing.
+            stale_after: (interval * 3).max(teardown_grace),
+            stale_warned: false,
+        }
+    }
+
+    /// An event arrived that we did not induce ourselves.
+    fn note_external_event(&mut self) {
+        self.last_external_event = Some(Instant::now());
+        self.stale_warned = false;
+    }
+
+    fn due(&mut self) -> bool {
+        self.iterations = self.iterations.saturating_add(1);
+        if self.disabled {
+            return false;
+        }
+        if self
+            .backoff_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            return false;
+        }
+        match self.schedule {
+            ResyncSchedule::Off => false,
+            ResyncSchedule::Every(interval) => self.last_tick.elapsed() >= interval,
+            #[cfg(test)]
+            ResyncSchedule::EveryIterations(n) => n > 0 && self.iterations % n == 0,
+        }
+    }
+}
+
+/// One authoritative re-read: compare it with the event-driven verdict,
+/// correct the verdict when they disagree, and take the two side
+/// readings that make a silent `Absent` interpretable.
+///
+/// **Ordering matters.** The verdict is snapshotted *before* the probe,
+/// because subscribing echoes an event back onto `source` (see
+/// [`fluxframe_gst::v4l2_events::probe_client_usage`]). Comparing
+/// against a verdict the echo already repaired would report zero
+/// corrections during exactly the failure this exists to detect. The
+/// echo is then drained explicitly so it cannot masquerade as consumer
+/// traffic in the silence gauge.
+///
+/// This function must stay on the detector thread: it writes
+/// `state.last_status`, which is plain `&mut`, and the status atomic has
+/// exactly one writer by construction. Moving the probe to a thread of
+/// its own needs that ownership reworked first.
+fn resync_tick<S: UsageSource, P: NodeProbe>(
+    source: &mut S,
+    probe: &P,
+    ctx: &DetectorContext<'_>,
+    state: &mut DetectorState<'_>,
+    resync: &mut ResyncState,
+) {
+    resync.last_tick = Instant::now();
+    ctx.counters.inc_consumer_resync();
+
+    let believed = *state.last_status;
+    match probe.client_usage() {
+        Ok(reading) => {
+            if resync.probe_failing {
+                info!(target: "fluxframe::idle", "consumer resync recovered");
+                resync.probe_failing = false;
+            }
+            resync.backoff_until = None;
+            let echo_disagreed = drain_probe_echo(source, reading, ctx, state, resync);
+            if !echo_disagreed {
+                reconcile(reading, believed, ctx, state, resync);
+            }
+            check_external_holder(reading, ctx, resync);
+        }
+        Err(e) => on_probe_error(&e, ctx, resync),
+    }
+
+    check_output_stream(probe, ctx, resync);
+    report_event_silence(ctx, resync);
+}
+
+/// Consume the event our own subscription just caused, if it is still
+/// queued, and report whether it disagreed with what the probe read.
+///
+/// A disagreement means the truth changed between the probe and the
+/// drain. That reading is newer, so it is applied — and the drift
+/// comparison is skipped for this tick, because a verdict that was
+/// correct until a moment ago is not evidence of a deaf subscription.
+fn drain_probe_echo<S: UsageSource>(
+    source: &mut S,
+    reading: ClientUsage,
+    ctx: &DetectorContext<'_>,
+    state: &mut DetectorState<'_>,
+    resync: &mut ResyncState,
+) -> bool {
+    let Ok(Some(echo)) = source.wait(0) else {
+        return false;
+    };
+    if echo == reading {
+        return false;
+    }
+    debug!(
+        target: "fluxframe::idle",
+        probed = reading.count,
+        observed = echo.count,
+        "client-usage changed while probing — taking the newer reading"
+    );
+    resync.note_external_event();
+    apply_usage(echo, ctx, state);
+    true
+}
+
+/// Compare an authoritative reading with the event-driven verdict and
+/// act on the difference.
+fn reconcile(
+    reading: ClientUsage,
+    believed: Option<ConsumerStatus>,
+    ctx: &DetectorContext<'_>,
+    state: &mut DetectorState<'_>,
+    resync: &mut ResyncState,
+) {
+    let observed = if reading.attached() {
+        ConsumerStatus::Present
+    } else {
+        ConsumerStatus::Absent
+    };
+
+    // Nothing to disagree with yet: no verdict published, or one that
+    // means "I do not know". Publishing is right, counting it as a
+    // correction is not — every run would then start at one and the
+    // counter would stop meaning "events are being lost".
+    if !matches!(
+        believed,
+        Some(ConsumerStatus::Present | ConsumerStatus::Absent)
+    ) {
+        debug!(
+            target: "fluxframe::idle",
+            ?believed,
+            ?observed,
+            "consumer resync — initial synchronisation"
+        );
+        apply_usage(reading, ctx, state);
+        return;
+    }
+
+    if believed == Some(observed) {
+        debug!(target: "fluxframe::idle", ?observed, "consumer resync — verdict confirmed");
+        resync.absent_streak = 0;
+        return;
+    }
+
+    warn!(
+        target: "fluxframe::idle",
+        ?believed,
+        ?observed,
+        count = reading.count,
+        "consumer state drift — the kernel disagrees with the event-driven verdict"
+    );
+
+    if observed == ConsumerStatus::Present {
+        // Waking up on a false positive costs an idle camera for one
+        // interval; staying asleep on a true positive costs the user
+        // their camera. Apply immediately.
+        ctx.counters.inc_consumer_resync_corrections();
+        resync.absent_streak = 0;
+        apply_usage(reading, ctx, state);
+        return;
+    }
+
+    // Downgrades are the expensive direction: `idle.teardown_secs` after
+    // this the camera is released, and a client mid-call sees it vanish.
+    // Require two consecutive re-reads to agree before paying that.
+    resync.absent_streak = resync.absent_streak.saturating_add(1);
+    if resync.absent_streak < 2 {
+        debug!(
+            target: "fluxframe::idle",
+            "holding the Present verdict until a second re-read agrees"
+        );
+        return;
+    }
+    ctx.counters.inc_consumer_resync_corrections();
+    resync.absent_streak = 0;
+    apply_usage(reading, ctx, state);
+}
+
+/// Classify a probe failure: permanent faults stop the mechanism,
+/// contention backs it off, everything else retries next tick.
+fn on_probe_error(e: &io::Error, ctx: &DetectorContext<'_>, resync: &mut ResyncState) {
+    ctx.counters.inc_consumer_resync_failures();
+    let raw = e.raw_os_error();
+    match classify_probe_error(e) {
+        ProbeFailure::Permanent => {
+            // The node cannot answer this question at all — a
+            // non-loopback sink, v4l2loopback < 0.13, or permissions.
+            // Retrying every interval would turn the failure counter
+            // into an uptime clock.
+            warn!(
+                target: "fluxframe::idle",
+                error = %e,
+                errno = ?raw,
+                "consumer resync unavailable on this node — disabling it for this run"
+            );
+            resync.disabled = true;
+            ctx.counters
+                .set_consumer_last_external_event_age_secs(CONSUMER_EVENT_AGE_UNSET);
+            return;
+        }
+        ProbeFailure::Busy => {
+            let step = if resync.backoff.is_zero() {
+                Duration::from_secs(1)
+            } else {
+                resync.backoff
+            };
+            let next = (step * 2).min(RESYNC_BACKOFF_MAX);
+            resync.backoff = next;
+            resync.backoff_until = Some(Instant::now() + next);
+        }
+        // `ProbeFailure` is `#[non_exhaustive]`; anything the driver
+        // starts reporting that we have not classified yet gets the
+        // conservative treatment — retry next tick, change nothing.
+        _ => {}
+    }
+    if !resync.probe_failing {
+        resync.probe_failing = true;
+        warn!(
+            target: "fluxframe::idle",
+            error = %e,
+            errno = ?raw,
+            backoff_secs = resync.backoff_until.map(|_| resync.backoff.as_secs()),
+            "consumer resync failed — the verdict is unverified until it recovers"
+        );
+    }
+}
+
+/// Verify that *we* are still streaming into the loopback.
+///
+/// Nothing else notices this: `idle_frames_pushed_total` counts frames
+/// handed to the pipeline, so it keeps climbing while the driver rejects
+/// every consumer with `EIO`.
+fn check_output_stream<P: NodeProbe>(
+    probe: &P,
+    ctx: &DetectorContext<'_>,
+    resync: &mut ResyncState,
+) {
+    let (gauge, down) = match probe.output_state() {
+        LoopbackState::ProducerStreaming => (1, Some(false)),
+        LoopbackState::ProducerStopped => (0, Some(true)),
+        other => {
+            debug!(
+                target: "fluxframe::idle",
+                state = ?other,
+                "loopback OUTPUT state unavailable"
+            );
+            (OUTPUT_STREAM_UNKNOWN, None)
+        }
+    };
+    ctx.counters.set_output_stream_up(gauge);
+    let Some(down) = down else { return };
+    if resync.output_down == Some(down) {
+        return;
+    }
+    if down {
+        ctx.counters.inc_output_stream_down();
+        warn!(
+            target: "fluxframe::idle",
+            "loopback OUTPUT stream is not held — every capture client will get EIO \
+             until the output pipeline is rebuilt"
+        );
+    } else if resync.output_down == Some(true) {
+        info!(target: "fluxframe::idle", "loopback OUTPUT stream is held again");
+    }
+    resync.output_down = Some(down);
+}
+
+/// When the driver says nobody is streaming, find out whether anybody is
+/// nevertheless *holding* the node.
+///
+/// That combination is the fingerprint of a client that opened the
+/// device and never reached `STREAMON` — usually because another
+/// application already owns v4l2loopback's single capture slot. Without
+/// this the log cannot tell that case from "nobody wants the camera".
+fn check_external_holder(
+    reading: ClientUsage,
+    ctx: &DetectorContext<'_>,
+    resync: &mut ResyncState,
+) {
+    if reading.attached() {
+        // Somebody is streaming; who else holds an fd is not interesting.
+        ctx.counters.set_external_openers(EXTERNAL_OPENERS_UNSET);
+        resync.external_holder = None;
+        return;
+    }
+    match count_external_consumers(ctx.proc_root, ctx.device_basename, ctx.my_pid) {
+        WalkOutcome::External { pid } => {
+            // The walk short-circuits on the first hit, so this gauge is
+            // "at least one", not a count.
+            ctx.counters.set_external_openers(1);
+            if resync.external_holder != Some(true) {
+                let comm = read_comms(ctx.proc_root, &[pid]).pop().unwrap_or_default();
+                warn!(
+                    target: "fluxframe::idle",
+                    holder_pid = pid,
+                    holder_comm = %comm,
+                    "loopback is held open by a process that is not streaming — a client \
+                     probably failed REQBUFS/STREAMON because the capture slot is taken"
+                );
+            }
+            resync.external_holder = Some(true);
+        }
+        WalkOutcome::CleanAbsent => {
+            ctx.counters.set_external_openers(0);
+            resync.external_holder = Some(false);
+        }
+        // "I may not look" is not "nobody is there" — the mistake that
+        // sank the previous detector. Report it as unknown, not as zero.
+        outcome => {
+            ctx.counters.set_external_openers(EXTERNAL_OPENERS_UNSET);
+            debug!(
+                target: "fluxframe::idle",
+                ?outcome,
+                "cannot attribute the loopback's holders"
+            );
+            resync.external_holder = None;
+        }
+    }
+}
+
+/// Publish how long the node has been event-silent, and say so once when
+/// that crosses the threshold.
+///
+/// A verdict that happens to be correct while the subscription is deaf
+/// produces no drift and no correction — this is the only signal that
+/// separates it from a healthy quiet node.
+fn report_event_silence(ctx: &DetectorContext<'_>, resync: &mut ResyncState) {
+    // The gauge only reports real observations, so it stays at the
+    // sentinel until an event actually arrives. The *threshold* falls
+    // back to the loop's start instead: a subscription that was already
+    // deaf when the run began never delivers a first event, and that is
+    // precisely a case worth a warning rather than an eternal sentinel.
+    let age = if let Some(last) = resync.last_external_event {
+        let age = last.elapsed();
+        ctx.counters
+            .set_consumer_last_external_event_age_secs(age.as_secs());
+        age
+    } else {
+        ctx.counters
+            .set_consumer_last_external_event_age_secs(CONSUMER_EVENT_AGE_UNSET);
+        resync.started_at.elapsed()
+    };
+    if age >= resync.stale_after && !resync.stale_warned {
+        resync.stale_warned = true;
+        warn!(
+            target: "fluxframe::idle",
+            silent_secs = age.as_secs(),
+            threshold_secs = resync.stale_after.as_secs(),
+            "no client-usage events for longer than expected — if consumers are \
+             attaching, the subscription has gone deaf"
+        );
+    }
 }
 
 /// Pin the status to `Present` and park until shutdown.
@@ -1560,9 +2112,97 @@ mod tests {
         counters: fluxframe_core::CounterValues,
     }
 
+    /// A scripted [`NodeProbe`]. Each `client_usage` call pops one entry;
+    /// once drained it keeps repeating the last answer, so a test can
+    /// script the interesting tick and let the rest of the run coast.
+    struct FakeProbe {
+        usage: std::cell::RefCell<std::collections::VecDeque<io::Result<ClientUsage>>>,
+        last: std::cell::Cell<Option<u32>>,
+        output: std::cell::Cell<LoopbackState>,
+        calls: std::cell::Cell<u32>,
+    }
+
+    impl FakeProbe {
+        fn new(script: Vec<io::Result<ClientUsage>>) -> Self {
+            Self {
+                usage: std::cell::RefCell::new(script.into()),
+                last: std::cell::Cell::new(None),
+                output: std::cell::Cell::new(LoopbackState::ProducerStreaming),
+                calls: std::cell::Cell::new(0),
+            }
+        }
+
+        /// A probe that never gets asked anything — for the paths where
+        /// the resync schedule is `Off`.
+        fn silent() -> Self {
+            Self::new(Vec::new())
+        }
+    }
+
+    impl NodeProbe for FakeProbe {
+        fn client_usage(&self) -> io::Result<ClientUsage> {
+            self.calls.set(self.calls.get() + 1);
+            match self.usage.borrow_mut().pop_front() {
+                Some(Ok(u)) => {
+                    self.last.set(Some(u.count));
+                    Ok(u)
+                }
+                Some(Err(e)) => Err(e),
+                None => match self.last.get() {
+                    Some(count) => Ok(ClientUsage { count }),
+                    None => Err(io::Error::from(io::ErrorKind::TimedOut)),
+                },
+            }
+        }
+
+        fn output_state(&self) -> LoopbackState {
+            self.output.get()
+        }
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the Result is the point: scripts mix successful readings with probe \
+                  failures, mirroring `usage()` on the event side"
+    )]
+    fn probe_ok(count: u32) -> io::Result<ClientUsage> {
+        Ok(ClientUsage { count })
+    }
+
+    /// Run the client-usage loop against a scripted source, with the
+    /// resync path disabled.
+    fn drive_client_usage(script: Vec<io::Result<Option<ClientUsage>>>) -> ClientUsageRun {
+        drive_client_usage_with(
+            script,
+            &FakeProbe::silent(),
+            ResyncSchedule::Off,
+            Path::new("/proc"),
+        )
+    }
+
+    /// Run the client-usage loop with the resync path enabled on every
+    /// iteration, against a `/proc` that contains nothing.
+    fn drive_with_resync(
+        script: Vec<io::Result<Option<ClientUsage>>>,
+        probe: &FakeProbe,
+    ) -> ClientUsageRun {
+        let empty_proc = tempfile::tempdir().expect("tempdir");
+        drive_client_usage_with(
+            script,
+            probe,
+            ResyncSchedule::EveryIterations(1),
+            empty_proc.path(),
+        )
+    }
+
     /// Run the client-usage loop against a scripted source until the
     /// script is exhausted, then stop it.
-    fn drive_client_usage(script: Vec<io::Result<Option<ClientUsage>>>) -> ClientUsageRun {
+    fn drive_client_usage_with(
+        script: Vec<io::Result<Option<ClientUsage>>>,
+        probe: &FakeProbe,
+        schedule: ResyncSchedule,
+        proc_root: &Path,
+    ) -> ClientUsageRun {
         let running = AtomicBool::new(true);
         let status = AtomicU8::new(ConsumerStatus::Unknown.as_u8());
         // `FakeUsage` sets this once the script is drained, so the loop
@@ -1573,7 +2213,7 @@ mod tests {
         #[cfg(test)]
         let activations = AtomicU64::new(0);
         let ctx = DetectorContext {
-            proc_root: Path::new("/proc"),
+            proc_root,
             stale_balance_after: Duration::from_secs(3600),
             my_pid: 9999,
             running: &running,
@@ -1595,7 +2235,7 @@ mod tests {
         };
 
         let mut source = FakeUsage::new(script, &stopped);
-        let result = run_detector_client_usage(&mut source, &ctx, &mut state);
+        let result = run_detector_client_usage(&mut source, probe, schedule, &ctx, &mut state);
         ClientUsageRun {
             last_status,
             result,
@@ -1697,6 +2337,220 @@ mod tests {
         let run = drive_client_usage(vec![Err(io::Error::from_raw_os_error(ENODEV))]);
         let err = run.result.expect_err("a dead subscription must surface");
         assert_eq!(err.raw_os_error(), Some(ENODEV));
+    }
+
+    #[test]
+    fn resync_confirming_the_verdict_is_not_a_correction() {
+        // The common case: the event stream is healthy and the re-read
+        // agrees. It must leave the verdict alone and, above all, not
+        // inflate the correction counter — that counter is the evidence
+        // that events are being lost.
+        let probe = FakeProbe::new(vec![probe_ok(1)]);
+        let run = drive_with_resync(vec![usage(1)], &probe);
+        assert_eq!(run.last_status, Some(ConsumerStatus::Present));
+        assert_eq!(run.counters.consumer_resync_corrections_total, 0);
+        assert!(run.counters.consumer_resync_total > 0);
+        assert_eq!(run.counters.consumer_resync_failures_total, 0);
+    }
+
+    #[test]
+    fn resync_wakes_the_camera_as_soon_as_the_kernel_says_present() {
+        // The 13.08/27.08 failure: the verdict is latched at Absent
+        // while a client is streaming. One disagreeing read is enough to
+        // repair it — an idle camera woken by mistake costs one
+        // interval, a sleeping camera under a live client costs the call.
+        let probe = FakeProbe::new(vec![probe_ok(1)]);
+        let run = drive_with_resync(vec![usage(0)], &probe);
+        assert_eq!(run.last_status, Some(ConsumerStatus::Present));
+        assert_eq!(run.counters.consumer_resync_corrections_total, 1);
+        assert_eq!(run.counters.consumer_clients, 1);
+    }
+
+    #[test]
+    fn resync_needs_two_agreeing_reads_before_letting_the_camera_go() {
+        // The expensive direction: `teardown_secs` after this verdict
+        // the camera is released under whoever is using it.
+        let probe = FakeProbe::new(vec![probe_ok(0)]);
+        let one_tick = drive_with_resync(vec![usage(1), Ok(None)], &probe);
+        assert_eq!(
+            one_tick.last_status,
+            Some(ConsumerStatus::Present),
+            "a single disagreeing read must not release the camera"
+        );
+        assert_eq!(one_tick.counters.consumer_resync_corrections_total, 0);
+
+        // Same script, but the probe keeps saying "nobody" — the second
+        // agreeing read is what applies the downgrade.
+        let probe = FakeProbe::new(vec![probe_ok(0), probe_ok(0)]);
+        let two_ticks = drive_with_resync(vec![usage(1), Ok(None), Ok(None)], &probe);
+        assert_eq!(two_ticks.last_status, Some(ConsumerStatus::Absent));
+        assert_eq!(two_ticks.counters.consumer_resync_corrections_total, 1);
+    }
+
+    #[test]
+    fn resync_publishes_the_first_reading_without_calling_it_a_correction() {
+        // Nothing published yet: the re-read establishes the verdict.
+        // Counting that as a drift correction would put a floor of one
+        // on every run and destroy the counter's meaning.
+        let probe = FakeProbe::new(vec![probe_ok(1)]);
+        let run = drive_with_resync(vec![Ok(None)], &probe);
+        assert_eq!(run.last_status, Some(ConsumerStatus::Present));
+        assert_eq!(run.counters.consumer_resync_corrections_total, 0);
+    }
+
+    #[test]
+    fn a_failed_resync_never_latches_the_verdict() {
+        // "The kernel did not answer" must not be read as "nobody is
+        // streaming" — that would be the original failure, caused by the
+        // thing meant to prevent it.
+        let probe = FakeProbe::new(vec![Err(io::Error::from(io::ErrorKind::TimedOut))]);
+        let run = drive_with_resync(vec![usage(1)], &probe);
+        assert_eq!(run.last_status, Some(ConsumerStatus::Present));
+        assert!(run.counters.consumer_resync_failures_total >= 1);
+        assert_eq!(run.counters.consumer_resync_corrections_total, 0);
+    }
+
+    #[test]
+    fn a_permanent_probe_failure_stops_the_resync_for_the_run() {
+        // ENOTTY: the node does not implement the event at all. Retrying
+        // every interval would turn the failure counter into a clock.
+        const ENOTTY: i32 = 25;
+        let probe = FakeProbe::new(vec![
+            Err(io::Error::from_raw_os_error(ENOTTY)),
+            probe_ok(1),
+            probe_ok(1),
+        ]);
+        let run = drive_with_resync(vec![usage(0), Ok(None), Ok(None), Ok(None)], &probe);
+        assert_eq!(probe.calls.get(), 1, "the probe must not be called again");
+        assert_eq!(run.counters.consumer_resync_failures_total, 1);
+        assert_eq!(run.last_status, Some(ConsumerStatus::Absent));
+    }
+
+    #[test]
+    fn a_changed_reading_during_the_probe_wins_over_the_drift_check() {
+        // The echo drain sees a value that differs from what the probe
+        // read: the truth moved between the two, so the newer reading
+        // applies and no drift is reported for this tick.
+        let probe = FakeProbe::new(vec![probe_ok(0)]);
+        let run = drive_with_resync(vec![usage(0), usage(1)], &probe);
+        assert_eq!(run.last_status, Some(ConsumerStatus::Present));
+        assert_eq!(run.counters.consumer_resync_corrections_total, 0);
+    }
+
+    /// Build a detector context over a caller-supplied `/proc` and run
+    /// `f` against it. For the tick helpers that are worth testing
+    /// without driving the whole loop.
+    fn with_ctx<R>(
+        proc_root: &Path,
+        counters: &Counters,
+        f: impl FnOnce(&DetectorContext<'_>) -> R,
+    ) -> R {
+        let running = AtomicBool::new(true);
+        let status = AtomicU8::new(ConsumerStatus::Unknown.as_u8());
+        let stopped = AtomicBool::new(false);
+        let device_basename = OsString::from("video10");
+        #[cfg(test)]
+        let activations = AtomicU64::new(0);
+        let ctx = DetectorContext {
+            proc_root,
+            stale_balance_after: Duration::from_secs(3600),
+            my_pid: 9999,
+            running: &running,
+            status: &status,
+            stopped: &stopped,
+            restat_interval_polls: RESTAT_INTERVAL_POLLS,
+            device_basename: &device_basename,
+            counters,
+            #[cfg(test)]
+            inotify_activations: &activations,
+        };
+        f(&ctx)
+    }
+
+    #[test]
+    fn output_stream_loss_is_counted_once_per_edge() {
+        let counters = Counters::new();
+        let probe = FakeProbe::silent();
+        probe.output.set(LoopbackState::ProducerStopped);
+        let mut resync = ResyncState::new(ResyncSchedule::Off, Duration::from_secs(5));
+        with_ctx(Path::new("/proc"), &counters, |ctx| {
+            check_output_stream(&probe, ctx, &mut resync);
+            check_output_stream(&probe, ctx, &mut resync);
+            assert_eq!(counters.snapshot().output_stream_up, 0);
+            assert_eq!(
+                counters.snapshot().output_stream_down_total,
+                1,
+                "a persistent fault is one edge, not one per tick"
+            );
+
+            probe.output.set(LoopbackState::ProducerStreaming);
+            check_output_stream(&probe, ctx, &mut resync);
+            assert_eq!(counters.snapshot().output_stream_up, 1);
+            assert_eq!(counters.snapshot().output_stream_down_total, 1);
+        });
+    }
+
+    #[test]
+    fn an_unreadable_output_state_is_unknown_not_down() {
+        // A non-loopback sink must not look like a broken one.
+        let counters = Counters::new();
+        let probe = FakeProbe::silent();
+        probe
+            .output
+            .set(LoopbackState::Unreadable(io::ErrorKind::NotFound));
+        let mut resync = ResyncState::new(ResyncSchedule::Off, Duration::from_secs(5));
+        with_ctx(Path::new("/proc"), &counters, |ctx| {
+            check_output_stream(&probe, ctx, &mut resync);
+        });
+        assert_eq!(
+            counters.snapshot().output_stream_up,
+            fluxframe_core::OUTPUT_STREAM_UNKNOWN
+        );
+        assert_eq!(counters.snapshot().output_stream_down_total, 0);
+    }
+
+    #[test]
+    fn a_holder_that_is_not_streaming_is_surfaced() {
+        // The scenario the log could not previously distinguish from
+        // "nobody wants the camera": somebody holds the node but never
+        // reached STREAMON.
+        let dir = tempfile::tempdir().expect("tempdir");
+        make_proc_entry(dir.path(), 4321, 7, Path::new("/dev/video10"));
+        let counters = Counters::new();
+        let mut resync = ResyncState::new(ResyncSchedule::Off, Duration::from_secs(5));
+        with_ctx(dir.path(), &counters, |ctx| {
+            check_external_holder(ClientUsage { count: 0 }, ctx, &mut resync);
+        });
+        assert_eq!(counters.snapshot().external_openers, 1);
+    }
+
+    #[test]
+    fn nobody_holding_the_node_reads_as_zero_not_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        make_proc_entry(dir.path(), 4321, 7, Path::new("/dev/video0"));
+        let counters = Counters::new();
+        let mut resync = ResyncState::new(ResyncSchedule::Off, Duration::from_secs(5));
+        with_ctx(dir.path(), &counters, |ctx| {
+            check_external_holder(ClientUsage { count: 0 }, ctx, &mut resync);
+        });
+        assert_eq!(counters.snapshot().external_openers, 0);
+    }
+
+    #[test]
+    fn holders_are_not_walked_while_somebody_is_streaming() {
+        // With a consumer attached the question is meaningless, and the
+        // gauge must say "not determined" rather than "nobody".
+        let dir = tempfile::tempdir().expect("tempdir");
+        make_proc_entry(dir.path(), 4321, 7, Path::new("/dev/video10"));
+        let counters = Counters::new();
+        let mut resync = ResyncState::new(ResyncSchedule::Off, Duration::from_secs(5));
+        with_ctx(dir.path(), &counters, |ctx| {
+            check_external_holder(ClientUsage { count: 1 }, ctx, &mut resync);
+        });
+        assert_eq!(
+            counters.snapshot().external_openers,
+            fluxframe_core::EXTERNAL_OPENERS_UNSET
+        );
     }
 
     #[test]
@@ -2150,6 +3004,8 @@ mod tests {
                 poll_interval: Duration::from_millis(20),
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
+                // The heuristic paths never resync — see the field docs.
+                resync_interval: None,
             },
             DetectorTestKnobs {
                 proc_root: proc_root.clone(),
@@ -2211,6 +3067,8 @@ mod tests {
                 poll_interval: Duration::from_secs(2), // long poll
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
+                // The heuristic paths never resync — see the field docs.
+                resync_interval: None,
             },
             DetectorTestKnobs {
                 proc_root: dir.path().to_path_buf(),
@@ -2285,6 +3143,8 @@ mod tests {
                 poll_interval: Duration::from_millis(20),
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
+                // The heuristic paths never resync — see the field docs.
+                resync_interval: None,
             },
             DetectorTestKnobs {
                 proc_root: PathBuf::from("/no/such/proc/path"),
@@ -2360,6 +3220,8 @@ mod tests {
                 poll_interval: Duration::from_millis(20),
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
+                // The heuristic paths never resync — see the field docs.
+                resync_interval: None,
             },
             DetectorTestKnobs {
                 proc_root: proc_root.clone(),
@@ -2447,6 +3309,8 @@ mod tests {
                 poll_interval: Duration::from_millis(20),
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
+                // The heuristic paths never resync — see the field docs.
+                resync_interval: None,
             },
             DetectorTestKnobs {
                 proc_root: proc_root.clone(),
@@ -2513,6 +3377,8 @@ mod tests {
                 poll_interval: Duration::from_millis(20),
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
+                // The heuristic paths never resync — see the field docs.
+                resync_interval: None,
             },
             DetectorTestKnobs {
                 proc_root: proc_root.clone(),

@@ -747,6 +747,25 @@ pub struct IdleConfig {
     #[serde(default = "default_idle_poll_interval_ms")]
     pub poll_interval_ms: u32,
 
+    /// How often the detector re-reads the driver's capture-usage value
+    /// instead of waiting for the next event, in seconds. `0` disables
+    /// the re-read entirely.
+    ///
+    /// The kernel client-usage subscription is edge-triggered: a single
+    /// event the driver never queues — or never delivers — latches the
+    /// verdict for the rest of the run, and the camera stays down until
+    /// the daemon is restarted. This interval bounds that failure to one
+    /// period.
+    ///
+    /// Only the kernel-event source honours it; the `inotify` and
+    /// `/proc` paths cannot use the re-read (its `open`/`close` would be
+    /// mistaken for a consumer by their own open-balance heuristic).
+    ///
+    /// Read once, when the detector starts: changing it needs a daemon
+    /// restart, not a `reload`.
+    #[serde(default = "default_idle_resync_interval_secs")]
+    pub resync_interval_secs: u32,
+
     /// Which mechanism decides whether a consumer is attached.
     ///
     /// The operator-facing kill switch for the detector. Unlike
@@ -799,6 +818,7 @@ impl Default for IdleConfig {
             teardown_secs: default_idle_teardown_secs(),
             deep_idle_secs: default_idle_deep_secs(),
             poll_interval_ms: default_idle_poll_interval_ms(),
+            resync_interval_secs: default_idle_resync_interval_secs(),
             presence_source: IdlePresenceSource::default(),
         }
     }
@@ -841,6 +861,22 @@ pub const MAX_IDLE_POLL_INTERVAL_MS: u32 = 5000;
 /// upper bound matches operator expectations.
 pub const MAX_IDLE_FPS: u32 = 60;
 
+/// Lower inclusive bound on a non-zero `idle.resync_interval_secs`.
+///
+/// Each resync opens the loopback node for the duration of one ioctl.
+/// v4l2loopback caps concurrent openers (`max_openers`, 10 by default)
+/// and a real consumer that opens the device inside that window gets
+/// `EBUSY` — so a mistyped `1` would turn the diagnostic into the very
+/// failure it is meant to detect. Five seconds is well below any wake
+/// budget an operator cares about and still leaves the node free
+/// essentially all of the time.
+pub const MIN_IDLE_RESYNC_INTERVAL_SECS: u32 = 5;
+
+/// Upper inclusive bound on `idle.resync_interval_secs` — same
+/// typo-catching rationale as [`MAX_IDLE_TEARDOWN_SECS`]. Past an hour
+/// the safety net is slower than an operator noticing the black frame.
+pub const MAX_IDLE_RESYNC_INTERVAL_SECS: u32 = 3600;
+
 fn default_placeholder_rgb() -> [u8; 3] {
     [16, 16, 16]
 }
@@ -858,6 +894,9 @@ fn default_idle_deep_secs() -> u32 {
 }
 fn default_idle_poll_interval_ms() -> u32 {
     250
+}
+fn default_idle_resync_interval_secs() -> u32 {
+    30
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,6 +1088,18 @@ impl FluxConfig {
                 self.idle.poll_interval_ms
             )));
         }
+        // `0` is a deliberate value here — "never re-read" — so it is
+        // excluded from the range rather than rejected with it.
+        if self.idle.resync_interval_secs != 0
+            && (self.idle.resync_interval_secs < MIN_IDLE_RESYNC_INTERVAL_SECS
+                || self.idle.resync_interval_secs > MAX_IDLE_RESYNC_INTERVAL_SECS)
+        {
+            return Err(config_err(format!(
+                "idle.resync_interval_secs must be 0 (disabled) or in \
+                 {MIN_IDLE_RESYNC_INTERVAL_SECS}..={MAX_IDLE_RESYNC_INTERVAL_SECS}, got {}",
+                self.idle.resync_interval_secs
+            )));
+        }
         if self.idle.placeholder == IdlePlaceholderKind::Image
             && self.idle.placeholder_path.is_none()
         {
@@ -1135,4 +1186,56 @@ fn default_metrics_interval_secs() -> u32 {
 }
 fn default_log_level() -> String {
     DEFAULT_LOG_LEVEL.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        FluxConfig, MAX_IDLE_RESYNC_INTERVAL_SECS, MIN_IDLE_RESYNC_INTERVAL_SECS,
+        default_idle_resync_interval_secs,
+    };
+
+    fn cfg_with_resync(value: &str) -> Result<FluxConfig, crate::error::FluxError> {
+        let text = format!("[idle]\nenabled = true\nresync_interval_secs = {value}\n");
+        FluxConfig::from_toml_str(&text)
+    }
+
+    #[test]
+    fn resync_interval_defaults_when_absent() {
+        let cfg = FluxConfig::from_toml_str("[idle]\nenabled = true\n").expect("parse");
+        assert_eq!(
+            cfg.idle.resync_interval_secs,
+            default_idle_resync_interval_secs()
+        );
+        cfg.validate().expect("default must validate");
+    }
+
+    #[test]
+    fn resync_interval_zero_is_accepted_as_disabled() {
+        let cfg = cfg_with_resync("0").expect("parse");
+        cfg.validate()
+            .expect("0 means 'never re-read', not an out-of-range value");
+    }
+
+    #[test]
+    fn resync_interval_below_the_floor_is_rejected() {
+        // A mistyped `1` would open the loopback every second and starve
+        // `max_openers`; the floor is what stops that reaching a run.
+        let cfg = cfg_with_resync(&(MIN_IDLE_RESYNC_INTERVAL_SECS - 1).to_string()).expect("parse");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn resync_interval_above_the_ceiling_is_rejected() {
+        let cfg = cfg_with_resync(&(MAX_IDLE_RESYNC_INTERVAL_SECS + 1).to_string()).expect("parse");
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn resync_interval_at_the_bounds_is_accepted() {
+        for value in [MIN_IDLE_RESYNC_INTERVAL_SECS, MAX_IDLE_RESYNC_INTERVAL_SECS] {
+            let cfg = cfg_with_resync(&value.to_string()).expect("parse");
+            cfg.validate().unwrap_or_else(|e| panic!("{value}: {e}"));
+        }
+    }
 }

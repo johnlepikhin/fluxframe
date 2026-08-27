@@ -38,8 +38,9 @@ pub use bus::{BusEvent, BusListener, BusSource, WatchedPipeline, translate_fatal
 pub use slot::LatestFrameSlot;
 pub use util::{check_v4l2_input_access, check_v4l2_output_access};
 pub use v4l2::{
-    EnumerationStatus, V4l2Device, V4l2DeviceKind, enumerate_devices, enumerate_devices_in,
-    enumerate_devices_status, enumerate_devices_status_in,
+    EnumerationStatus, LoopbackState, V4l2Device, V4l2DeviceKind, enumerate_devices,
+    enumerate_devices_in, enumerate_devices_status, enumerate_devices_status_in,
+    read_loopback_state, read_loopback_state_in,
 };
 
 use fluxframe_core::error::PipelineError;

@@ -2823,6 +2823,13 @@ fn build_idle_runtime(
                 stale_balance_after: std::time::Duration::from_secs(u64::from(
                     cfg.idle.teardown_secs.max(1),
                 )),
+                // `0` is the operator's "never re-read" switch; the
+                // detector takes the absence of an interval rather than
+                // a zero-length one, so the off case cannot be confused
+                // with "as often as possible".
+                resync_interval: (cfg.idle.resync_interval_secs > 0).then(|| {
+                    std::time::Duration::from_secs(u64::from(cfg.idle.resync_interval_secs))
+                }),
             },
             detector_running,
             Arc::clone(counters),

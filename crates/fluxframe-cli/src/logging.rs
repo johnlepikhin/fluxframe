@@ -13,6 +13,7 @@
 //! it in later, once the daemon has a validated config — but only when
 //! neither of the two higher-precedence sources spoke up.
 
+use std::io::IsTerminal;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -83,7 +84,17 @@ pub fn init(verbosity: u8) -> Result<()> {
     let (filter_layer, handle) = reload::Layer::new(filter);
     Registry::default()
         .with(filter_layer)
-        .with(fmt::layer().with_target(true).with_level(true))
+        .with(
+            fmt::layer()
+                .with_target(true)
+                .with_level(true)
+                // `fmt` colours unconditionally by default, and under a
+                // service manager stdout is a log file — the escape
+                // sequences end up in it verbatim, which makes the file
+                // hostile to `grep` exactly when someone is reading it
+                // during an incident.
+                .with_ansi(std::io::stdout().is_terminal()),
+        )
         .try_init()
         .map_err(|e| anyhow::anyhow!("tracing init failed: {e}"))?;
 

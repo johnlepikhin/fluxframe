@@ -441,6 +441,7 @@ match the typical "step away from desk" use case:
 | `teardown_secs` | `5` | "No consumer" grace window before the camera drops. Absorbs Zoom / OBS reopen storms. |
 | `deep_idle_secs` | `30` | **Deprecated / ignored** since Stage 16 (the `DeepIdle` state was removed). Still accepted in TOML for back-compat; has no effect. |
 | `poll_interval_ms` | `250` | Polling-fallback walk cadence. The default path is event-driven via `inotify`, which ignores this knob; it only kicks in when `inotify` is unavailable (sandbox, watch-limit exhaustion). |
+| `resync_interval_secs` | `30` | How often the kernel-event path re-reads the driver's absolute capture-usage value instead of waiting for the next event. `0` disables it; otherwise `5..=3600`. Read once at detector start — changing it needs a daemon restart, not a `reload`. See "Re-reading the verdict" below. |
 
 A consumer disconnect triggers this lifecycle:
 
@@ -476,6 +477,39 @@ Two properties are worth knowing:
   daemon knows the state immediately instead of waiting for a change.
   Until the first reading arrives the status stays `Unknown`, which is
   treated as "consumer present" — idle never engages on an assumption.
+
+**Re-reading the verdict.** The subscription is edge-triggered, and that
+is a single point of failure: one event the driver never queues — or
+never delivers — latches the verdict for the rest of the run, and if the
+latched value is "nobody", the camera stays down until the daemon is
+restarted. Twice in production it did exactly that, for 49 minutes and
+for 19 hours.
+
+So every `idle.resync_interval_secs` the detector opens the node again,
+subscribes with `SEND_INITIAL`, reads the absolute value and closes.
+Nothing is retained and no buffers are claimed, so a live consumer
+cannot be displaced. When the re-read disagrees with the event-driven
+verdict, the daemon logs `consumer state drift` and corrects itself —
+immediately if the kernel says a client *is* streaming, and only after
+two consecutive agreeing re-reads in the other direction, because that
+one releases the camera under whoever is using it.
+
+Two side readings ride along on the same tick:
+
+- **`output_stream_up`** — whether *we* still hold the loopback's OUTPUT
+  stream. If we do not, the driver fails every consumer's `STREAMON`
+  with `EIO`, while `idle_frames_pushed_total` keeps climbing (it counts
+  frames handed to the pipeline, not writes that reached the device).
+  Nothing else in the daemon notices that state.
+- **`external_openers`** — when the driver says nobody is streaming, is
+  anybody nevertheless holding the node open? That combination is the
+  fingerprint of a client that opened the device and never reached
+  `STREAMON`, usually because another application already owns
+  v4l2loopback's single capture slot.
+
+The re-read runs only on the kernel-event path. The heuristic below
+cannot use it: the probe's own `open`/`close` would land in that path's
+open-balance and read as a consumer attaching.
 
 **Fallback: `inotify` + `/proc` walk.** When the subscription is
 unavailable (v4l2loopback older than 0.13, or a sink that owns no
@@ -532,7 +566,7 @@ Idle transitions are logged at `info!` with `target =
 
 - `idle_entered_total` — Active → Idle transitions.
 - `deep_idle_entered_total` — retained for dashboard back-compat; always `0` since the `DeepIdle` state was removed in Stage 16.
-- `idle_frames_pushed_total` — placeholder frames emitted.
+- `idle_frames_pushed_total` — placeholder frames emitted. Counts frames handed to the pipeline, **not** writes that reached the device — see `output_stream_up`.
 - `consumer_status` — the detector's current verdict (`0` Absent, `1` Present, `2` Unknown).
 - `consumer_clients` — capture clients reported by the kernel (0/1 on v4l2loopback 0.15).
 - `consumer_source` — which detection path is live; see the table above.
@@ -540,6 +574,18 @@ Idle transitions are logged at `info!` with `target =
 - `frames_out_while_no_consumer_total` — frames composited while the detector said nobody was attached.
 - `input_reacquire_total` / `input_reacquire_failures_total` — in-place camera recoveries that did not tear the loopback down.
 - `input_down_ms_total` — wall time with no valid input inside a run.
+- `consumer_resync_total` — authoritative re-reads taken. Flat over a long uptime means the safety net itself stopped running.
+- `consumer_resync_corrections_total` — re-reads that disagreed with the event-driven verdict. Non-zero means kernel events are being lost; the daemon repaired itself.
+- `consumer_resync_failures_total` — re-reads that could not be taken (no free opener slot, permissions, a driver without the event).
+- `consumer_last_external_event_age_secs` — age of the last client-usage event *not* caused by our own probe, or `u64::MAX` if none has arrived. A value that keeps growing while consumers come and go means the subscription has gone deaf.
+- `output_stream_up` — `1` we hold the loopback's OUTPUT stream, `0` we do not (consumers get `EIO`), `u64::MAX` not observed. `output_stream_down_total` counts the down edges.
+- `external_openers` — `1` somebody other than us holds the node open, `0` authoritatively nobody, `u64::MAX` not determined. `1` alongside `consumer_status=0` points at a client that could not claim the capture slot.
+
+Steady-state metric ticks that repeat the previous line verbatim are
+suppressed; one is emitted at least every 10 minutes so an idle daemon
+still proves it is alive. A tick is never suppressed when frames flowed,
+when any counter above changed, or when
+`consumer_last_external_event_age_secs` crosses five minutes.
 
 Status changes (`Present ↔ Absent` from the detector) also log at
 `info!` so a `RUST_LOG=info` operator sees consumer attach/detach

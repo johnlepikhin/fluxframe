@@ -60,8 +60,11 @@
 //! against the bindgen-generated structs, so a layout drift is a build
 //! error rather than a silent `ENOTTY`.
 
+use std::fs::OpenOptions;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
 use v4l::v4l_sys::{
     V4L2_EVENT_PRIVATE_START, V4L2_EVENT_SUB_FL_SEND_INITIAL, v4l2_event, v4l2_event_subscription,
@@ -406,6 +409,106 @@ impl ConsumerWatch {
         let bytes = unsafe { ev.u.data };
         let count = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         Ok(Dequeued::Usage(ClientUsage { count }))
+    }
+}
+
+/// Take a one-shot, authoritative reading of capture usage from `device`.
+///
+/// Opens the node, subscribes with `V4L2_EVENT_SUB_FL_SEND_INITIAL`,
+/// dequeues the value the driver queues in response, and closes
+/// everything again. Nothing is retained.
+///
+/// ## Why a fresh descriptor
+///
+/// A [`ConsumerWatch`] that is already subscribed cannot be asked for
+/// the current value: the kernel's `v4l2_event_subscribe()` finds the
+/// existing subscription for the `(type, id)` pair on that file handle,
+/// returns success and — crucially — does **not** call the driver's
+/// `add` op, which is what `SEND_INITIAL` is implemented by. Re-arming
+/// in place is therefore a no-op; only a new file handle produces a
+/// fresh initial value.
+///
+/// ## The probe is visible to other subscribers
+///
+/// v4l2loopback answers the subscription by queueing the event through
+/// `v4l2_event_queue()`, which fans out to **every** subscribed file
+/// handle on the node — including any long-lived [`ConsumerWatch`] the
+/// caller holds. That echo is useful (it repairs a stale verdict on the
+/// watch by itself) but it means a caller must not treat "an event
+/// arrived shortly after probing" as evidence of consumer activity, and
+/// must drain it before measuring how long the node has been quiet.
+///
+/// ## Cost and safety
+///
+/// One `open` + one `ioctl` + one `close`, plus one `max_openers` slot
+/// for the duration of the call. No `S_FMT`, `REQBUFS` or `STREAMON`, so
+/// the single capture slot v4l2loopback hands out is never claimed and a
+/// live consumer cannot be displaced. The node is opened read-only:
+/// `VIDIOC_SUBSCRIBE_EVENT` / `VIDIOC_DQEVENT` do not need write access.
+///
+/// `timeout_ms` must stay within the caller's shutdown budget — the same
+/// contract as [`ConsumerWatch::poll`], and for the same reason. The
+/// driver answers `SEND_INITIAL` synchronously, so a value in the tens
+/// of milliseconds is generous. Note the `open(2)` itself is not covered
+/// by it: the driver takes an interruptible mutex there, so a pathologically
+/// contended node can block for longer than `timeout_ms`.
+///
+/// # Errors
+///
+/// * [`io::ErrorKind::TimedOut`] — the driver queued nothing within
+///   `timeout_ms`. Deliberately an error rather than a `None`: "the
+///   kernel did not answer" must never be mistaken for "nobody is
+///   streaming", which would put the daemon to sleep under a live
+///   client.
+/// * `EBUSY` — no free opener slot on the node.
+/// * `ENOTTY` / `EINVAL` — the driver does not implement the event
+///   (not a v4l2loopback node, or older than 0.13). Permanent: retrying
+///   cannot fix it.
+/// * Anything else `open(2)` or the ioctls can raise.
+pub fn probe_client_usage(device: &Path, timeout_ms: i32) -> io::Result<ClientUsage> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(device)?;
+    let watch = ConsumerWatch::subscribe(file.as_fd())?;
+    watch.poll(timeout_ms)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "driver queued no client-usage event for a fresh SEND_INITIAL subscription",
+        )
+    })
+}
+
+/// How a caller should react to a [`probe_client_usage`] failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProbeFailure {
+    /// Retrying cannot help: the node does not implement the event
+    /// (`ENOTTY`/`EINVAL` — not a v4l2loopback node, or older than
+    /// 0.13) or we are not allowed to open it (`EACCES`/`EPERM`).
+    /// Callers should stop probing rather than log the same failure
+    /// every interval.
+    Permanent,
+    /// `EBUSY`: the node is at `max_openers`. Transient, but the caller
+    /// should back off — this is precisely when one more opener hurts,
+    /// since a real consumer opening right now gets the same error.
+    Busy,
+    /// Anything else: the node vanished, a signal interrupted the wait,
+    /// the driver stayed silent. Worth retrying on the next tick.
+    Transient,
+}
+
+/// Classify an error from [`probe_client_usage`].
+///
+/// Lives here rather than at the call site because it encodes which
+/// errnos this specific driver raises — the same knowledge the ioctl
+/// wrappers above already own.
+#[must_use]
+pub fn classify_probe_error(e: &io::Error) -> ProbeFailure {
+    match e.raw_os_error() {
+        Some(libc::ENOTTY | libc::EINVAL | libc::EACCES | libc::EPERM) => ProbeFailure::Permanent,
+        Some(libc::EBUSY) => ProbeFailure::Busy,
+        _ => ProbeFailure::Transient,
     }
 }
 

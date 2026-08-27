@@ -29,8 +29,9 @@ pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineErro
 pub use frame::{FrameBuffer, FrameMeta, PixelFormat, Timestamp, VideoFrame};
 pub use metadata::{CommitStrategy, EffectMetadata, ParamDescriptor, ParamKind, Scale};
 pub use metrics::{
-    CounterValues, Counters, EffectTelemetry, LatencyHistogram, LatencySnapshot, MetricsSnapshot,
-    PeriodicExtras, emit_metrics_line,
+    CONSUMER_EVENT_AGE_UNSET, CounterValues, Counters, EXTERNAL_OPENERS_UNSET, EffectTelemetry,
+    LatencyHistogram, LatencySnapshot, MetricsSnapshot, OUTPUT_STREAM_UNKNOWN, PeriodicExtras,
+    emit_metrics_line,
 };
 pub use plane::{FramePlane, MaskEffect, MaskPlane, PlaneEffect, PostEffect, SubchainKind};
 pub use protocol::{Command, Response, SetPath, default_socket_path, parse_set_path};

@@ -44,6 +44,23 @@ pub const CONSUMER_STATUS_UNSET: u64 = u64::MAX;
 /// sink that has none).
 pub const CONSUMER_SOURCE_UNSET: u64 = u64::MAX;
 
+/// Sentinel for `output_stream_up`: the producer's own OUTPUT stream has
+/// not been observed. Distinct from `0` ("observed, and it is down"),
+/// which is an actionable failure — the resync tick that reads it does
+/// not run on every presence source, and sysfs is not always readable.
+pub const OUTPUT_STREAM_UNKNOWN: u64 = u64::MAX;
+
+/// Sentinel for `consumer_last_external_event_age_secs` before any
+/// externally-attributable client-usage event has been seen. Zero would
+/// read as "an event just arrived", which is the exact false-healthy
+/// signal this gauge exists to remove.
+pub const CONSUMER_EVENT_AGE_UNSET: u64 = u64::MAX;
+
+/// Sentinel for `external_openers`: nobody has walked `/proc` yet, so
+/// "how many other processes hold the loopback" is unknown rather than
+/// zero.
+pub const EXTERNAL_OPENERS_UNSET: u64 = u64::MAX;
+
 /// Process-wide event counters.
 ///
 /// Shared between the supervisor (writer) and any metrics readers via
@@ -76,6 +93,12 @@ pub struct Counters {
     // state. `deep_idle_entered_total` is retained but always 0 — the
     // `DeepIdle` state was removed in Stage 16 (see the deprecated
     // `inc_deep_idle_entered`); the field stays for wire-compat.
+    //
+    // Scope note on `idle_frames_pushed_total`: it counts frames handed
+    // to the output pipeline, not writes that reached the device. A sink
+    // that stopped holding the driver's OUTPUT stream keeps this counter
+    // growing while every capture client gets `EIO` — `output_stream_up`
+    // is the signal that catches that case.
     idle_entered_total: AtomicU64,
     deep_idle_entered_total: AtomicU64,
     idle_frames_pushed_total: AtomicU64,
@@ -159,6 +182,52 @@ pub struct Counters {
     input_reacquire_total: AtomicU64,
     input_reacquire_failures_total: AtomicU64,
     input_down_ms_total: AtomicU64,
+    // Consumer-presence resync. The kernel client-usage subscription is
+    // edge-driven: one event the driver never queues (or never delivers)
+    // latches the verdict for the rest of the run, and the camera stays
+    // down until the daemon is restarted. The detector therefore re-reads
+    // the absolute value from the driver on a timer, and these three make
+    // that mechanism auditable:
+    //
+    // * `consumer_resync_total` is the liveness proof — a flat counter
+    //   over a long uptime means the tick itself stopped running, which
+    //   is otherwise indistinguishable from "nothing ever drifted".
+    // * `consumer_resync_corrections_total` counts re-reads that
+    //   disagreed with the event-driven verdict. Non-zero means events
+    //   are being lost; the initial sync out of `Unknown` deliberately
+    //   does NOT count here.
+    // * `consumer_resync_failures_total` counts re-reads that could not
+    //   be taken at all (no free opener slot, permissions, a driver
+    //   without the event).
+    consumer_resync_total: AtomicU64,
+    consumer_resync_corrections_total: AtomicU64,
+    consumer_resync_failures_total: AtomicU64,
+    // Age of the most recent client-usage event NOT attributable to our
+    // own resync probe, or [`CONSUMER_EVENT_AGE_UNSET`].
+    //
+    // The probe's subscription makes the driver queue an event to every
+    // subscribed file handle on the node — including the detector's own
+    // long-lived watch. Counting that echo as traffic would pin this
+    // gauge below the resync interval forever and erase the one symptom
+    // that identifies a deaf subscription ("no events for 49 minutes").
+    // The detector drains its own echo before updating this.
+    consumer_last_external_event_age_secs: AtomicU64,
+    // Does the producer still hold the loopback's OUTPUT stream? `1` yes,
+    // `0` no (every capture client gets `EIO` — see the scope note on
+    // `idle_frames_pushed_total`), [`OUTPUT_STREAM_UNKNOWN`] when it has
+    // not been observed. `output_stream_down_total` counts the down
+    // edges, so a fault that flapped between two metrics lines still
+    // leaves a trace.
+    output_stream_up: AtomicU64,
+    output_stream_down_total: AtomicU64,
+    // Whether anybody other than us holds the loopback node open — `1`
+    // for "at least one" (the walk stops at the first hit, so it is not
+    // a count), `0` for an authoritative nobody, or
+    // [`EXTERNAL_OPENERS_UNSET`] when the walk could not tell. `1` while
+    // `consumer_status` reads Absent is the fingerprint of a client that
+    // opened the device but never reached `STREAMON` — typically because
+    // another application already owns the single capture slot.
+    external_openers: AtomicU64,
 }
 
 impl Counters {
@@ -189,6 +258,13 @@ impl Counters {
             input_reacquire_total: AtomicU64::new(0),
             input_reacquire_failures_total: AtomicU64::new(0),
             input_down_ms_total: AtomicU64::new(0),
+            consumer_resync_total: AtomicU64::new(0),
+            consumer_resync_corrections_total: AtomicU64::new(0),
+            consumer_resync_failures_total: AtomicU64::new(0),
+            consumer_last_external_event_age_secs: AtomicU64::new(CONSUMER_EVENT_AGE_UNSET),
+            output_stream_up: AtomicU64::new(OUTPUT_STREAM_UNKNOWN),
+            output_stream_down_total: AtomicU64::new(0),
+            external_openers: AtomicU64::new(EXTERNAL_OPENERS_UNSET),
         }
     }
 
@@ -362,6 +438,83 @@ impl Counters {
         self.consumer_source.store(source, Ordering::Relaxed);
     }
 
+    /// Increment `consumer_resync_total` — one authoritative re-read of
+    /// the driver's capture-usage value was taken.
+    ///
+    /// Bump this on every tick, successful or not: it is the liveness
+    /// proof for the resync mechanism itself, and a mechanism that only
+    /// counts its successes cannot report that it stopped running.
+    #[inline]
+    pub fn inc_consumer_resync(&self) {
+        self.consumer_resync_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `consumer_resync_corrections_total` — a re-read
+    /// disagreed with the event-driven verdict.
+    ///
+    /// Only for a genuine disagreement between two verdicts. The first
+    /// sync out of `Unknown` (or out of "nothing published yet") is not
+    /// a correction: counting it would put a floor of one on every run
+    /// and destroy the counter's meaning as "events are being lost".
+    #[inline]
+    pub fn inc_consumer_resync_corrections(&self) {
+        self.consumer_resync_corrections_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment `consumer_resync_failures_total` — a re-read could not
+    /// be taken (no free opener slot, permissions, or a driver without
+    /// the client-usage event).
+    #[inline]
+    pub fn inc_consumer_resync_failures(&self) {
+        self.consumer_resync_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record how long ago the last *externally-caused* client-usage
+    /// event arrived, or [`CONSUMER_EVENT_AGE_UNSET`] if none has.
+    ///
+    /// The caller is responsible for excluding the echo of its own
+    /// resync probe — see the field comment. A value that keeps growing
+    /// while consumers come and go is the signature of a subscription
+    /// that has gone deaf.
+    #[inline]
+    pub fn set_consumer_last_external_event_age_secs(&self, age_secs: u64) {
+        self.consumer_last_external_event_age_secs
+            .store(age_secs, Ordering::Relaxed);
+    }
+
+    /// Record whether the producer still holds the loopback's OUTPUT
+    /// stream: `1` up, `0` down, [`OUTPUT_STREAM_UNKNOWN`] unobserved.
+    ///
+    /// `0` is actionable on its own: with no OUTPUT stream the driver
+    /// fails every capture `STREAMON` with `EIO`, so clients see a
+    /// broken camera while this daemon still reports healthy frame
+    /// counts.
+    #[inline]
+    pub fn set_output_stream_up(&self, state: u64) {
+        self.output_stream_up.store(state, Ordering::Relaxed);
+    }
+
+    /// Increment `output_stream_down_total` — one transition from
+    /// "producer is streaming" to "producer is not".
+    ///
+    /// Call on the edge, not on every observation: the gauge says what
+    /// is true now, this says how often it broke, and a per-observation
+    /// bump would conflate the two.
+    #[inline]
+    pub fn inc_output_stream_down(&self) {
+        self.output_stream_down_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record how many processes other than us hold the loopback node
+    /// open, or [`EXTERNAL_OPENERS_UNSET`] when that was not determined.
+    #[inline]
+    pub fn set_external_openers(&self, openers: u64) {
+        self.external_openers.store(openers, Ordering::Relaxed);
+    }
+
     /// Increment `frames_out_while_no_consumer_total` — one composited
     /// frame published while the detector reported `Absent`.
     #[inline]
@@ -428,6 +581,19 @@ impl Counters {
                 .input_reacquire_failures_total
                 .load(Ordering::Relaxed),
             input_down_ms_total: self.input_down_ms_total.load(Ordering::Relaxed),
+            consumer_resync_total: self.consumer_resync_total.load(Ordering::Relaxed),
+            consumer_resync_corrections_total: self
+                .consumer_resync_corrections_total
+                .load(Ordering::Relaxed),
+            consumer_resync_failures_total: self
+                .consumer_resync_failures_total
+                .load(Ordering::Relaxed),
+            consumer_last_external_event_age_secs: self
+                .consumer_last_external_event_age_secs
+                .load(Ordering::Relaxed),
+            output_stream_up: self.output_stream_up.load(Ordering::Relaxed),
+            output_stream_down_total: self.output_stream_down_total.load(Ordering::Relaxed),
+            external_openers: self.external_openers.load(Ordering::Relaxed),
         }
     }
 }
@@ -439,7 +605,15 @@ impl Default for Counters {
 }
 
 /// Plain-data snapshot of [`Counters`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// [`Default`] is hand-written rather than derived: the gauges that
+/// carry a sentinel must read "not observed" in a snapshot nobody has
+/// written to. A derived default would make an empty snapshot claim
+/// `output_stream_up = 0` ("the producer's OUTPUT stream is down") and
+/// `consumer_last_external_event_age_secs = 0` ("an event just
+/// arrived") — the false-healthy/false-alarm pair these sentinels exist
+/// to prevent. The values match [`Counters::new`] field for field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CounterValues {
     /// See [`Counters::frames_in`].
@@ -488,6 +662,26 @@ pub struct CounterValues {
     pub input_reacquire_failures_total: u64,
     /// See [`Counters::add_input_down_ms`].
     pub input_down_ms_total: u64,
+    /// See [`Counters::inc_consumer_resync`].
+    pub consumer_resync_total: u64,
+    /// See [`Counters::inc_consumer_resync_corrections`].
+    pub consumer_resync_corrections_total: u64,
+    /// See [`Counters::inc_consumer_resync_failures`].
+    pub consumer_resync_failures_total: u64,
+    /// See [`Counters::set_consumer_last_external_event_age_secs`].
+    pub consumer_last_external_event_age_secs: u64,
+    /// See [`Counters::set_output_stream_up`].
+    pub output_stream_up: u64,
+    /// See [`Counters::inc_output_stream_down`].
+    pub output_stream_down_total: u64,
+    /// See [`Counters::set_external_openers`].
+    pub external_openers: u64,
+}
+
+impl Default for CounterValues {
+    fn default() -> Self {
+        Counters::new().snapshot()
+    }
 }
 
 /// Bounded ring of latency samples in microseconds.
@@ -791,6 +985,13 @@ pub fn emit_metrics_line(snap: &MetricsSnapshot, extras: Option<PeriodicExtras>)
         input_reacquire_total,
         input_reacquire_failures_total,
         input_down_ms_total,
+        consumer_resync_total,
+        consumer_resync_corrections_total,
+        consumer_resync_failures_total,
+        consumer_last_external_event_age_secs,
+        output_stream_up,
+        output_stream_down_total,
+        external_openers,
     } = snap.counters;
 
     let ex = extras.unwrap_or_default();
@@ -834,6 +1035,13 @@ pub fn emit_metrics_line(snap: &MetricsSnapshot, extras: Option<PeriodicExtras>)
         input_reacquire_total = input_reacquire_total,
         input_reacquire_failures_total = input_reacquire_failures_total,
         input_down_ms_total = input_down_ms_total,
+        consumer_resync_total = consumer_resync_total,
+        consumer_resync_corrections_total = consumer_resync_corrections_total,
+        consumer_resync_failures_total = consumer_resync_failures_total,
+        consumer_last_external_event_age_secs = consumer_last_external_event_age_secs,
+        output_stream_up = output_stream_up,
+        output_stream_down_total = output_stream_down_total,
+        external_openers = external_openers,
         capture_p50_us = snap.capture.percentile_us(0.5),
         capture_p95_us = snap.capture.percentile_us(0.95),
         inference_p50_us = snap.inference.percentile_us(0.5),
