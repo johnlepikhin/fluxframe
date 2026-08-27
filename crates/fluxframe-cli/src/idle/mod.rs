@@ -17,6 +17,10 @@
 //!   see the module docs for why the heuristic cannot be authoritative
 //!   on its own. Linux-only, `cfg`-gated, and the supervisor consults
 //!   the same gate when wiring it.
+//! * `resync` — the detector's safety net: re-reads the driver's
+//!   absolute capture-usage value on a timer, because the kernel event
+//!   it otherwise relies on is edge-triggered and a single lost event
+//!   used to latch the verdict for the rest of the run.
 //! * `placeholder` (Step 2) — pre-rendered frame cache.
 //! * `managed_composite` (Step 2) — lifecycle wrapper around
 //!   `CompositeEffect` that owns the engine slot.
@@ -24,6 +28,11 @@
 
 #[cfg(target_os = "linux")]
 pub(crate) mod detector;
+// Level-triggered repair for the detector's verdict. Same `cfg` as
+// `detector`: it re-opens the same v4l2loopback node and is meaningless
+// without it.
+#[cfg(target_os = "linux")]
+pub(crate) mod resync;
 // `managed_composite` wraps `CompositeEffect` + ONNX engine
 // lifecycle, both of which are gated behind the `ml` feature in
 // fluxframe-effects. Without `ml` there is no engine to manage and
