@@ -547,6 +547,38 @@ mod tests {
     }
 
     #[test]
+    fn probe_errors_are_classified_by_errno() {
+        use super::{ProbeFailure, classify_probe_error};
+        use std::io;
+
+        // Permanent: the node cannot answer this question at all, so a
+        // caller that keeps retrying turns its failure counter into an
+        // uptime clock. Getting `EBUSY` into this set by accident would
+        // disable the safety net for the whole run on the first time
+        // the device hits `max_openers`.
+        for errno in [libc::ENOTTY, libc::EINVAL, libc::EACCES, libc::EPERM] {
+            assert_eq!(
+                classify_probe_error(&io::Error::from_raw_os_error(errno)),
+                ProbeFailure::Permanent,
+                "errno {errno}"
+            );
+        }
+        assert_eq!(
+            classify_probe_error(&io::Error::from_raw_os_error(libc::EBUSY)),
+            ProbeFailure::Busy
+        );
+        for e in [
+            io::Error::from_raw_os_error(libc::ENODEV),
+            io::Error::from_raw_os_error(libc::EINTR),
+            // No `raw_os_error` at all — the synthetic `TimedOut` this
+            // module returns when the driver queues nothing.
+            io::Error::from(io::ErrorKind::TimedOut),
+        ] {
+            assert_eq!(classify_probe_error(&e), ProbeFailure::Transient, "{e}");
+        }
+    }
+
+    #[test]
     fn ioc_encoding_matches_asm_generic_layout() {
         // dir in bits 30..32, size in 16..30, type in 8..16, nr in 0..8.
         assert_eq!(ioc(IOC_READ, 0, 0, 0), 0x8000_0000);

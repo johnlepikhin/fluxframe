@@ -2823,6 +2823,13 @@ fn build_idle_runtime(
                 stale_balance_after: std::time::Duration::from_secs(u64::from(
                     cfg.idle.teardown_secs.max(1),
                 )),
+                // The same knob, but a different contract: this one is
+                // the floor under the resync path's event-silence
+                // threshold, and must not follow a retune of the
+                // heuristic's decay above.
+                teardown_grace: std::time::Duration::from_secs(u64::from(
+                    cfg.idle.teardown_secs.max(1),
+                )),
                 // `0` is the operator's "never re-read" switch; the
                 // detector takes the absence of an interval rather than
                 // a zero-length one, so the off case cannot be confused

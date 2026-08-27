@@ -17,6 +17,11 @@
 //! a silent degradation is otherwise indistinguishable from a healthy
 //! run.
 //!
+//! The two kernel-event modes take a second knob,
+//! `idle.resync_interval_secs`: how often to re-read the driver instead
+//! of waiting for the next event (`0` disables it). The heuristic modes
+//! ignore it — see "The resync tick" below.
+//!
 //! ## Why the kernel event is the primary source
 //!
 //! Two earlier designs failed, and their failure modes are the reason
@@ -42,9 +47,21 @@
 //! `V4L2_EVENT_PRI_CLIENT_USAGE` (see
 //! [`fluxframe_gst::v4l2_events`]) sidesteps both: the driver reports
 //! capture usage as an absolute value, so there is no state to
-//! accumulate and drift, and no `/proc` access is involved. It also
-//! fires on `STREAMON`/`STREAMOFF` rather than `open`/`close`, so
-//! device enumeration no longer counts as a consumer.
+//! accumulate and drift, and the verdict never depends on `/proc`. It
+//! also fires on `STREAMON`/`STREAMOFF` rather than `open`/`close`, so
+//! device enumeration no longer counts as a consumer. (The resync tick
+//! below does walk `/proc`, but only for the `external_openers`
+//! diagnostic — never to decide presence.)
+//!
+//! ## The resync tick
+//!
+//! The subscription is edge-triggered, which makes it a single point of
+//! failure: an event the driver never queues — or never delivers —
+//! latches the verdict for the rest of the run. Every
+//! `idle.resync_interval_secs` the detector therefore re-reads the
+//! absolute value from a fresh descriptor and repairs itself. See
+//! [`resync_tick`] for the ordering constraints and
+//! [`ResyncSchedule`] for the cadence.
 //!
 //! Until the first reading arrives the status stays `Unknown`, which
 //! the state machine treats as "present": idle must never engage on an
@@ -163,9 +180,10 @@ use fluxframe_core::{
     OUTPUT_STREAM_UNKNOWN,
 };
 use fluxframe_gst::output::OutputSink;
-use fluxframe_gst::v4l2::{LoopbackState, read_loopback_state};
-use fluxframe_gst::v4l2_events::{
-    ClientUsage, ConsumerWatch, ProbeFailure, classify_probe_error, probe_client_usage,
+use fluxframe_gst::v4l2_events::ConsumerWatch;
+use fluxframe_gst::{
+    ClientUsage, LoopbackState, ProbeFailure, classify_probe_error, probe_client_usage,
+    read_loopback_state,
 };
 use tracing::{debug, info, warn};
 
@@ -187,6 +205,17 @@ const RESTAT_INTERVAL_POLLS: u32 = 60;
 /// least this often to re-check `running` / `stopped`, capping
 /// shutdown latency at this value regardless of `poll_interval`.
 const SHUTDOWN_POLL_GRANULARITY: Duration = Duration::from_millis(50);
+
+/// [`SHUTDOWN_POLL_GRANULARITY`] as a `poll(2)` timeout.
+///
+/// The saturating fallback deliberately rounds *down*: this timeout is
+/// consumed by blocking calls on the thread `ConsumerDetector::drop`
+/// joins, so an unrepresentable value must degrade into a shorter wait,
+/// never into `i32::MAX` milliseconds — that would turn a retuned
+/// constant into a shutdown deadlock.
+fn shutdown_bounded_timeout_ms() -> i32 {
+    i32::try_from(SHUTDOWN_POLL_GRANULARITY.as_millis()).unwrap_or(i32::from(u8::MAX))
+}
 
 /// Persistent `inotify::read_events` failures budget. The first
 /// failure already published `Unknown` (fail-open). After this many
@@ -291,8 +320,10 @@ impl NodeProbe for DeviceProbe {
         // The driver answers `SEND_INITIAL` synchronously, so the wait is
         // a formality — but it still runs on the thread `Drop` joins, so
         // it gets the same budget as every other blocking call here.
-        let timeout_ms = i32::try_from(SHUTDOWN_POLL_GRANULARITY.as_millis()).unwrap_or(i32::MAX);
-        probe_client_usage(&self.device, timeout_ms)
+        // Note the budget covers the `poll`, not the `open` before it:
+        // that one takes an interruptible driver mutex and has no
+        // timeout to give it. See `probe_client_usage`.
+        probe_client_usage(&self.device, shutdown_bounded_timeout_ms())
     }
 
     fn output_state(&self) -> LoopbackState {
@@ -354,6 +385,10 @@ struct DetectorContext<'a> {
     /// decay never fires faster than the grace period the operator
     /// configured for entering idle.
     stale_balance_after: Duration,
+    /// The operator's idle grace period, used by the resync path as the
+    /// floor for its event-silence threshold. See the field of the same
+    /// name on [`DetectorParams`].
+    teardown_grace: Duration,
     /// Per-detector test counter incremented in the inotify path on
     /// successful init + add_watch. See [`ConsumerDetector::inotify_activations_handle`].
     #[cfg(test)]
@@ -627,6 +662,13 @@ pub(crate) struct DetectorParams {
     /// Quiet period after which a `Present` verdict resting only on an
     /// unattributable open balance is discarded.
     pub(crate) stale_balance_after: Duration,
+    /// The operator's idle grace period (`idle.teardown_secs`).
+    ///
+    /// Its own field rather than a second reading of
+    /// `stale_balance_after`: that one is a heuristic-path knob that may
+    /// be retuned for `inotify` reasons, and the resync path's silence
+    /// threshold must not move silently when it is.
+    pub(crate) teardown_grace: Duration,
     /// How often to re-read the driver's absolute capture-usage value
     /// instead of trusting the event stream. `None` disables it.
     ///
@@ -832,6 +874,7 @@ fn run_detector(
         poll_interval,
         mode,
         stale_balance_after,
+        teardown_grace,
         resync_interval,
     } = params;
     let DetectorHandles {
@@ -884,6 +927,7 @@ fn run_detector(
         device_basename: &device_basename,
         counters: &counters,
         stale_balance_after,
+        teardown_grace,
         #[cfg(test)]
         inotify_activations: &inotify_activations,
     };
@@ -897,7 +941,7 @@ fn run_detector(
     // built here so the kernel-event path gets it without knowing how a
     // device path becomes a probe.
     let probe = DeviceProbe::new(device_path.clone());
-    let schedule = resync_interval.map_or(ResyncSchedule::Off, ResyncSchedule::Every);
+    let schedule = resync_interval.map_or(ResyncSchedule::Off, ResyncSchedule::every);
 
     // Try the inotify event-driven path first. On failure (watch
     // limit, sandbox restriction, device-node deleted mid-run, …)
@@ -1049,9 +1093,17 @@ fn park_until_stopped(ctx: &DetectorContext<'_>) {
 ///
 /// The loop does not interpret the signal: it takes each reading the
 /// driver hands it, asks the reading itself whether a capture client is
-/// streaming ([`ClientUsage::attached`]), and publishes that. No balance
-/// to accumulate, no `/proc` to walk, and therefore no way to drift into
-/// a latched verdict.
+/// streaming ([`ClientUsage::attached`]), and publishes that. There is
+/// no balance to accumulate, so the verdict cannot drift by degrees —
+/// but it *can* be lost outright, because the signal is edge-triggered:
+/// an event the driver never queues, or never delivers, leaves the last
+/// verdict standing for the rest of the run. Twice in production that
+/// verdict was `Absent`, and the camera stayed down until the daemon
+/// was restarted.
+///
+/// [`resync_tick`] is the answer to that: on the cadence given by
+/// `schedule` it re-reads the absolute value from the driver and
+/// corrects the verdict when the two disagree.
 ///
 /// Blocks in `wait` for at most [`SHUTDOWN_POLL_GRANULARITY`] so the
 /// thread stays responsive to `running` / `stopped` — the handle's
@@ -1072,15 +1124,17 @@ fn run_detector_client_usage<S: UsageSource, P: NodeProbe>(
     ctx: &DetectorContext<'_>,
     state: &mut DetectorState<'_>,
 ) -> io::Result<()> {
-    let timeout_ms = i32::try_from(SHUTDOWN_POLL_GRANULARITY.as_millis()).unwrap_or(i32::MAX);
+    let timeout_ms = shutdown_bounded_timeout_ms();
     ctx.counters.set_consumer_source(CONSUMER_SOURCE_KERNEL);
     info!(
         target: "fluxframe::idle",
         "consumer detection using kernel client-usage events"
     );
-    let mut resync = ResyncState::new(schedule, ctx.stale_balance_after);
+    let mut resync = ResyncState::new(schedule, ctx.teardown_grace);
+    resync.announce();
 
     while ctx.running.load(Ordering::Acquire) && !ctx.stopped.load(Ordering::Acquire) {
+        resync.note_iteration();
         if let Some(usage) = source.wait(timeout_ms)? {
             debug!(
                 target: "fluxframe::idle",
@@ -1109,6 +1163,12 @@ fn run_detector_client_usage<S: UsageSource, P: NodeProbe>(
 /// that says `consumer_status=1 consumer_clients=0` is exactly the kind
 /// of self-contradiction that costs an hour when reading logs after an
 /// incident.
+///
+/// The two are still separate atomics, so a snapshot taken between them
+/// can catch the pair mid-update. This narrows that window to a couple
+/// of instructions rather than closing it — closing it would mean
+/// packing verdict and count into one atomic, which is not worth the
+/// encoding for a diagnostic gauge.
 fn apply_usage(usage: ClientUsage, ctx: &DetectorContext<'_>, state: &mut DetectorState<'_>) {
     ctx.counters.set_consumer_clients(u64::from(usage.count));
     let status = if usage.attached() {
@@ -1137,6 +1197,35 @@ pub(crate) enum ResyncSchedule {
     EveryIterations(u32),
 }
 
+impl ResyncSchedule {
+    /// Build a wall-clock schedule, mapping a zero interval onto
+    /// [`Self::Off`].
+    ///
+    /// A zero-length `Every` would re-open the device on every loop
+    /// iteration — 20 opens a second against a node with ten opener
+    /// slots. The config layer already rejects it
+    /// (`MIN_IDLE_RESYNC_INTERVAL_SECS`), but the invariant belongs to
+    /// the type as well: a second construction site must not be able to
+    /// reintroduce it.
+    pub(crate) fn every(interval: Duration) -> Self {
+        if interval.is_zero() {
+            Self::Off
+        } else {
+            Self::Every(interval)
+        }
+    }
+
+    /// The configured cadence, or zero for schedules that have none.
+    fn interval(self) -> Duration {
+        match self {
+            Self::Every(d) => d,
+            Self::Off => Duration::ZERO,
+            #[cfg(test)]
+            Self::EveryIterations(_) => Duration::ZERO,
+        }
+    }
+}
+
 /// Backoff ceiling after `EBUSY` from the probe's `open`.
 ///
 /// `EBUSY` means the node is at `max_openers` — the one moment when one
@@ -1144,6 +1233,30 @@ pub(crate) enum ResyncSchedule {
 /// attach right then gets the same error. So the diagnostic backs off
 /// instead of competing for the last slot.
 const RESYNC_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// First backoff step after an `EBUSY`, before doubling.
+const RESYNC_BACKOFF_START: Duration = Duration::from_secs(1);
+
+/// How many consecutive re-reads must agree on "nobody is streaming"
+/// before the verdict is downgraded.
+///
+/// One is enough in the other direction. This side releases the camera
+/// `idle.teardown_secs` later, under whoever is using it, so it is worth
+/// one extra interval of delay. The value is part of the documented
+/// contract (README, changelog) — changing it changes user-visible
+/// behaviour.
+const RESYNC_ABSENT_CONFIRMATIONS: u8 = 2;
+
+/// How often the `/proc` census behind `external_openers` may run.
+///
+/// The census answers "is somebody holding the node without streaming",
+/// which changes on human timescales, and it costs a full `/proc` walk.
+/// Running it on every resync tick would put that walk in the idle
+/// steady state — where the daemon spends most of its life — for a gauge
+/// that almost never changes. A transition still forces a fresh census
+/// (see [`ResyncState::census_due`]), so the answer is never stale
+/// across a state change.
+const EXTERNAL_CENSUS_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Everything the resync tick has to remember between firings.
 ///
@@ -1157,16 +1270,25 @@ struct ResyncState {
     /// Set once a probe error proves permanent; stops the ticking for
     /// the rest of the run rather than retrying 120 times an hour.
     disabled: bool,
-    /// Deadline set after `EBUSY`, and the current backoff step.
+    /// Deadline set after `EBUSY`, the current backoff step, and the
+    /// step to return to once a probe succeeds again. Without the last
+    /// one the escalation is permanent: isolated `EBUSY`s minutes apart
+    /// would keep doubling from wherever the previous one left off.
     backoff_until: Option<Instant>,
     backoff: Duration,
+    backoff_base: Duration,
     /// Consecutive re-reads that said "nobody" while the verdict says
-    /// somebody. Two are required before acting — see [`Self::observe`].
+    /// somebody. [`RESYNC_ABSENT_CONFIRMATIONS`] are required before
+    /// acting, and any contradicting event resets the run — two
+    /// re-reads separated by "a client is streaming" are not two
+    /// consecutive re-reads.
     absent_streak: u8,
     /// Edge trackers for the three conditions worth one log line each.
     probe_failing: bool,
     output_down: Option<bool>,
     external_holder: Option<bool>,
+    /// When the census behind `external_holder` last ran.
+    last_census: Option<Instant>,
     /// When the last event we did NOT cause ourselves arrived, and the
     /// baseline to measure against before any has.
     last_external_event: Option<Instant>,
@@ -1180,26 +1302,7 @@ struct ResyncState {
 impl ResyncState {
     fn new(schedule: ResyncSchedule, teardown_grace: Duration) -> Self {
         let now = Instant::now();
-        let interval = if let ResyncSchedule::Every(d) = schedule {
-            d
-        } else {
-            Duration::ZERO
-        };
-        // Say which of the two it is at startup: a disabled safety net
-        // that looks armed is worse than no safety net at all.
-        if matches!(schedule, ResyncSchedule::Off) {
-            warn!(
-                target: "fluxframe::idle",
-                "consumer resync disabled by config — a lost kernel event will latch \
-                 the verdict until the daemon restarts"
-            );
-        } else {
-            info!(
-                target: "fluxframe::idle",
-                resync_interval_secs = interval.as_secs(),
-                "consumer resync armed"
-            );
-        }
+        let interval = schedule.interval();
         Self {
             schedule,
             last_tick: now,
@@ -1207,10 +1310,12 @@ impl ResyncState {
             disabled: false,
             backoff_until: None,
             backoff: interval,
+            backoff_base: interval,
             absent_streak: 0,
             probe_failing: false,
             output_down: None,
             external_holder: None,
+            last_census: None,
             last_external_event: None,
             started_at: now,
             // Three intervals of silence is not yet suspicious on a
@@ -1221,14 +1326,47 @@ impl ResyncState {
         }
     }
 
+    /// Announce at startup which of the two states the safety net is in.
+    ///
+    /// Deliberately not part of [`Self::new`]: a constructor that logs
+    /// cannot be called from a test or a diagnostic path without
+    /// polluting the output.
+    fn announce(&self) {
+        if matches!(self.schedule, ResyncSchedule::Off) {
+            warn!(
+                target: "fluxframe::idle",
+                "consumer resync disabled by config — a lost kernel event will latch \
+                 the verdict until the daemon restarts"
+            );
+        } else {
+            info!(
+                target: "fluxframe::idle",
+                resync_interval_secs = self.schedule.interval().as_secs(),
+                "consumer resync armed"
+            );
+        }
+    }
+
     /// An event arrived that we did not induce ourselves.
     fn note_external_event(&mut self) {
         self.last_external_event = Some(Instant::now());
         self.stale_warned = false;
+        // A re-read run before this event and one run after it are not
+        // "consecutive": the event is evidence against the downgrade
+        // they were accumulating towards.
+        self.absent_streak = 0;
     }
 
-    fn due(&mut self) -> bool {
+    /// Count one iteration of the detector loop.
+    ///
+    /// Separate from [`Self::due`] so the predicate stays a predicate —
+    /// and so the test schedule counts loop iterations rather than
+    /// "iterations on which somebody happened to ask".
+    fn note_iteration(&mut self) {
         self.iterations = self.iterations.saturating_add(1);
+    }
+
+    fn due(&self) -> bool {
         if self.disabled {
             return false;
         }
@@ -1243,6 +1381,20 @@ impl ResyncState {
             ResyncSchedule::Every(interval) => self.last_tick.elapsed() >= interval,
             #[cfg(test)]
             ResyncSchedule::EveryIterations(n) => n > 0 && self.iterations % n == 0,
+        }
+    }
+
+    /// May the `/proc` census run on this tick?
+    ///
+    /// Always when the previous answer is unknown — that is either the
+    /// first Absent tick or the tick right after a consumer detached,
+    /// which is exactly when an operator asks "who is holding it" —
+    /// and otherwise no more often than [`EXTERNAL_CENSUS_INTERVAL`].
+    fn census_due(&self) -> bool {
+        match self.last_census {
+            None => true,
+            Some(_) if self.external_holder.is_none() => true,
+            Some(at) => at.elapsed() >= EXTERNAL_CENSUS_INTERVAL,
         }
     }
 }
@@ -1281,17 +1433,36 @@ fn resync_tick<S: UsageSource, P: NodeProbe>(
                 resync.probe_failing = false;
             }
             resync.backoff_until = None;
+            // Escalation is per-incident, not for the rest of the run:
+            // without this, isolated `EBUSY`s hours apart would keep
+            // doubling and silently leave the safety net at the ceiling.
+            resync.backoff = resync.backoff_base;
             let echo_disagreed = drain_probe_echo(source, reading, ctx, state, resync);
             if !echo_disagreed {
                 reconcile(reading, believed, ctx, state, resync);
             }
-            check_external_holder(reading, ctx, resync);
+            // The census walks `/proc`, which has no upper bound on a
+            // busy host — do not start it if shutdown is already asked
+            // for, since `Drop` is waiting on this thread.
+            if !ctx.stopped.load(Ordering::Acquire) {
+                check_external_holder(reading, ctx, resync);
+            }
         }
         Err(e) => on_probe_error(&e, ctx, resync),
     }
 
     check_output_stream(probe, ctx, resync);
-    report_event_silence(ctx, resync);
+    if resync.disabled {
+        // The probe just proved permanently unavailable, so the age can
+        // never advance again. Leaving the last measured value in place
+        // would freeze the gauge at something small — "an event just
+        // arrived" — which is the false-healthy reading the sentinel
+        // exists to prevent.
+        ctx.counters
+            .set_consumer_last_external_event_age_secs(CONSUMER_EVENT_AGE_UNSET);
+    } else {
+        report_event_silence(ctx, resync);
+    }
 }
 
 /// Consume the event our own subscription just caused, if it is still
@@ -1301,6 +1472,12 @@ fn resync_tick<S: UsageSource, P: NodeProbe>(
 /// drain. That reading is newer, so it is applied — and the drift
 /// comparison is skipped for this tick, because a verdict that was
 /// correct until a moment ago is not evidence of a deaf subscription.
+///
+/// Exactly one event is taken. If a genuine event was queued ahead of
+/// the echo and carries the same value, it is consumed in the echo's
+/// place and the echo itself reaches the main loop on the next
+/// iteration — costing the silence gauge one interval of accuracy, but
+/// never a state change.
 fn drain_probe_echo<S: UsageSource>(
     source: &mut S,
     reading: ClientUsage,
@@ -1308,8 +1485,21 @@ fn drain_probe_echo<S: UsageSource>(
     state: &mut DetectorState<'_>,
     resync: &mut ResyncState,
 ) -> bool {
-    let Ok(Some(echo)) = source.wait(0) else {
-        return false;
+    let echo = match source.wait(0) {
+        Ok(Some(echo)) => echo,
+        Ok(None) => return false,
+        // The subscription is dead. Not fatal here — the next
+        // `wait(timeout)` in the main loop surfaces it and the caller
+        // falls back — but losing the fact entirely would hide *where*
+        // it died.
+        Err(e) => {
+            debug!(
+                target: "fluxframe::idle",
+                error = %e,
+                "echo drain failed; the subscription looks dead"
+            );
+            return false;
+        }
     };
     if echo == reading {
         return false;
@@ -1384,12 +1574,14 @@ fn reconcile(
 
     // Downgrades are the expensive direction: `idle.teardown_secs` after
     // this the camera is released, and a client mid-call sees it vanish.
-    // Require two consecutive re-reads to agree before paying that.
+    // Require several consecutive re-reads to agree before paying that.
     resync.absent_streak = resync.absent_streak.saturating_add(1);
-    if resync.absent_streak < 2 {
+    if resync.absent_streak < RESYNC_ABSENT_CONFIRMATIONS {
         debug!(
             target: "fluxframe::idle",
-            "holding the Present verdict until a second re-read agrees"
+            confirmations = resync.absent_streak,
+            required = RESYNC_ABSENT_CONFIRMATIONS,
+            "holding the Present verdict until another re-read agrees"
         );
         return;
     }
@@ -1422,7 +1614,7 @@ fn on_probe_error(e: &io::Error, ctx: &DetectorContext<'_>, resync: &mut ResyncS
         }
         ProbeFailure::Busy => {
             let step = if resync.backoff.is_zero() {
-                Duration::from_secs(1)
+                RESYNC_BACKOFF_START
             } else {
                 resync.backoff
             };
@@ -1501,17 +1693,28 @@ fn check_external_holder(
 ) {
     if reading.attached() {
         // Somebody is streaming; who else holds an fd is not interesting.
+        // Clearing the edge tracker also forces a fresh census on the
+        // first tick after they detach.
         ctx.counters.set_external_openers(EXTERNAL_OPENERS_UNSET);
         resync.external_holder = None;
         return;
     }
+    if !resync.census_due() {
+        return;
+    }
+    resync.last_census = Some(Instant::now());
     match count_external_consumers(ctx.proc_root, ctx.device_basename, ctx.my_pid) {
         WalkOutcome::External { pid } => {
             // The walk short-circuits on the first hit, so this gauge is
             // "at least one", not a count.
             ctx.counters.set_external_openers(1);
             if resync.external_holder != Some(true) {
-                let comm = read_comms(ctx.proc_root, &[pid]).pop().unwrap_or_default();
+                // `comm` is set by the other process (`PR_SET_NAME`) and
+                // can carry newlines or escapes; it goes into a log line
+                // an operator reads during an incident.
+                let comm = read_comm(ctx.proc_root, pid)
+                    .map(|c| c.escape_default().to_string())
+                    .unwrap_or_default();
                 warn!(
                     target: "fluxframe::idle",
                     holder_pid = pid,
@@ -1967,16 +2170,23 @@ fn walk_observe_publish(
     publish_if_changed(status, ctx.status, state.last_status, ctx.counters);
 }
 
+/// Best-effort read of `/proc/<pid>/comm`.
+///
+/// `None` for a process that exited between the walk and the read, or
+/// whose `comm` we may not read. The value is attacker-controlled
+/// (`PR_SET_NAME`): escape it before it reaches a log line.
+fn read_comm(proc_root: &Path, pid: u32) -> Option<String> {
+    std::fs::read_to_string(proc_root.join(pid.to_string()).join("comm"))
+        .ok()
+        .map(|s| s.trim_end().to_string())
+}
+
 /// Best-effort read of `/proc/<pid>/comm` for a sample of pids, for the
 /// EACCES-storm diagnostic. Failures (ENOENT for a process that exited)
 /// are skipped. Called only when the gate fires.
 fn read_comms(proc_root: &Path, pids: &[u32]) -> Vec<String> {
     pids.iter()
-        .filter_map(|&pid| {
-            std::fs::read_to_string(proc_root.join(pid.to_string()).join("comm"))
-                .ok()
-                .map(|s| s.trim_end().to_string())
-        })
+        .filter_map(|&pid| read_comm(proc_root, pid))
         .collect()
 }
 
@@ -2215,6 +2425,7 @@ mod tests {
         let ctx = DetectorContext {
             proc_root,
             stale_balance_after: Duration::from_secs(3600),
+            teardown_grace: Duration::from_secs(5),
             my_pid: 9999,
             running: &running,
             status: &status,
@@ -2454,6 +2665,7 @@ mod tests {
         let ctx = DetectorContext {
             proc_root,
             stale_balance_after: Duration::from_secs(3600),
+            teardown_grace: Duration::from_secs(5),
             my_pid: 9999,
             running: &running,
             status: &status,
@@ -2465,6 +2677,168 @@ mod tests {
             inotify_activations: &activations,
         };
         f(&ctx)
+    }
+
+    #[test]
+    fn the_wall_clock_schedule_fires_only_after_its_interval() {
+        // The production schedule. Every other resync test drives the
+        // test-only iteration variant, so without this the dispatcher
+        // branch that actually ships is never executed: "the tick never
+        // fires" would pass the whole suite.
+        let never = ResyncState::new(
+            ResyncSchedule::every(Duration::from_secs(3600)),
+            Duration::from_secs(5),
+        );
+        assert!(!never.due(), "a fresh state must wait out its interval");
+
+        let now = ResyncState::new(
+            ResyncSchedule::every(Duration::from_millis(1)),
+            Duration::from_secs(5),
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(now.due());
+    }
+
+    #[test]
+    fn a_zero_interval_is_not_a_schedule() {
+        // Guards the invariant at the type: `Every(ZERO)` would re-open
+        // the device on every loop iteration, twenty times a second.
+        let state = ResyncState::new(
+            ResyncSchedule::every(Duration::ZERO),
+            Duration::from_secs(5),
+        );
+        assert!(matches!(state.schedule, ResyncSchedule::Off));
+        assert!(!state.due());
+    }
+
+    #[test]
+    fn a_disabled_resync_never_fires_again() {
+        let mut state = ResyncState::new(
+            ResyncSchedule::every(Duration::from_millis(1)),
+            Duration::from_secs(5),
+        );
+        state.disabled = true;
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(!state.due());
+    }
+
+    #[test]
+    fn busy_backs_off_and_recovers_to_the_configured_interval() {
+        // The regression this guards: `backoff` used to keep its
+        // escalated value after a success, so isolated EBUSYs hours
+        // apart doubled from wherever the previous incident left off
+        // and pinned the safety net at the five-minute ceiling.
+        // Spelled numerically because this crate does not depend on
+        // `libc` — same convention as `ENODEV` below.
+        const EBUSY: i32 = 16;
+        let counters = Counters::new();
+        let interval = Duration::from_secs(30);
+        let mut resync = ResyncState::new(ResyncSchedule::every(interval), Duration::from_secs(5));
+        let busy = io::Error::from_raw_os_error(EBUSY);
+
+        with_ctx(Path::new("/proc"), &counters, |ctx| {
+            on_probe_error(&busy, ctx, &mut resync);
+            let first = resync.backoff;
+            assert!(resync.backoff_until.is_some(), "EBUSY must back off");
+            assert!(!resync.due(), "the backoff deadline suppresses the tick");
+
+            on_probe_error(&busy, ctx, &mut resync);
+            assert!(
+                resync.backoff > first,
+                "consecutive EBUSY must escalate: {first:?} -> {:?}",
+                resync.backoff
+            );
+            assert!(resync.backoff <= RESYNC_BACKOFF_MAX);
+        });
+
+        // A success ends the incident; the next one starts over.
+        resync.backoff_until = None;
+        resync.backoff = resync.backoff_base;
+        assert_eq!(resync.backoff, interval);
+        assert_eq!(counters.snapshot().consumer_resync_failures_total, 2);
+    }
+
+    #[test]
+    fn a_permanent_failure_is_not_retried_and_takes_the_gauge_with_it() {
+        const ENOTTY: i32 = 25;
+        let counters = Counters::new();
+        let mut resync = ResyncState::new(
+            ResyncSchedule::every(Duration::from_millis(1)),
+            Duration::from_secs(5),
+        );
+        with_ctx(Path::new("/proc"), &counters, |ctx| {
+            on_probe_error(&io::Error::from_raw_os_error(ENOTTY), ctx, &mut resync);
+        });
+        assert!(resync.disabled);
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(!resync.due());
+        assert_eq!(
+            counters.snapshot().consumer_last_external_event_age_secs,
+            fluxframe_core::CONSUMER_EVENT_AGE_UNSET
+        );
+    }
+
+    #[test]
+    fn event_silence_is_measured_only_from_real_events() {
+        let counters = Counters::new();
+        let mut resync = ResyncState::new(ResyncSchedule::Off, Duration::from_secs(5));
+        resync.stale_after = Duration::ZERO;
+
+        with_ctx(Path::new("/proc"), &counters, |ctx| {
+            // Nothing observed yet: the gauge must stay at the sentinel
+            // rather than claim "an event just arrived".
+            report_event_silence(ctx, &mut resync);
+            assert_eq!(
+                counters.snapshot().consumer_last_external_event_age_secs,
+                fluxframe_core::CONSUMER_EVENT_AGE_UNSET
+            );
+            // ...but the threshold still runs off the loop's start, so a
+            // subscription that was already deaf at startup is reported.
+            assert!(resync.stale_warned);
+
+            resync.note_external_event();
+            assert!(!resync.stale_warned, "a real event re-arms the warning");
+            report_event_silence(ctx, &mut resync);
+            assert_ne!(
+                counters.snapshot().consumer_last_external_event_age_secs,
+                fluxframe_core::CONSUMER_EVENT_AGE_UNSET
+            );
+        });
+    }
+
+    #[test]
+    fn an_external_event_breaks_a_run_of_agreeing_reads() {
+        // Two re-reads separated by "a client is streaming" are not two
+        // consecutive re-reads, and must not release the camera.
+        let mut resync = ResyncState::new(ResyncSchedule::Off, Duration::from_secs(5));
+        resync.absent_streak = 1;
+        resync.note_external_event();
+        assert_eq!(resync.absent_streak, 0);
+    }
+
+    #[test]
+    fn the_proc_census_is_throttled_between_state_changes() {
+        // The walk is unbounded on a busy host, and the question it
+        // answers changes on human timescales — running it on every
+        // tick would put it in the idle steady state.
+        let dir = tempfile::tempdir().expect("tempdir");
+        make_proc_entry(dir.path(), 4321, 7, Path::new("/dev/video10"));
+        let counters = Counters::new();
+        let mut resync = ResyncState::new(ResyncSchedule::Off, Duration::from_secs(5));
+
+        with_ctx(dir.path(), &counters, |ctx| {
+            assert!(resync.census_due(), "the first Absent tick must census");
+            check_external_holder(ClientUsage { count: 0 }, ctx, &mut resync);
+            assert_eq!(counters.snapshot().external_openers, 1);
+            assert!(
+                !resync.census_due(),
+                "a second tick moments later must not walk /proc again"
+            );
+
+            // A consumer attaching and detaching invalidates the answer.
+            check_external_holder(ClientUsage { count: 1 }, ctx, &mut resync);
+            assert!(resync.census_due(), "a state change forces a fresh census");
+        });
     }
 
     #[test]
@@ -2905,6 +3279,7 @@ mod tests {
         let ctx = DetectorContext {
             proc_root,
             stale_balance_after: Duration::from_secs(3600),
+            teardown_grace: Duration::from_secs(5),
             my_pid: 9999,
             running: &running,
             status: &status,
@@ -3004,6 +3379,7 @@ mod tests {
                 poll_interval: Duration::from_millis(20),
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
+                teardown_grace: Duration::from_secs(5),
                 // The heuristic paths never resync — see the field docs.
                 resync_interval: None,
             },
@@ -3067,6 +3443,7 @@ mod tests {
                 poll_interval: Duration::from_secs(2), // long poll
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
+                teardown_grace: Duration::from_secs(5),
                 // The heuristic paths never resync — see the field docs.
                 resync_interval: None,
             },
@@ -3143,6 +3520,7 @@ mod tests {
                 poll_interval: Duration::from_millis(20),
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
+                teardown_grace: Duration::from_secs(5),
                 // The heuristic paths never resync — see the field docs.
                 resync_interval: None,
             },
@@ -3220,6 +3598,7 @@ mod tests {
                 poll_interval: Duration::from_millis(20),
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
+                teardown_grace: Duration::from_secs(5),
                 // The heuristic paths never resync — see the field docs.
                 resync_interval: None,
             },
@@ -3309,6 +3688,7 @@ mod tests {
                 poll_interval: Duration::from_millis(20),
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
+                teardown_grace: Duration::from_secs(5),
                 // The heuristic paths never resync — see the field docs.
                 resync_interval: None,
             },
@@ -3377,6 +3757,7 @@ mod tests {
                 poll_interval: Duration::from_millis(20),
                 mode: IdlePresenceSource::Inotify,
                 stale_balance_after: Duration::from_secs(3600),
+                teardown_grace: Duration::from_secs(5),
                 // The heuristic paths never resync — see the field docs.
                 resync_interval: None,
             },

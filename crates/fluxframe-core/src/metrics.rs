@@ -210,7 +210,10 @@ pub struct Counters {
     // long-lived watch. Counting that echo as traffic would pin this
     // gauge below the resync interval forever and erase the one symptom
     // that identifies a deaf subscription ("no events for 49 minutes").
-    // The detector drains its own echo before updating this.
+    // The detector drains one queued event after each probe to absorb
+    // that echo; a genuine event carrying the same value can be consumed
+    // in its place, which costs this gauge one interval of accuracy but
+    // never a state change.
     consumer_last_external_event_age_secs: AtomicU64,
     // Does the producer still hold the loopback's OUTPUT stream? `1` yes,
     // `0` no (every capture client gets `EIO` — see the scope note on
@@ -508,11 +511,16 @@ impl Counters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record how many processes other than us hold the loopback node
-    /// open, or [`EXTERNAL_OPENERS_UNSET`] when that was not determined.
+    /// Record whether anybody other than us holds the loopback node
+    /// open: `1` for "at least one", `0` for an authoritative nobody, or
+    /// [`EXTERNAL_OPENERS_UNSET`] when it was not determined.
+    ///
+    /// Not a count. The walk behind it stops at the first holder, so
+    /// summing or averaging this gauge is meaningless — and the
+    /// sentinel would poison the result if it were done anyway.
     #[inline]
-    pub fn set_external_openers(&self, openers: u64) {
-        self.external_openers.store(openers, Ordering::Relaxed);
+    pub fn set_external_openers(&self, held: u64) {
+        self.external_openers.store(held, Ordering::Relaxed);
     }
 
     /// Increment `frames_out_while_no_consumer_total` — one composited

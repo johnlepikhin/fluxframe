@@ -584,8 +584,13 @@ Idle transitions are logged at `info!` with `target =
 Steady-state metric ticks that repeat the previous line verbatim are
 suppressed; one is emitted at least every 10 minutes so an idle daemon
 still proves it is alive. A tick is never suppressed when frames flowed,
-when any counter above changed, or when
-`consumer_last_external_event_age_secs` crosses five minutes.
+when any counter other than `idle_frames_pushed_total`,
+`consumer_resync_total` and `consumer_last_external_event_age_secs`
+changed, or on the tick where the last of those first crosses five
+minutes. Those three advance on their own schedule, so counting them
+would suppress nothing; the silence threshold is an edge rather than a
+level for the same reason — a node nobody uses is legitimately quiet for
+hours.
 
 Status changes (`Present ↔ Absent` from the detector) also log at
 `info!` so a `RUST_LOG=info` operator sees consumer attach/detach

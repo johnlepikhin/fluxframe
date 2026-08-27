@@ -44,14 +44,19 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// dead reporter looks exactly like a quiet one.
 const QUIET_HEARTBEAT: Duration = Duration::from_secs(600);
 
-/// Silence threshold for the client-usage gauge, above which a tick is
-/// never suppressed.
+/// Silence threshold for the client-usage gauge: the tick that carries
+/// the gauge *across* this value is always emitted.
 ///
 /// The gauge grows every tick by construction, so it cannot take part in
-/// the equality test — but a *large* value is the one thing an idle
-/// daemon can report that is genuinely alarming (the presence
+/// the equality test — but crossing this threshold is the one thing an
+/// idle daemon can report that is genuinely alarming (the presence
 /// subscription has gone deaf), and hiding it behind a ten-minute
 /// heartbeat would make the next incident harder to read than the last.
+///
+/// Strictly an *edge*: a level test would hold forever, because a node
+/// nobody uses is legitimately silent for hours — and suppression, the
+/// whole point of this module, would switch itself off five minutes
+/// into every idle period.
 const EVENT_SILENCE_ALERT: Duration = Duration::from_secs(300);
 
 /// Whether a tick is worth a log line.
@@ -59,6 +64,21 @@ const EVENT_SILENCE_ALERT: Duration = Duration::from_secs(300);
 enum TickVerdict {
     Emit,
     Suppress,
+}
+
+/// What changed since the previously *emitted* tick.
+///
+/// A struct rather than four positional arguments: two `u64`s and two
+/// `Duration`s in a row are a transposition waiting to happen, and the
+/// cost of getting it wrong here is suppressing exactly the ticks this
+/// function exists to surface.
+struct TickInput<'a> {
+    prev: &'a CounterValues,
+    cur: &'a CounterValues,
+    frames_out_delta: u64,
+    dropped_delta: u64,
+    since_last_emit: Duration,
+    heartbeat: Duration,
 }
 
 /// Decide whether this tick says anything the previous one did not.
@@ -71,23 +91,23 @@ enum TickVerdict {
 /// on their own schedule and would make every tick look eventful: the
 /// idle placeholder frame count, the resync tick count, and the age of
 /// the last client-usage event.
-fn tick_verdict(
-    prev: &CounterValues,
-    cur: &CounterValues,
-    frames_out_delta: u64,
-    dropped_delta: u64,
-    since_last_emit: Duration,
-    heartbeat: Duration,
-) -> TickVerdict {
+fn tick_verdict(input: &TickInput<'_>) -> TickVerdict {
+    let TickInput {
+        prev,
+        cur,
+        frames_out_delta,
+        dropped_delta,
+        since_last_emit,
+        heartbeat,
+    } = *input;
+
     if frames_out_delta != 0 || dropped_delta != 0 {
         return TickVerdict::Emit;
     }
     if since_last_emit >= heartbeat {
         return TickVerdict::Emit;
     }
-    if cur.consumer_last_external_event_age_secs != CONSUMER_EVENT_AGE_UNSET
-        && cur.consumer_last_external_event_age_secs >= EVENT_SILENCE_ALERT.as_secs()
-    {
+    if crossed_silence_threshold(prev, cur) {
         return TickVerdict::Emit;
     }
     let mut baseline = *prev;
@@ -99,6 +119,22 @@ fn tick_verdict(
     } else {
         TickVerdict::Emit
     }
+}
+
+/// Did the event-silence gauge cross [`EVENT_SILENCE_ALERT`] between the
+/// last emitted tick and this one?
+///
+/// The sentinel is not a duration and must not be compared as one: read
+/// as seconds it is larger than any threshold, so treating it as a level
+/// would emit on every tick of a run that has seen no events at all.
+fn crossed_silence_threshold(prev: &CounterValues, cur: &CounterValues) -> bool {
+    let measured = |v: u64| (v != CONSUMER_EVENT_AGE_UNSET).then_some(v);
+    let threshold = EVENT_SILENCE_ALERT.as_secs();
+    let now_over =
+        measured(cur.consumer_last_external_event_age_secs).is_some_and(|v| v >= threshold);
+    let was_over =
+        measured(prev.consumer_last_external_event_age_secs).is_some_and(|v| v >= threshold);
+    now_over && !was_over
 }
 
 /// Handle to the reporter thread.  Dropping joins the thread; a panic
@@ -191,14 +227,14 @@ fn reporter_loop(
         // otherwise a suppressed tick would fold its frames into the
         // next emitted window and misreport fps.
         let verdict = last_emitted.as_ref().map_or(TickVerdict::Emit, |prev| {
-            tick_verdict(
+            tick_verdict(&TickInput {
                 prev,
-                &snap.counters,
-                frames_delta,
+                cur: &snap.counters,
+                frames_out_delta: frames_delta,
                 dropped_delta,
-                now.duration_since(last_emit),
-                QUIET_HEARTBEAT,
-            )
+                since_last_emit: now.duration_since(last_emit),
+                heartbeat: QUIET_HEARTBEAT,
+            })
         });
         if verdict == TickVerdict::Suppress {
             continue;
@@ -231,15 +267,17 @@ mod tests {
         c
     }
 
+    /// A tick with no frames and well inside the heartbeat window: the
+    /// case where suppression is allowed to make a decision.
     fn verdict(prev: &CounterValues, cur: &CounterValues) -> TickVerdict {
-        tick_verdict(
+        tick_verdict(&TickInput {
             prev,
             cur,
-            0,
-            0,
-            Duration::from_secs(30),
-            Duration::from_secs(600),
-        )
+            frames_out_delta: 0,
+            dropped_delta: 0,
+            since_last_emit: Duration::from_secs(30),
+            heartbeat: Duration::from_secs(600),
+        })
     }
 
     #[test]
@@ -279,14 +317,14 @@ mod tests {
     #[test]
     fn frames_flowing_is_always_eventful() {
         assert_eq!(
-            tick_verdict(
-                &quiet(),
-                &quiet(),
-                750,
-                0,
-                Duration::from_secs(30),
-                Duration::from_secs(600)
-            ),
+            tick_verdict(&TickInput {
+                prev: &quiet(),
+                cur: &quiet(),
+                frames_out_delta: 750,
+                dropped_delta: 0,
+                since_last_emit: Duration::from_secs(30),
+                heartbeat: Duration::from_secs(600),
+            }),
             TickVerdict::Emit
         );
     }
@@ -294,25 +332,52 @@ mod tests {
     #[test]
     fn the_heartbeat_breaks_a_long_silence() {
         assert_eq!(
-            tick_verdict(
-                &quiet(),
-                &quiet(),
-                0,
-                0,
-                Duration::from_secs(601),
-                Duration::from_secs(600)
-            ),
+            tick_verdict(&TickInput {
+                prev: &quiet(),
+                cur: &quiet(),
+                frames_out_delta: 0,
+                dropped_delta: 0,
+                since_last_emit: Duration::from_secs(601),
+                heartbeat: Duration::from_secs(600),
+            }),
             TickVerdict::Emit
         );
     }
 
     #[test]
-    fn a_long_event_silence_defeats_suppression() {
+    fn crossing_the_event_silence_threshold_defeats_suppression() {
         // A deaf presence subscription is the one thing an otherwise
         // idle daemon can report that is worth reading promptly.
+        let mut prev = quiet();
+        prev.consumer_last_external_event_age_secs = EVENT_SILENCE_ALERT.as_secs() - 1;
         let mut cur = quiet();
         cur.consumer_last_external_event_age_secs = EVENT_SILENCE_ALERT.as_secs();
-        assert_eq!(verdict(&quiet(), &cur), TickVerdict::Emit);
+        assert_eq!(verdict(&prev, &cur), TickVerdict::Emit);
+    }
+
+    #[test]
+    fn staying_above_the_silence_threshold_is_suppressed_again() {
+        // The regression this guards: as a *level* test, the threshold
+        // switched suppression off permanently five minutes into every
+        // idle period — a node nobody uses is legitimately silent for
+        // hours, and the log went back to a line every 30 s.
+        let mut prev = quiet();
+        prev.consumer_last_external_event_age_secs = EVENT_SILENCE_ALERT.as_secs();
+        let mut cur = quiet();
+        cur.consumer_last_external_event_age_secs = EVENT_SILENCE_ALERT.as_secs() * 4;
+        assert_eq!(verdict(&prev, &cur), TickVerdict::Suppress);
+    }
+
+    #[test]
+    fn a_reattached_consumer_rearms_the_silence_edge() {
+        // Age resets when an event arrives, so the next slide into
+        // silence must be reported again rather than swallowed as
+        // "already known".
+        let mut prev = quiet();
+        prev.consumer_last_external_event_age_secs = 3;
+        let mut cur = quiet();
+        cur.consumer_last_external_event_age_secs = EVENT_SILENCE_ALERT.as_secs() + 30;
+        assert_eq!(verdict(&prev, &cur), TickVerdict::Emit);
     }
 
     #[test]

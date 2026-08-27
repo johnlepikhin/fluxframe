@@ -33,6 +33,23 @@ static FILTER_RELOAD: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::
 /// operator's explicit choice.
 static FILTER_PINNED: AtomicBool = AtomicBool::new(false);
 
+/// Should the log line carry ANSI colour?
+///
+/// Yes only for an interactive stdout, and never when `NO_COLOR` is set
+/// — the writer is stdout, so under a service manager "not a terminal"
+/// means "this is going into the log file", and the escapes would be
+/// stored verbatim. `CLICOLOR_FORCE` overrides in the other direction
+/// for people who pipe into a pager that understands colour.
+fn use_ansi() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if std::env::var_os("CLICOLOR_FORCE").is_some_and(|v| v != "0") {
+        return true;
+    }
+    std::io::stdout().is_terminal()
+}
+
 /// Map a `-v` repeat count onto a level name.
 fn verbosity_level(verbosity: u8) -> &'static str {
     match verbosity {
@@ -93,7 +110,7 @@ pub fn init(verbosity: u8) -> Result<()> {
                 // sequences end up in it verbatim, which makes the file
                 // hostile to `grep` exactly when someone is reading it
                 // during an incident.
-                .with_ansi(std::io::stdout().is_terminal()),
+                .with_ansi(use_ansi()),
         )
         .try_init()
         .map_err(|e| anyhow::anyhow!("tracing init failed: {e}"))?;

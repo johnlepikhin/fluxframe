@@ -42,6 +42,7 @@ pub use v4l2::{
     enumerate_devices_in, enumerate_devices_status, enumerate_devices_status_in,
     read_loopback_state, read_loopback_state_in,
 };
+pub use v4l2_events::{ClientUsage, ProbeFailure, classify_probe_error, probe_client_usage};
 
 use fluxframe_core::error::PipelineError;
 
