@@ -11,24 +11,30 @@
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
 use fluxframe_core::frame::{PixelFormat, VideoFrame};
+use fluxframe_core::metrics::StageKey;
 use fluxframe_core::plane::{
     FramePlane, MaskEffect, MaskPlane, PlaneEffect, PostEffect, SubchainKind,
 };
 use fluxframe_core::traits::{RawEffectParams, VideoEffect};
-use tracing::trace;
 
 use crate::composite::segmentation::{SegmentationBase, SegmentationOutcome};
 use crate::processing::compose::alpha_composite_rgb_in_place;
 use crate::processing::resize_mask_bilinear;
 
-/// Time a closure and return its result together with elapsed
-/// microseconds. Saturates to `u64::MAX` worth of micros on overflow
-/// (effectively impossible inside a per-frame stage).
-fn timed<R>(f: impl FnOnce() -> R) -> (R, u64) {
+/// Scope under which the composite's own stages are reported.
+const SCOPE: &str = "composite";
+
+/// Time `f` and publish the elapsed wall-clock under `key` through the
+/// frame's telemetry sink (a no-op sink costs one `Instant::now`
+/// pair).  The closure receives `ctx` back so the borrow of
+/// `ctx.telemetry` after the call does not clash with the stage's own
+/// use of the context.
+#[inline]
+fn timed<R>(ctx: &mut FrameContext, key: StageKey, f: impl FnOnce(&mut FrameContext) -> R) -> R {
     let start = std::time::Instant::now();
-    let r = f();
-    let us = u64::try_from(start.elapsed().as_micros()).unwrap_or(0);
-    (r, us)
+    let r = f(ctx);
+    ctx.telemetry.record_stage(key, start.elapsed());
+    r
 }
 
 /// Build a `ProcessFailed` error for this effect with the given
@@ -313,7 +319,9 @@ impl VideoEffect for CompositeEffect {
         }
 
         // 1. Segmentation produces a mask at model resolution.
-        let (seg_result, seg_us) = timed(|| self.segmentation.process(frame, ctx));
+        let seg_result = timed(ctx, StageKey::new(SCOPE, "seg"), |ctx| {
+            self.segmentation.process(frame, ctx)
+        });
         let (mask_w, mask_h) = match seg_result {
             SegmentationOutcome::Ok { width, height } => (width, height),
             SegmentationOutcome::Fallback => {
@@ -323,16 +331,23 @@ impl VideoEffect for CompositeEffect {
             SegmentationOutcome::Fatal(err) => return Err(err),
         };
 
-        // 2. Mask chain at model resolution + 3. resize mask to frame
-        //    resolution. The composite owns the implicit upscale —
-        //    mask effects never resize.
-        let (mask_result, mask_us) = timed(|| -> Result<(), EffectError> {
-            {
-                let mut mask_plane = MaskPlane::new(self.segmentation.mask_mut(), mask_w, mask_h);
-                for effect in &mut self.mask_chain {
-                    effect.process(&mut mask_plane, ctx)?;
-                }
+        // 2. Mask chain at model resolution.
+        timed(ctx, StageKey::new(SCOPE, "mask_chain"), |ctx| {
+            let mut mask_plane = MaskPlane::new(self.segmentation.mask_mut(), mask_w, mask_h);
+            for effect in &mut self.mask_chain {
+                timed(
+                    ctx,
+                    StageKey::new(SubchainKind::Mask.as_str(), effect.name()),
+                    |ctx| effect.process(&mut mask_plane, ctx),
+                )?;
             }
+            Ok::<(), EffectError>(())
+        })?;
+
+        // 3. Resize mask to frame resolution. The composite owns the
+        //    implicit upscale — mask effects never resize.  Timed
+        //    separately from the chain: this is the frame-res part.
+        timed(ctx, StageKey::new(SCOPE, "mask_resize"), |_| {
             resize_mask_bilinear(
                 self.segmentation.mask(),
                 mask_w,
@@ -341,9 +356,7 @@ impl VideoEffect for CompositeEffect {
                 self.frame_w,
                 self.frame_h,
             );
-            Ok(())
         });
-        mask_result?;
 
         // 4. Promote the frame buffer to Owned so we can mutate it
         //    directly as the foreground plane.
@@ -356,31 +369,39 @@ impl VideoEffect for CompositeEffect {
 
         // 5. Snapshot the original frame into `bg_plane`. This is the
         //    only full-frame copy in the composite hot path.
-        self.bg_plane.copy_from_slice(frame_bytes);
+        timed(ctx, StageKey::new(SCOPE, "bg_copy"), |_| {
+            self.bg_plane.copy_from_slice(frame_bytes);
+        });
 
         // 6. Background chain runs on the snapshot.
-        let (bg_result, bg_us) = timed(|| -> Result<(), EffectError> {
+        timed(ctx, StageKey::new(SCOPE, "bg_chain"), |ctx| {
             let mut background = FramePlane::new(&mut self.bg_plane, self.frame_w, self.frame_h);
             for effect in &mut self.bg_chain {
-                effect.process(&mut background, ctx)?;
+                timed(
+                    ctx,
+                    StageKey::new(SubchainKind::Background.as_str(), effect.name()),
+                    |ctx| effect.process(&mut background, ctx),
+                )?;
             }
-            Ok(())
-        });
-        bg_result?;
+            Ok::<(), EffectError>(())
+        })?;
 
         // 7. Foreground chain runs in place on `frame.data`.
-        let (fg_result, fg_us) = timed(|| -> Result<(), EffectError> {
+        timed(ctx, StageKey::new(SCOPE, "fg_chain"), |ctx| {
             let mut foreground = FramePlane::new(frame_bytes, self.frame_w, self.frame_h);
             for effect in &mut self.fg_chain {
-                effect.process(&mut foreground, ctx)?;
+                timed(
+                    ctx,
+                    StageKey::new(SubchainKind::Foreground.as_str(), effect.name()),
+                    |ctx| effect.process(&mut foreground, ctx),
+                )?;
             }
-            Ok(())
-        });
-        fg_result?;
+            Ok::<(), EffectError>(())
+        })?;
 
         // 8. Composite bg into fg/frame in place using the parallel
         //    helper.
-        let ((), compose_us) = timed(|| {
+        timed(ctx, StageKey::new(SCOPE, "compose"), |_| {
             alpha_composite_rgb_in_place(frame_bytes, &self.bg_plane, &self.mask_full);
         });
 
@@ -388,20 +409,19 @@ impl VideoEffect for CompositeEffect {
         //    while reading the upscaled mask. Split-borrow so the
         //    mask buffer can be passed as `&MaskPlane` without
         //    clashing with `&mut self.post_chain`.
-        let (post_result, post_us) = timed(|| -> Result<(), EffectError> {
+        timed(ctx, StageKey::new(SCOPE, "post_chain"), |ctx| {
             let mut composed = FramePlane::new(frame_bytes, self.frame_w, self.frame_h);
             let mask_plane = MaskPlane::new(&mut self.mask_full, self.frame_w, self.frame_h);
             for effect in &mut self.post_chain {
-                effect.process(&mut composed, &mask_plane, ctx)?;
+                timed(
+                    ctx,
+                    StageKey::new(SubchainKind::Post.as_str(), effect.name()),
+                    |ctx| effect.process(&mut composed, &mask_plane, ctx),
+                )?;
             }
-            Ok(())
-        });
-        post_result?;
+            Ok::<(), EffectError>(())
+        })?;
 
-        trace!(
-            frame_seq = frame.meta.sequence,
-            seg_us, mask_us, fg_us, bg_us, compose_us, post_us, "composite per-stage timings",
-        );
         Ok(())
     }
 

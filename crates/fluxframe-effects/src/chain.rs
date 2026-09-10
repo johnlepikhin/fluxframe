@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
 use fluxframe_core::frame::VideoFrame;
+use fluxframe_core::metrics::StageKey;
 use fluxframe_core::plane::SubchainKind;
 use fluxframe_core::traits::{RawEffectParams, VideoEffect};
 
@@ -106,7 +107,15 @@ impl EffectChain {
         context: &mut FrameContext,
     ) -> Result<(), EffectError> {
         for effect in &mut self.effects {
-            effect.process(frame, context)?;
+            // `chain/<name>` lines up with the supervisor's
+            // `processing_*` histogram (which wraps this whole loop)
+            // and with the composite's own `composite/*` stages.
+            let start = std::time::Instant::now();
+            let result = effect.process(frame, context);
+            context
+                .telemetry
+                .record_stage(StageKey::new("chain", effect.name()), start.elapsed());
+            result?;
         }
         Ok(())
     }

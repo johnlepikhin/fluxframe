@@ -28,6 +28,7 @@ use std::sync::Arc;
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::InferenceError;
 use fluxframe_core::frame::{FrameBuffer, FrameMeta, PixelFormat, VideoFrame};
+use fluxframe_core::metrics::{EffectTelemetry, StageKey, StageTimings};
 use fluxframe_core::plane::PlaneEffect;
 use fluxframe_core::traits::{
     InferenceEngine, InferenceInput, InferenceOutput, ModelInfo, RawEffectParams, VideoEffect,
@@ -206,9 +207,40 @@ fn composite_alpha_composites_foreground_over_background_fill() {
         FrameMeta::default(),
     )
     .expect("frame ok");
-    let mut ctx = FrameContext::default();
+    // Per-stage timing sink: the composite must publish its own
+    // stages plus one key per configured sub-effect.
+    let stages = Arc::new(StageTimings::with_capacity(8));
+    let mut ctx = FrameContext {
+        telemetry: EffectTelemetry::default().with_stages(Arc::clone(&stages)),
+        ..FrameContext::default()
+    };
 
     composite.process(&mut frame, &mut ctx).expect("process ok");
+
+    let recorded = stages.snapshot();
+    for expected in [
+        StageKey::new("composite", "seg"),
+        StageKey::new("seg", "preprocess"),
+        StageKey::new("seg", "decode"),
+        StageKey::new("composite", "mask_chain"),
+        StageKey::new("composite", "mask_resize"),
+        StageKey::new("composite", "bg_copy"),
+        StageKey::new("composite", "bg_chain"),
+        StageKey::new("background", "color_fill"),
+        StageKey::new("composite", "fg_chain"),
+        StageKey::new("composite", "compose"),
+        StageKey::new("composite", "post_chain"),
+    ] {
+        let stage = recorded
+            .iter()
+            .find(|s| s.key == expected)
+            .unwrap_or_else(|| panic!("stage {expected} must be recorded"));
+        assert_eq!(
+            stage.latency.len(),
+            1,
+            "one frame → one sample for {expected}"
+        );
+    }
 
     let out = frame.data.as_slice();
     assert_eq!(out.len(), 12, "2x2 RGB frame must be 12 bytes");

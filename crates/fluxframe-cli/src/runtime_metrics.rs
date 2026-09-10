@@ -14,6 +14,10 @@
 //!   [`fluxframe_core::FrameContext::telemetry`].  The supervisor wires
 //!   the bundle's `inference` histogram into the per-frame context
 //!   before calling [`fluxframe_effects::EffectChain::process`].
+//! * `stages`     — per-stage / per-effect breakdown of `processing`,
+//!   written by the chain and composite through
+//!   [`fluxframe_core::EffectTelemetry::record_stage`]; reported on the
+//!   sibling `stage timings` log line.
 //!
 //! Not wired yet:
 //! * `capture` — needs the GStreamer pipeline clock to subtract from
@@ -27,7 +31,9 @@
 
 use std::sync::Arc;
 
-use fluxframe_core::metrics::{Counters, EffectTelemetry, LatencyHistogram, MetricsSnapshot};
+use fluxframe_core::metrics::{
+    Counters, EffectTelemetry, LatencyHistogram, MetricsSnapshot, StageTimings,
+};
 
 /// Number of samples retained per per-stage histogram.
 ///
@@ -63,6 +69,11 @@ pub(crate) struct RuntimeMetrics {
     /// [`EffectTelemetry::record_inference`].  Empty for non-ML
     /// pipelines (passthrough leaves this untouched).
     pub(crate) inference: Arc<LatencyHistogram>,
+    /// Per-stage / per-effect timings inside `processing`, populated
+    /// via [`EffectTelemetry::record_stage`].  Empty for chains that
+    /// record nothing.  Same per-ring capacity as the histograms —
+    /// ~15–20 keys × 2048 × 8 B is a few hundred KB.
+    pub(crate) stages: Arc<StageTimings>,
 }
 
 impl RuntimeMetrics {
@@ -79,14 +90,16 @@ impl RuntimeMetrics {
             output: hist(),
             end_to_end: hist(),
             inference: hist(),
+            stages: Arc::new(StageTimings::with_capacity(PER_STAGE_HISTOGRAM_CAPACITY)),
         }
     }
 
     /// Build the [`EffectTelemetry`] sink the supervisor hands to
     /// effects via [`fluxframe_core::FrameContext::telemetry`].
-    /// Cheap `Arc` clone.
+    /// Cheap `Arc` clones.
     pub(crate) fn effect_telemetry(&self) -> EffectTelemetry {
         EffectTelemetry::with_inference(Arc::clone(&self.inference))
+            .with_stages(Arc::clone(&self.stages))
     }
 
     /// Take a unified [`MetricsSnapshot`] across counters and the
@@ -99,6 +112,7 @@ impl RuntimeMetrics {
             .with_output(self.output.snapshot())
             .with_end_to_end(self.end_to_end.snapshot())
             .with_inference(self.inference.snapshot())
+            .with_stages(self.stages.snapshot())
     }
 
     /// Reconcile [`Counters::add_frames_dropped`] against the input
@@ -153,6 +167,19 @@ mod tests {
         assert_eq!(s.inference.len(), 2);
         assert_eq!(s.inference.percentile_us(0.5), 8_000);
         assert_eq!(s.inference.percentile_us(1.0), 12_500);
+    }
+
+    #[test]
+    fn effect_telemetry_writes_to_shared_stage_table() {
+        use fluxframe_core::metrics::StageKey;
+        let m = RuntimeMetrics::new();
+        let t = m.effect_telemetry();
+        let key = StageKey::new("composite", "compose");
+        t.record_stage(key, std::time::Duration::from_micros(700));
+        let s = m.snapshot();
+        assert_eq!(s.stages.len(), 1);
+        assert_eq!(s.stages[0].key, key);
+        assert_eq!(s.stages[0].latency.percentile_us(0.5), 700);
     }
 
     #[test]

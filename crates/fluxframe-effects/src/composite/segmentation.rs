@@ -16,6 +16,7 @@ use fluxframe_core::Counters;
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::{EffectError, InferenceError};
 use fluxframe_core::frame::{PixelFormat, VideoFrame};
+use fluxframe_core::metrics::StageKey;
 use fluxframe_core::traits::{InferenceEngine, InferenceInput};
 use serde::Deserialize;
 use tracing::{info, warn};
@@ -64,6 +65,11 @@ pub const DEFAULT_FALLBACK_THRESHOLD: u32 = 3;
 /// specify `person_class_index`. Matches the convention of common
 /// person-segmentation datasets where background = 0, person = 1.
 const DEFAULT_PERSON_CLASS_INDEX: u32 = 1;
+
+/// Scope under which the pre/post-processing around inference is
+/// reported (`seg/preprocess`, `seg/decode`).  Inference itself goes
+/// to the dedicated `inference_*` histogram.
+const SEG_SCOPE: &str = "seg";
 
 /// Tolerance for matching a float-encoded integer label. The
 /// CategoryMask convention stores integer labels as `f32`; values
@@ -397,7 +403,9 @@ impl SegmentationBase {
             return SegmentationOutcome::Fatal(process_err("process called before prepare"));
         };
 
-        // 1. Resize frame → model_input_u8 (bilinear stretch).
+        // 1. Resize frame → model_input_u8 (bilinear stretch) and
+        // 2. normalise + pack.  Timed together as `seg/preprocess`.
+        let t_pre = std::time::Instant::now();
         resize_rgb_bilinear(
             frame.data.as_slice(),
             frame.width,
@@ -406,8 +414,6 @@ impl SegmentationBase {
             self.model_w,
             self.model_h,
         );
-
-        // 2. Normalise + pack.
         pack_input(
             &self.model_input_u8,
             &mut self.model_input_f32,
@@ -417,6 +423,8 @@ impl SegmentationBase {
             scale,
             zero,
         );
+        ctx.telemetry
+            .record_stage(StageKey::new(SEG_SCOPE, "preprocess"), t_pre.elapsed());
 
         // 3. Build input shape.
         let shape: [usize; 4] = match layout {
@@ -465,12 +473,16 @@ impl SegmentationBase {
                 "model_config missing — process called before prepare",
             ));
         };
-        if let Err(err) = decode_mask(
+        let t_dec = std::time::Instant::now();
+        let decoded = decode_mask(
             &output.data,
             &output.shape,
             &mut self.mask_raw,
             model_config,
-        ) {
+        );
+        ctx.telemetry
+            .record_stage(StageKey::new(SEG_SCOPE, "decode"), t_dec.elapsed());
+        if let Err(err) = decoded {
             return SegmentationOutcome::Fatal(err);
         }
 
