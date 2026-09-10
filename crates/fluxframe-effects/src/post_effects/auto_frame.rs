@@ -224,32 +224,28 @@ impl Default for AutoFrameEffect {
 /// Compute the bounding box of mask pixels above `threshold`. Returns
 /// `None` when no pixel exceeds the threshold (i.e. nobody detected).
 fn extract_bbox(mask: &[f32], width: usize, height: usize, threshold: f32) -> Option<SmoothBox> {
+    if width == 0 || height == 0 {
+        return None;
+    }
     let mut min_x = usize::MAX;
     let mut max_x = 0usize;
     let mut min_y = usize::MAX;
     let mut max_y = 0usize;
-    let mut any = false;
-    for y in 0..height {
-        let row_off = y * width;
-        for x in 0..width {
-            if mask[row_off + x] > threshold {
-                any = true;
-                if x < min_x {
-                    min_x = x;
-                }
-                if x > max_x {
-                    max_x = x;
-                }
-                if y < min_y {
-                    min_y = y;
-                }
-                if y > max_y {
-                    max_y = y;
-                }
-            }
-        }
+    // Per row, only the first and last hot pixel matter: `position` /
+    // `rposition` are tight scans that stop early, and a fully cold
+    // row costs one pass with no per-pixel branching on the min/max.
+    for (y, row) in mask.chunks_exact(width).take(height).enumerate() {
+        let Some(first) = row.iter().position(|&v| v > threshold) else {
+            continue;
+        };
+        // `rposition` cannot fail once `position` succeeded.
+        let last = row.iter().rposition(|&v| v > threshold).unwrap_or(first);
+        min_x = min_x.min(first);
+        max_x = max_x.max(last);
+        min_y = min_y.min(y);
+        max_y = y;
     }
-    if !any {
+    if min_x == usize::MAX {
         return None;
     }
     let cx = (min_x as f32 + max_x as f32 + 1.0) * 0.5;

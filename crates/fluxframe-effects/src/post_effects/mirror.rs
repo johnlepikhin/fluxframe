@@ -20,11 +20,14 @@ use fluxframe_core::metadata::EffectMetadata;
 use fluxframe_core::plane::{FramePlane, MaskPlane, PostEffect};
 use fluxframe_core::traits::RawEffectParams;
 
+use crate::processing::parallel::for_each_row_mut;
+
 /// In-place horizontal flip of the composited RGB frame.
 ///
 /// Stateless: no `configure` parameters, no scratch buffer. `process`
-/// runs `O(W·H)` time with zero heap allocations. The mask is ignored
-/// — the flip is geometric, not mask-aware.
+/// runs `O(W·H)` time with zero heap allocations, row-parallel on the
+/// shared pool. The mask is ignored — the flip is geometric, not
+/// mask-aware.
 #[derive(Debug, Default)]
 pub struct MirrorEffect;
 
@@ -81,20 +84,27 @@ impl PostEffect for MirrorEffect {
         if width < 2 {
             return Ok(());
         }
-        let row_bytes = width * 3;
-        let last_pixel_offset = (width - 1) * 3;
-        for row in plane.data.chunks_exact_mut(row_bytes) {
-            let mut left: usize = 0;
-            let mut right: usize = last_pixel_offset;
-            while left < right {
-                row.swap(left, right);
-                row.swap(left + 1, right + 1);
-                row.swap(left + 2, right + 2);
-                left += 3;
-                right -= 3;
-            }
-        }
+        // Rows are independent, so flip them on the shared rayon pool.
+        for_each_row_mut(plane.data, width * 3, |_, row| flip_row(row, width));
         Ok(())
+    }
+}
+
+/// Reverse the pixel order of one packed-RGB row in place.  The row is
+/// split into its left and right halves (the centre pixel of an
+/// odd-width row is left alone) and pixels are swapped pairwise from
+/// the outside in; the iterator form keeps the loop free of per-byte
+/// bounds checks.
+fn flip_row(row: &mut [u8], width: usize) {
+    let half_bytes = (width / 2) * 3;
+    let (left, rest) = row.split_at_mut(half_bytes);
+    let right_start = rest.len() - half_bytes;
+    let right = &mut rest[right_start..];
+    for (l, r) in left
+        .chunks_exact_mut(3)
+        .zip(right.chunks_exact_mut(3).rev())
+    {
+        l.swap_with_slice(r);
     }
 }
 
