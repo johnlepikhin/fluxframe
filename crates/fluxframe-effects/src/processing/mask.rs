@@ -71,8 +71,13 @@ pub fn dilate(mask: &mut [f32], scratch: &mut [f32], width: u32, height: u32, it
 }
 
 /// Edge feathering — soft-edge blur on the mask via a separable box
-/// blur of `radius` pixels.  Single pass; for stronger blur, increase
-/// `radius`.
+/// blur of `radius` pixels with clamp-to-edge borders.  Single pass;
+/// for stronger blur, increase `radius`.
+///
+/// Both passes are sliding-window running sums, so the cost is
+/// `O(width × height)` independent of `radius`.  The vertical pass is
+/// evaluated row-major against a per-column sum so every inner loop
+/// walks contiguous memory.
 ///
 /// `scratch` must be the same length as `mask`.
 ///
@@ -88,38 +93,41 @@ pub fn feather(mask: &mut [f32], scratch: &mut [f32], width: u32, height: u32, r
     let w = width as usize;
     let h = height as usize;
     let r = radius as usize;
-    let kernel_size = (2 * r + 1) as f32;
+    let inv_kernel = 1.0 / (2 * r + 1) as f32;
+    // Index of the element `r` before `i`, clamped to the edge; and of
+    // the element `r + 1` after `i`, clamped to `len - 1`.
+    let leave_at = |i: usize| i.saturating_sub(r);
+    let enter_at = |i: usize, len: usize| (i + r + 1).min(len - 1);
 
-    // Horizontal pass: mask → scratch
-    for y in 0..h {
-        for x in 0..w {
-            let x_start = x.saturating_sub(r);
-            let x_end = (x + r).min(w - 1);
-            // Edge pixels are repeated (clamp-to-edge) to keep the
-            // divisor uniform.
-            let left_pad = r - (x - x_start);
-            let right_pad = r - (x_end - x);
-            let mut sum =
-                mask[y * w + x_start] * left_pad as f32 + mask[y * w + x_end] * right_pad as f32;
-            for nx in x_start..=x_end {
-                sum += mask[y * w + nx];
-            }
-            scratch[y * w + x] = sum / kernel_size;
+    // Horizontal pass: mask → scratch, one running sum per row.
+    for (src_row, dst_row) in mask.chunks_exact(w).zip(scratch.chunks_exact_mut(w)) {
+        // Window centred on x = 0: `r + 1` copies of the edge element
+        // (clamp-to-edge) plus the next `r` elements.
+        let mut sum =
+            src_row[0] * (r + 1) as f32 + (1..=r).map(|dx| src_row[dx.min(w - 1)]).sum::<f32>();
+        for (x, out) in dst_row.iter_mut().enumerate() {
+            *out = sum * inv_kernel;
+            sum += src_row[enter_at(x, w)] - src_row[leave_at(x)];
         }
     }
-    // Vertical pass: scratch → mask
-    for y in 0..h {
-        let y_start = y.saturating_sub(r);
-        let y_end = (y + r).min(h - 1);
-        let top_pad = r - (y - y_start);
-        let bottom_pad = r - (y_end - y);
-        for x in 0..w {
-            let mut sum = scratch[y_start * w + x] * top_pad as f32
-                + scratch[y_end * w + x] * bottom_pad as f32;
-            for ny in y_start..=y_end {
-                sum += scratch[ny * w + x];
-            }
-            mask[y * w + x] = sum / kernel_size;
+
+    // Vertical pass: scratch → mask, one running sum per column,
+    // advanced a whole row at a time.
+    let row = |y: usize| &scratch[y * w..y * w + w];
+    let mut col_sum: Vec<f32> = row(0).iter().map(|v| v * (r + 1) as f32).collect();
+    for dy in 1..=r {
+        for (acc, v) in col_sum.iter_mut().zip(row(dy.min(h - 1))) {
+            *acc += v;
+        }
+    }
+    for (y, dst_row) in mask.chunks_exact_mut(w).enumerate() {
+        for (out, &acc) in dst_row.iter_mut().zip(&col_sum) {
+            *out = acc * inv_kernel;
+        }
+        let enter = row(enter_at(y, h));
+        let leave = row(leave_at(y));
+        for ((acc, &e), &l) in col_sum.iter_mut().zip(enter).zip(leave) {
+            *acc += e - l;
         }
     }
 }
@@ -207,6 +215,48 @@ mod tests {
         // Layout is row-major: mask[0] = (x=0, y=0), mask[3] = (x=3, y=0).
         assert!(mask[0] < 0.5); // top-left corner
         assert!(mask[3] > 0.5); // top-right corner
+    }
+
+    #[test]
+    fn feather_matches_naive_box_blur_reference() {
+        // Direct O(radius) evaluation with clamp-to-edge — the sliding
+        // window must agree to float noise, including a radius larger
+        // than the image so every window is fully clamped.
+        for &(w, h, r) in &[(9usize, 6usize, 1usize), (9, 6, 3), (5, 4, 7)] {
+            let src: Vec<f32> = (0..w * h)
+                .map(|i| ((i * 37 + 11) % 101) as f32 / 100.0)
+                .collect();
+            // Window `[i - r, i + r]` as offsets `i + d - r`, clamped to
+            // `[0, len - 1]` — evaluated with unsigned arithmetic only.
+            let window = |i: usize, len: usize| {
+                (0..=2 * r).map(move |d| (i + d).saturating_sub(r).min(len - 1))
+            };
+            let k = (2 * r + 1) as f32;
+            let mut hpass = vec![0.0_f32; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let s: f32 = window(x, w).map(|xx| src[y * w + xx]).sum();
+                    hpass[y * w + x] = s / k;
+                }
+            }
+            let mut expected = vec![0.0_f32; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    let s: f32 = window(y, h).map(|yy| hpass[yy * w + x]).sum();
+                    expected[y * w + x] = s / k;
+                }
+            }
+
+            let mut mask = src.clone();
+            let mut scratch = vec![0.0_f32; w * h];
+            feather(&mut mask, &mut scratch, w as u32, h as u32, r as u32);
+            for (i, (got, exp)) in mask.iter().zip(&expected).enumerate() {
+                assert!(
+                    (got - exp).abs() < 1e-5,
+                    "{w}x{h} r={r} idx {i}: {got} vs {exp}"
+                );
+            }
+        }
     }
 
     #[test]
