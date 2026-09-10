@@ -28,7 +28,7 @@
 //! `Arc` itself provides the synchronisation needed to observe the
 //! struct at all.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -692,7 +692,80 @@ impl Default for CounterValues {
     }
 }
 
-/// Bounded ring of latency samples in microseconds.
+/// Duration → microseconds, saturating at `u64::MAX` µs (≈584 942
+/// years) so no real latency ever truncates; the cap exists only to
+/// keep the API total in the face of an arithmetic bug elsewhere.
+#[inline]
+fn duration_to_us(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Bounded, lock-free ring of latency samples in microseconds — the
+/// storage shared by [`LatencyHistogram`] (one ring behind its own
+/// mutex) and [`StageTimings`] (many rings behind one mutex).
+///
+/// Once `capacity` samples are stored, pushing a new sample evicts the
+/// oldest one.  Percentile queries operate on a sorted snapshot (see
+/// [`LatencyRing::snapshot`]).
+#[derive(Debug, Clone)]
+pub struct LatencyRing {
+    samples: VecDeque<u64>,
+    capacity: usize,
+}
+
+impl LatencyRing {
+    /// Construct a ring retaining at most `capacity` samples.
+    ///
+    /// A zero `capacity` is clamped to 1 so callers cannot accidentally
+    /// create a sink that silently discards every input.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            samples: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Push one sample in microseconds, evicting the oldest if full.
+    #[inline]
+    pub fn push(&mut self, value: u64) {
+        if self.samples.len() == self.capacity {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(value);
+    }
+
+    /// Copy the current contents into a sorted snapshot.  The ring is
+    /// NOT emptied.
+    #[must_use]
+    pub fn snapshot(&self) -> LatencySnapshot {
+        let mut owned: Vec<u64> = Vec::with_capacity(self.samples.len());
+        owned.extend(self.samples.iter().copied());
+        owned.sort_unstable();
+        LatencySnapshot { sorted: owned }
+    }
+
+    /// Number of samples currently held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// `true` when nothing has been pushed yet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    /// Capacity supplied at construction (post-clamp).
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+/// Thread-safe bounded ring of latency samples in microseconds.
 ///
 /// Once `capacity` samples are stored, recording a new sample evicts
 /// the oldest one.  Percentile queries operate on a sorted snapshot
@@ -703,7 +776,7 @@ impl Default for CounterValues {
 /// 5 s.
 #[derive(Debug)]
 pub struct LatencyHistogram {
-    samples: Mutex<VecDeque<u64>>,
+    ring: Mutex<LatencyRing>,
     capacity: usize,
 }
 
@@ -714,22 +787,19 @@ impl LatencyHistogram {
     /// create a sink that silently discards every input.
     #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
+        let ring = LatencyRing::with_capacity(capacity);
+        let capacity = ring.capacity();
         Self {
-            samples: Mutex::new(VecDeque::with_capacity(capacity)),
+            ring: Mutex::new(ring),
             capacity,
         }
     }
 
-    /// Record one latency sample given as a [`Duration`].  Saturates at
-    /// `u64::MAX` µs (≈584 942 years) so no real latency ever truncates;
-    /// the cap exists only to keep the API total in the face of an
-    /// arithmetic bug elsewhere.  Thin wrapper around
-    /// [`LatencyHistogram::record_us`].
+    /// Record one latency sample given as a [`Duration`].  Thin wrapper
+    /// around [`LatencyHistogram::record_us`] (saturating conversion).
     #[inline]
     pub fn record_duration(&self, d: Duration) {
-        let us = u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
-        self.record_us(us);
+        self.record_us(duration_to_us(d));
     }
 
     /// Record one latency sample in microseconds.  Evicts the oldest
@@ -741,11 +811,7 @@ impl LatencyHistogram {
     /// `push_back` with no cross-call invariants.
     #[inline]
     pub fn record_us(&self, value: u64) {
-        let mut buf = self.samples.lock();
-        if buf.len() == self.capacity {
-            buf.pop_front();
-        }
-        buf.push_back(value);
+        self.ring.lock().push(value);
     }
 
     /// Drain the histogram's current contents into a sorted snapshot
@@ -755,14 +821,10 @@ impl LatencyHistogram {
     /// Infallible by virtue of `parking_lot::Mutex` (no poisoning).
     #[must_use]
     pub fn snapshot(&self) -> LatencySnapshot {
-        let buf = self.samples.lock();
-        let mut owned: Vec<u64> = Vec::with_capacity(buf.len());
-        owned.extend(buf.iter().copied());
-        // Release the lock before sorting — sort is O(n log n) and we
-        // do not want to block other recorders for that long.
-        drop(buf);
-        owned.sort_unstable();
-        LatencySnapshot { sorted: owned }
+        // Clone the raw samples under the lock, sort outside it — sort
+        // is O(n log n) and we do not want to block recorders that long.
+        let ring = self.ring.lock().clone();
+        ring.snapshot()
     }
 
     /// Capacity supplied at construction (post-clamp).
@@ -770,6 +832,144 @@ impl LatencyHistogram {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+}
+
+/// Identity of one timed stage: a static `scope` (which part of the
+/// pipeline) and a static `name` (which step inside it).
+///
+/// Both halves are `&'static str` so recording never allocates and
+/// hashing is a pointer-length pair compare in the common case.
+/// Conventions used by the effect crate:
+///
+/// * `composite/<stage>` — the composite effect's own stages
+///   (`seg`, `mask_chain`, `mask_resize`, `bg_copy`, …);
+/// * `<subchain>/<effect>` — one sub-effect inside `mask` /
+///   `background` / `foreground` / `post`;
+/// * `chain/<effect>` — a top-level effect of the main chain;
+/// * `seg/<step>` — pre/post-processing around inference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StageKey {
+    /// Pipeline area the stage belongs to.
+    pub scope: &'static str,
+    /// Step name inside `scope`.
+    pub name: &'static str,
+}
+
+impl StageKey {
+    /// Build a key from its two static halves.
+    #[must_use]
+    pub const fn new(scope: &'static str, name: &'static str) -> Self {
+        Self { scope, name }
+    }
+}
+
+impl std::fmt::Display for StageKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.scope, self.name)
+    }
+}
+
+/// Per-stage latency rings keyed by [`StageKey`], behind one mutex.
+///
+/// The effect chain records ~20 stages per frame; one uncontended
+/// lock + hash lookup per stage is cheaper than a mutex per ring and
+/// keeps a single critical section per `record`.  Keys are inserted
+/// on first sight (one allocation per key per run, or per chain
+/// rebuild) and reported in insertion order — the first frame records
+/// in pipeline order, so the summary reads top to bottom.
+#[derive(Debug)]
+pub struct StageTimings {
+    table: Mutex<StageTable>,
+    capacity: usize,
+}
+
+#[derive(Debug, Default)]
+struct StageTable {
+    index: HashMap<StageKey, usize>,
+    entries: Vec<(StageKey, LatencyRing)>,
+}
+
+/// One stage's sorted samples, as returned by [`StageTimings::snapshot`].
+#[derive(Debug, Clone)]
+pub struct StageSnapshot {
+    /// Which stage.
+    pub key: StageKey,
+    /// Its samples over the retained window.
+    pub latency: LatencySnapshot,
+}
+
+impl StageTimings {
+    /// Construct a table whose rings each retain at most `capacity`
+    /// samples (zero is clamped to 1, as for [`LatencyRing`]).
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            table: Mutex::new(StageTable::default()),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Record one sample for `key`, creating its ring on first sight.
+    #[inline]
+    pub fn record(&self, key: StageKey, d: Duration) {
+        let us = duration_to_us(d);
+        let mut table = self.table.lock();
+        let idx = if let Some(&idx) = table.index.get(&key) {
+            idx
+        } else {
+            let idx = table.entries.len();
+            table
+                .entries
+                .push((key, LatencyRing::with_capacity(self.capacity)));
+            table.index.insert(key, idx);
+            idx
+        };
+        table.entries[idx].1.push(us);
+    }
+
+    /// Sorted snapshot of every stage, in insertion order.  Rings are
+    /// cloned under the lock and sorted outside it.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<StageSnapshot> {
+        let rings: Vec<(StageKey, LatencyRing)> = self.table.lock().entries.clone();
+        rings
+            .into_iter()
+            .map(|(key, ring)| StageSnapshot {
+                key,
+                latency: ring.snapshot(),
+            })
+            .collect()
+    }
+
+    /// Per-ring capacity supplied at construction (post-clamp).
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+/// Render stage snapshots as one compact `key=p50/p95` list (µs),
+/// space-separated, in the order given — the payload of the
+/// `stage timings` log line.
+#[must_use]
+pub fn format_stage_summary(stages: &[StageSnapshot]) -> String {
+    let mut out = String::new();
+    for (i, stage) in stages.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        // `write!` into a String is infallible.
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{}={}/{}",
+                stage.key,
+                stage.latency.percentile_us(0.5),
+                stage.latency.percentile_us(0.95)
+            ),
+        );
+    }
+    out
 }
 
 /// Sorted snapshot of a [`LatencyHistogram`]'s samples.  Percentile
@@ -847,21 +1047,26 @@ pub struct MetricsSnapshot {
     pub inference: LatencySnapshot,
     /// Output-side latency: effect chain exit → output push.
     pub output: LatencySnapshot,
+    /// Fine-grained per-stage / per-effect timings inside `processing`
+    /// (see [`StageTimings`]).  Empty when the chain records none.
+    pub stages: Vec<StageSnapshot>,
 }
 
 /// Telemetry sink handed to an effect via [`crate::context::FrameContext`].
 ///
 /// An effect that owns per-stage timings (e.g. ML inference inside a
-/// composite effect) calls [`EffectTelemetry::record_inference`] on
-/// each frame; the supervisor reads the underlying histogram via
-/// [`crate::metrics::MetricsSnapshot::inference`].
+/// composite effect) calls [`EffectTelemetry::record_inference`] /
+/// [`EffectTelemetry::record_stage`] on each frame; the supervisor
+/// reads the results via [`MetricsSnapshot::inference`] /
+/// [`MetricsSnapshot::stages`].
 ///
 /// `Default` returns a no-op sink: tests and downstream callers that
 /// do not wire metrics can still hand a [`crate::context::FrameContext`]
-/// to an effect without fabricating a real [`LatencyHistogram`].
+/// to an effect without fabricating real histograms.
 #[derive(Debug, Clone, Default)]
 pub struct EffectTelemetry {
     inference: Option<Arc<LatencyHistogram>>,
+    stages: Option<Arc<StageTimings>>,
 }
 
 impl EffectTelemetry {
@@ -871,7 +1076,15 @@ impl EffectTelemetry {
     pub fn with_inference(inference: Arc<LatencyHistogram>) -> Self {
         Self {
             inference: Some(inference),
+            stages: None,
         }
+    }
+
+    /// Attach a per-stage timing table (builder style).
+    #[must_use]
+    pub fn with_stages(mut self, stages: Arc<StageTimings>) -> Self {
+        self.stages = Some(stages);
+        self
     }
 
     /// Record one inference latency sample.  No-op when the sink was
@@ -880,6 +1093,15 @@ impl EffectTelemetry {
     pub fn record_inference(&self, d: Duration) {
         if let Some(h) = &self.inference {
             h.record_duration(d);
+        }
+    }
+
+    /// Record one per-stage latency sample.  No-op when the sink was
+    /// built without a stage table (test/default path).
+    #[inline]
+    pub fn record_stage(&self, key: StageKey, d: Duration) {
+        if let Some(t) = &self.stages {
+            t.record(key, d);
         }
     }
 }
@@ -933,6 +1155,13 @@ impl MetricsSnapshot {
     #[must_use]
     pub fn with_output(mut self, snap: LatencySnapshot) -> Self {
         self.output = snap;
+        self
+    }
+
+    /// Replace the per-stage timing snapshots.
+    #[must_use]
+    pub fn with_stages(mut self, stages: Vec<StageSnapshot>) -> Self {
+        self.stages = stages;
         self
     }
 }
@@ -1060,6 +1289,30 @@ pub fn emit_metrics_line(snap: &MetricsSnapshot, extras: Option<PeriodicExtras>)
         output_p95_us = snap.output.percentile_us(0.95),
         end_to_end_p50_us = snap.end_to_end.percentile_us(0.5),
         end_to_end_p95_us = snap.end_to_end.percentile_us(0.95),
+        "{msg}"
+    );
+
+    emit_stage_line(&snap.stages, periodic);
+}
+
+/// Per-stage breakdown on a sibling line of the main metrics line.
+///
+/// The key set is dynamic (depends on the configured chain), so it
+/// cannot be a static field list like [`emit_metrics_line`]'s.  Skipped
+/// entirely when the chain records nothing (passthrough, tests) so
+/// existing greps on the main line are unaffected.
+fn emit_stage_line(stages: &[StageSnapshot], periodic: bool) {
+    if stages.is_empty() {
+        return;
+    }
+    let msg = if periodic {
+        "stage timings"
+    } else {
+        "run stage timings"
+    };
+    tracing::info!(
+        target: "fluxframe::metrics",
+        stages = %format_stage_summary(stages),
         "{msg}"
     );
 }
@@ -1442,5 +1695,86 @@ mod tests {
         assert!(snap.capture.is_empty());
         assert!(snap.inference.is_empty());
         assert!(snap.output.is_empty());
+        assert!(snap.stages.is_empty());
+    }
+
+    // -- StageTimings ------------------------------------------------
+
+    const K_A: StageKey = StageKey::new("composite", "seg");
+    const K_B: StageKey = StageKey::new("background", "blur");
+
+    #[test]
+    fn stage_key_displays_as_scope_slash_name() {
+        assert_eq!(K_A.to_string(), "composite/seg");
+    }
+
+    #[test]
+    fn stage_timings_records_per_key_in_insertion_order() {
+        let t = StageTimings::with_capacity(8);
+        t.record(K_B, Duration::from_micros(30));
+        t.record(K_A, Duration::from_micros(10));
+        t.record(K_B, Duration::from_micros(50));
+
+        let snap = t.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].key, K_B);
+        assert_eq!(snap[0].latency.len(), 2);
+        assert_eq!(snap[0].latency.percentile_us(0.5), 30);
+        assert_eq!(snap[1].key, K_A);
+        assert_eq!(snap[1].latency.percentile_us(0.5), 10);
+    }
+
+    #[test]
+    fn stage_timings_evicts_oldest_per_ring() {
+        let t = StageTimings::with_capacity(2);
+        for us in [1, 2, 3] {
+            t.record(K_A, Duration::from_micros(us));
+        }
+        let snap = t.snapshot();
+        assert_eq!(snap[0].latency.len(), 2);
+        assert_eq!(snap[0].latency.percentile_us(0.0), 2);
+        assert_eq!(snap[0].latency.percentile_us(1.0), 3);
+    }
+
+    #[test]
+    fn stage_timings_zero_capacity_clamped_to_one() {
+        let t = StageTimings::with_capacity(0);
+        assert_eq!(t.capacity(), 1);
+        t.record(K_A, Duration::from_micros(7));
+        t.record(K_A, Duration::from_micros(9));
+        assert_eq!(t.snapshot()[0].latency.len(), 1);
+    }
+
+    #[test]
+    fn effect_telemetry_default_record_stage_is_noop() {
+        let tel = EffectTelemetry::default();
+        tel.record_stage(K_A, Duration::from_micros(1));
+        // Nothing to observe — the point is that it does not panic.
+    }
+
+    #[test]
+    fn effect_telemetry_with_stages_publishes_samples() {
+        let stages = Arc::new(StageTimings::with_capacity(4));
+        let tel = EffectTelemetry::default().with_stages(Arc::clone(&stages));
+        tel.record_stage(K_A, Duration::from_micros(42));
+        let snap = stages.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].latency.percentile_us(0.5), 42);
+    }
+
+    #[test]
+    fn format_stage_summary_renders_p50_p95_pairs() {
+        let t = StageTimings::with_capacity(8);
+        for us in [10, 20, 30, 40, 100] {
+            t.record(K_A, Duration::from_micros(us));
+        }
+        t.record(K_B, Duration::from_micros(5));
+        let s = format_stage_summary(&t.snapshot());
+        assert_eq!(s, "composite/seg=30/100 background/blur=5/5");
+    }
+
+    #[test]
+    fn format_stage_summary_empty_is_empty_string() {
+        assert_eq!(format_stage_summary(&[]), "");
     }
 }
