@@ -44,10 +44,56 @@ pub fn fit_letterbox(src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Letterbo
     }
 }
 
+/// One bilinear sample position along an axis: the two source
+/// indices to blend and the weight of the second one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AxisTap {
+    /// Lower source index.
+    i0: usize,
+    /// Upper source index (`i0 + 1`, clamped to the last element).
+    i1: usize,
+    /// Weight of `i1`; `i0` gets `1 - w`.
+    w: f32,
+}
+
+/// Pixel-centre bilinear mapping of `dst_len` output positions onto
+/// `src_len` source positions, precomputed once per resize call so the
+/// per-pixel loop does no division / floor / clamping.
+///
+/// The mapping is `s = (d + 0.5) * src / dst - 0.5`, clamped at 0 —
+/// the same convention the original per-pixel formula used, so the
+/// sampled positions are unchanged.
+fn axis_taps(src_len: u32, dst_len: u32) -> Vec<AxisTap> {
+    let last = (src_len as usize).saturating_sub(1);
+    let (sl, dl) = (src_len as f32, dst_len as f32);
+    (0..dst_len)
+        .map(|d| {
+            // Evaluated exactly as the former per-pixel expression so
+            // the sampled positions are bit-identical to before.
+            let s = ((d as f32 + 0.5) * sl / dl - 0.5).max(0.0);
+            let i0 = (s.floor() as usize).min(last);
+            let i1 = (i0 + 1).min(last);
+            AxisTap {
+                i0,
+                i1,
+                w: s - i0 as f32,
+            }
+        })
+        .collect()
+}
+
+/// Blend `a` toward `b` by `w` — one multiply instead of the two the
+/// expanded `(1-w)*a + w*b` form needs.
+#[inline]
+fn lerp(a: f32, b: f32, w: f32) -> f32 {
+    a + w * (b - a)
+}
+
 /// Bilinear resize for packed RGB (3 bytes per pixel).
 ///
 /// `src` length must equal `src_w * src_h * 3`, `dst` length must
-/// equal `dst_w * dst_h * 3`.  No allocation.
+/// equal `dst_w * dst_h * 3`.  Allocates only the two small per-axis
+/// tap tables (`dst_w + dst_h` entries).
 ///
 /// # Panics
 ///
@@ -62,39 +108,28 @@ pub fn resize_rgb_bilinear(
 ) {
     debug_assert_eq!(src.len(), (src_w * src_h * 3) as usize);
     debug_assert_eq!(dst.len(), (dst_w * dst_h * 3) as usize);
-    if dst_w == 0 || dst_h == 0 {
+    if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
         return;
     }
-    let sw = src_w as f32;
-    let sh = src_h as f32;
-    let dw = dst_w as f32;
-    let dh = dst_h as f32;
+    let xs = axis_taps(src_w, dst_w);
+    let ys = axis_taps(src_h, dst_h);
+    let src_row = src_w as usize * 3;
     // Output rows are independent — each reads the shared `src` and
-    // writes only its own row — so dispatch them row-parallel; the inner
-    // per-pixel bilinear sample is unchanged, keeping output identical.
-    let dst_row_bytes = dst_w as usize * 3;
-    for_each_row_mut(dst, dst_row_bytes, |y_row, dst_row| {
-        let y = y_row as u32;
-        let sy = ((y as f32 + 0.5) * sh / dh - 0.5).max(0.0);
-        let y0 = (sy.floor() as u32).min(src_h - 1);
-        let y1 = (y0 + 1).min(src_h - 1);
-        let wy = sy - y0 as f32;
-        for x in 0..dst_w {
-            let sx = ((x as f32 + 0.5) * sw / dw - 0.5).max(0.0);
-            let x0 = (sx.floor() as u32).min(src_w - 1);
-            let x1 = (x0 + 1).min(src_w - 1);
-            let wx = sx - x0 as f32;
-            let i00 = ((y0 * src_w + x0) * 3) as usize;
-            let i01 = ((y0 * src_w + x1) * 3) as usize;
-            let i10 = ((y1 * src_w + x0) * 3) as usize;
-            let i11 = ((y1 * src_w + x1) * 3) as usize;
-            let dst_idx = (x * 3) as usize;
+    // writes only its own row — so dispatch them row-parallel.
+    for_each_row_mut(dst, dst_w as usize * 3, |y, dst_row| {
+        let ty = ys[y];
+        let row0 = &src[ty.i0 * src_row..ty.i0 * src_row + src_row];
+        let row1 = &src[ty.i1 * src_row..ty.i1 * src_row + src_row];
+        for (tx, out) in xs.iter().zip(dst_row.chunks_exact_mut(3)) {
+            let p00 = &row0[tx.i0 * 3..tx.i0 * 3 + 3];
+            let p01 = &row0[tx.i1 * 3..tx.i1 * 3 + 3];
+            let p10 = &row1[tx.i0 * 3..tx.i0 * 3 + 3];
+            let p11 = &row1[tx.i1 * 3..tx.i1 * 3 + 3];
             for c in 0..3 {
-                let v = (1.0 - wx) * (1.0 - wy) * f32::from(src[i00 + c])
-                    + wx * (1.0 - wy) * f32::from(src[i01 + c])
-                    + (1.0 - wx) * wy * f32::from(src[i10 + c])
-                    + wx * wy * f32::from(src[i11 + c]);
-                dst_row[dst_idx + c] = v.round().clamp(0.0, 255.0) as u8;
+                let top = lerp(f32::from(p00[c]), f32::from(p01[c]), tx.w);
+                let bot = lerp(f32::from(p10[c]), f32::from(p11[c]), tx.w);
+                let v = lerp(top, bot, ty.w);
+                out[c] = v.round().clamp(0.0, 255.0) as u8;
             }
         }
     });
@@ -165,36 +200,23 @@ pub fn resize_mask_bilinear(
 ) {
     debug_assert_eq!(src.len(), (src_w * src_h) as usize);
     debug_assert_eq!(dst.len(), (dst_w * dst_h) as usize);
-    if dst_w == 0 || dst_h == 0 {
+    if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
         return;
     }
-    let sw = src_w as f32;
-    let sh = src_h as f32;
-    let dw = dst_w as f32;
-    let dh = dst_h as f32;
+    let xs = axis_taps(src_w, dst_w);
+    let ys = axis_taps(src_h, dst_h);
+    let src_row = src_w as usize;
     // Output rows are independent (each reads the shared `src`), so
     // dispatch them row-parallel — same structure as the RGB resize.
     // This is the per-frame model→frame mask upscale in the composite.
-    let dst_row_len = dst_w as usize;
-    for_each_row_mut(dst, dst_row_len, |y_row, dst_row| {
-        let y = y_row as u32;
-        let sy = ((y as f32 + 0.5) * sh / dh - 0.5).max(0.0);
-        let y0 = (sy.floor() as u32).min(src_h - 1);
-        let y1 = (y0 + 1).min(src_h - 1);
-        let wy = sy - y0 as f32;
-        for x in 0..dst_w {
-            let sx = ((x as f32 + 0.5) * sw / dw - 0.5).max(0.0);
-            let x0 = (sx.floor() as u32).min(src_w - 1);
-            let x1 = (x0 + 1).min(src_w - 1);
-            let wx = sx - x0 as f32;
-            let v00 = src[(y0 * src_w + x0) as usize];
-            let v01 = src[(y0 * src_w + x1) as usize];
-            let v10 = src[(y1 * src_w + x0) as usize];
-            let v11 = src[(y1 * src_w + x1) as usize];
-            dst_row[x as usize] = (1.0 - wx) * (1.0 - wy) * v00
-                + wx * (1.0 - wy) * v01
-                + (1.0 - wx) * wy * v10
-                + wx * wy * v11;
+    for_each_row_mut(dst, dst_w as usize, |y, dst_row| {
+        let ty = ys[y];
+        let row0 = &src[ty.i0 * src_row..ty.i0 * src_row + src_row];
+        let row1 = &src[ty.i1 * src_row..ty.i1 * src_row + src_row];
+        for (tx, out) in xs.iter().zip(dst_row.iter_mut()) {
+            let top = lerp(row0[tx.i0], row0[tx.i1], tx.w);
+            let bot = lerp(row1[tx.i0], row1[tx.i1], tx.w);
+            *out = lerp(top, bot, ty.w);
         }
     });
 }
@@ -266,6 +288,67 @@ mod tests {
         assert!((dst[15] - 0.0).abs() < 1e-3); // bottom-right
         assert!((dst[3] - 1.0).abs() < 1e-3); // top-right
         assert!((dst[12] - 1.0).abs() < 1e-3); // bottom-left
+    }
+
+    #[test]
+    fn axis_taps_match_pixel_centre_formula() {
+        // Reference: the per-pixel formula the kernels used before the
+        // tables were introduced.
+        let (src_len, dst_len) = (256u32, 800u32);
+        let taps = axis_taps(src_len, dst_len);
+        assert_eq!(taps.len(), dst_len as usize);
+        for (d, tap) in taps.iter().enumerate() {
+            let s = ((d as f32 + 0.5) * src_len as f32 / dst_len as f32 - 0.5).max(0.0);
+            let i0 = (s.floor() as usize).min(src_len as usize - 1);
+            assert_eq!(tap.i0, i0);
+            assert_eq!(tap.i1, (i0 + 1).min(src_len as usize - 1));
+            assert!((tap.w - (s - i0 as f32)).abs() < 1e-6);
+            assert!((0.0..1.0).contains(&tap.w));
+        }
+        // Last tap clamps to the final source element.
+        let last = taps[dst_len as usize - 1];
+        assert_eq!(last.i1, src_len as usize - 1);
+    }
+
+    #[test]
+    fn axis_taps_single_source_element_is_degenerate() {
+        for tap in axis_taps(1, 5) {
+            assert_eq!((tap.i0, tap.i1), (0, 0));
+        }
+    }
+
+    #[test]
+    fn mask_upsample_matches_reference_bilinear() {
+        // Pseudo-random 16×9 mask upscaled 3× — the two-lerp form must
+        // agree with the expanded four-term weights to float noise.
+        let (sw, sh, dw, dh) = (16u32, 9u32, 48u32, 27u32);
+        let src: Vec<f32> = (0..sw * sh)
+            .map(|i| (i.wrapping_mul(2_654_435_761) % 1000) as f32 / 1000.0)
+            .collect();
+        let mut dst = vec![0.0_f32; (dw * dh) as usize];
+        resize_mask_bilinear(&src, sw, sh, &mut dst, dw, dh);
+        for y in 0..dh {
+            let sy = ((y as f32 + 0.5) * sh as f32 / dh as f32 - 0.5).max(0.0);
+            let y0 = (sy.floor() as u32).min(sh - 1);
+            let y1 = (y0 + 1).min(sh - 1);
+            let wy = sy - y0 as f32;
+            for x in 0..dw {
+                let sx = ((x as f32 + 0.5) * sw as f32 / dw as f32 - 0.5).max(0.0);
+                let x0 = (sx.floor() as u32).min(sw - 1);
+                let x1 = (x0 + 1).min(sw - 1);
+                let wx = sx - x0 as f32;
+                let at = |yy: u32, xx: u32| src[(yy * sw + xx) as usize];
+                let expected = (1.0 - wx) * (1.0 - wy) * at(y0, x0)
+                    + wx * (1.0 - wy) * at(y0, x1)
+                    + (1.0 - wx) * wy * at(y1, x0)
+                    + wx * wy * at(y1, x1);
+                let got = dst[(y * dw + x) as usize];
+                assert!(
+                    (got - expected).abs() < 1e-5,
+                    "({x},{y}) {got} vs {expected}"
+                );
+            }
+        }
     }
 
     #[test]
