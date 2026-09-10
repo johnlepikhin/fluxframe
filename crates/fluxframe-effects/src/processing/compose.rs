@@ -1,4 +1,12 @@
 //! Alpha compositing for packed RGB buffers with an `f32` mask.
+//!
+//! The blend runs in 8.8 fixed point: the mask value is quantised once
+//! per pixel to `0..=256` and the three channels are then integer
+//! multiply-adds.  Versus the former per-channel `f32` formula (three
+//! multiplies, `round`, `clamp`, cast) this is a few integer ops per
+//! channel and auto-vectorises; the result differs from the exact
+//! float blend by at most 1 LSB (alpha quantisation error ≤ 0.5/256 ×
+//! 255 ≈ 0.5, plus rounding) and is exact at alpha 0, 0.5 and 1.
 
 use super::parallel::for_each_chunk_mut;
 
@@ -8,6 +16,32 @@ use super::parallel::for_each_chunk_mut;
 /// machines saturate, large enough that the per-task overhead (~µs)
 /// stays well below the per-chunk arithmetic cost.
 const COMPOSITE_CHUNK_PIXELS: usize = 4_096;
+
+/// Fixed-point one: an alpha of exactly 1.0 maps to this so the
+/// foreground passes through bit-exact (`(v * 256 + 128) >> 8 == v`).
+const ALPHA_ONE: u32 = 256;
+
+/// Quantise a mask value to `0..=256` (clamping out-of-range input).
+#[inline]
+fn alpha_q8(alpha: f32) -> u32 {
+    // `as u32` saturates, and the clamp keeps the product in range, so
+    // the cast is total.
+    (alpha.clamp(0.0, 1.0) * ALPHA_ONE as f32 + 0.5) as u32
+}
+
+/// Blend one RGB pixel in place: `fg = fg * a + bg * (1 - a)` in 8.8
+/// fixed point with round-to-nearest.  Shared by both public entry
+/// points so the in-place and out-of-place paths stay bit-identical.
+#[inline]
+fn blend_pixel(fg: &mut [u8], bg: &[u8], a: u32) {
+    let inv = ALPHA_ONE - a;
+    for c in 0..3 {
+        let v = (u32::from(fg[c]) * a + u32::from(bg[c]) * inv + ALPHA_ONE / 2) >> 8;
+        // `v <= 255` by construction (weights sum to 256), so the
+        // narrowing cast cannot truncate.
+        fg[c] = v as u8;
+    }
+}
 
 /// Composite `fg` over `bg` using `mask` as per-pixel alpha (1.0 → fg,
 /// 0.0 → bg).  `dst` receives the result.
@@ -22,14 +56,9 @@ pub fn alpha_composite_rgb(fg: &[u8], bg: &[u8], dst: &mut [u8], mask: &[f32]) {
     debug_assert_eq!(fg.len(), mask.len() * 3);
     debug_assert_eq!(bg.len(), mask.len() * 3);
     debug_assert_eq!(dst.len(), mask.len() * 3);
-    for (i, &alpha) in mask.iter().enumerate() {
-        let alpha = alpha.clamp(0.0, 1.0);
-        let one_minus = 1.0 - alpha;
-        let base = i * 3;
-        for c in 0..3 {
-            let v = alpha * f32::from(fg[base + c]) + one_minus * f32::from(bg[base + c]);
-            dst[base + c] = v.round().clamp(0.0, 255.0) as u8;
-        }
+    dst.copy_from_slice(fg);
+    for ((dst_px, bg_px), &alpha) in dst.chunks_exact_mut(3).zip(bg.chunks_exact(3)).zip(mask) {
+        blend_pixel(dst_px, bg_px, alpha_q8(alpha));
     }
 }
 
@@ -66,16 +95,12 @@ pub fn alpha_composite_rgb_in_place(fg_dst: &mut [u8], bg: &[u8], mask: &[f32]) 
         let pixel_off = byte_off / 3;
         let bg_chunk = &bg[byte_off..byte_off + fg_chunk.len()];
         let mask_chunk = &mask[pixel_off..pixel_off + fg_chunk.len() / 3];
-        for (i, &alpha) in mask_chunk.iter().enumerate() {
-            let alpha = alpha.clamp(0.0, 1.0);
-            let one_minus = 1.0 - alpha;
-            let base = i * 3;
-            for c in 0..3 {
-                let fg_v = f32::from(fg_chunk[base + c]);
-                let bg_v = f32::from(bg_chunk[base + c]);
-                let v = alpha * fg_v + one_minus * bg_v;
-                fg_chunk[base + c] = v.round().clamp(0.0, 255.0) as u8;
-            }
+        for ((fg_px, bg_px), &alpha) in fg_chunk
+            .chunks_exact_mut(3)
+            .zip(bg_chunk.chunks_exact(3))
+            .zip(mask_chunk)
+        {
+            blend_pixel(fg_px, bg_px, alpha_q8(alpha));
         }
     });
 }
@@ -186,6 +211,30 @@ mod tests {
         let mut fg_dst = fg.clone();
         alpha_composite_rgb_in_place(&mut fg_dst, &bg, &mask);
         assert_eq!(fg_dst, dst_oop);
+    }
+
+    #[test]
+    fn fixed_point_blend_is_within_one_lsb_of_float_reference() {
+        // Pseudo-random fg/bg/mask; the 8.8 blend may differ from the
+        // exact float blend by alpha quantisation + rounding, never more
+        // than one LSB.
+        let pixels = 4_099usize;
+        let fg: Vec<u8> = (0..pixels * 3).map(|i| (i * 31 % 256) as u8).collect();
+        let bg: Vec<u8> = (0..pixels * 3).map(|i| (i * 97 + 5) as u8).collect();
+        let mask: Vec<f32> = (0..pixels).map(|i| (i % 257) as f32 / 256.0).collect();
+        let mut dst = vec![0u8; pixels * 3];
+        alpha_composite_rgb(&fg, &bg, &mut dst, &mask);
+        for (i, &alpha) in mask.iter().enumerate() {
+            for c in 0..3 {
+                let exact =
+                    alpha * f32::from(fg[i * 3 + c]) + (1.0 - alpha) * f32::from(bg[i * 3 + c]);
+                let got = f32::from(dst[i * 3 + c]);
+                assert!(
+                    (got - exact).abs() <= 1.0,
+                    "px {i} ch {c}: {got} vs {exact}"
+                );
+            }
+        }
     }
 
     #[test]
