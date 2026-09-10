@@ -10,8 +10,8 @@
 //! * `[background]` — rarely useful; pairs poorly with `blur` which has
 //!   already thrown detail away.
 //!
-//! Cost: `O(width × height)` per frame — three passes (horizontal blur,
-//! vertical blur, blend).
+//! Cost: `O(width × height)` per frame — two passes (horizontal blur
+//! into a scratch, then vertical blur fused with the blend in place).
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
@@ -23,7 +23,7 @@ use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
 use super::helpers::reject_out_of_range;
-use crate::processing::parallel::{for_each_chunk_mut, for_each_row_mut};
+use crate::processing::parallel::for_each_row_mut;
 
 /// Upper bound on `amount`. Past this, the unsharp formula produces
 /// pronounced ringing halos rather than perceived sharpness; reject
@@ -68,12 +68,9 @@ impl Default for SharpenConfig {
 /// `PlaneEffect` implementing a 3×3 separable-Gaussian unsharp mask.
 pub struct SharpenEffect {
     config: SharpenConfig,
-    /// Scratch for the horizontal-pass blur output. Reused as the
-    /// source of the vertical pass.
+    /// Scratch for the horizontal-pass blur output — the source of the
+    /// fused vertical-blur + blend pass.
     scratch_h: Vec<u8>,
-    /// Scratch for the vertical-pass blur output — the "blurred" input
-    /// to the unsharp combine.
-    scratch_v: Vec<u8>,
     frame_w: u32,
     frame_h: u32,
 }
@@ -109,7 +106,6 @@ impl SharpenEffect {
         Self {
             config: SharpenConfig::default(),
             scratch_h: Vec::new(),
-            scratch_v: Vec::new(),
             frame_w: 0,
             frame_h: 0,
         }
@@ -130,70 +126,83 @@ fn gauss_h(src: &[u8], dst: &mut [u8], width: usize) {
     let row_stride = width * 3;
     for_each_row_mut(dst, row_stride, |y, dst_row| {
         let src_row = &src[y * row_stride..y * row_stride + row_stride];
-        for x in 0..width {
-            let xm = x.saturating_sub(1);
-            let xp = (x + 1).min(width - 1);
+        // Interior pixels: `windows(9)` yields the left / centre / right
+        // pixel triple with no per-byte bounds checks; the two edge
+        // pixels are handled separately with clamp-to-edge.
+        if width == 1 {
+            dst_row.copy_from_slice(src_row);
+            return;
+        }
+        for (out, win) in dst_row[3..row_stride - 3]
+            .chunks_exact_mut(3)
+            .zip(src_row.windows(9).step_by(3))
+        {
             for c in 0..3 {
-                let l = u16::from(src_row[xm * 3 + c]);
-                let m = u16::from(src_row[x * 3 + c]);
-                let r = u16::from(src_row[xp * 3 + c]);
-                // `+ 2` is the standard rounding adjustment for
-                // integer division by 4.
-                dst_row[x * 3 + c] = ((l + 2 * m + r + 2) / 4) as u8;
+                out[c] = tap3(win[c], win[3 + c], win[6 + c]);
             }
         }
-    });
-}
-
-/// Vertical 3-tap Gaussian-style blur with the `[1, 2, 1] / 4` kernel
-/// and clamp-to-edge boundary. Each output row reads three `src` rows
-/// (`y-1`, `y`, `y+1`) from a separate scratch buffer, so rows are
-/// independent and dispatched row-parallel; the inner byte-wise tap-sum
-/// stays auto-vectorisable.
-fn gauss_v(src: &[u8], dst: &mut [u8], width: usize, height: usize) {
-    let row_stride = width * 3;
-    for_each_row_mut(dst, row_stride, |y, dst_row| {
-        let ym = y.saturating_sub(1);
-        let yp = (y + 1).min(height - 1);
-        let top = &src[ym * row_stride..ym * row_stride + row_stride];
-        let mid = &src[y * row_stride..y * row_stride + row_stride];
-        let bot = &src[yp * row_stride..yp * row_stride + row_stride];
-        for (i, out) in dst_row.iter_mut().enumerate() {
-            let l = u16::from(top[i]);
-            let m = u16::from(mid[i]);
-            let r = u16::from(bot[i]);
-            *out = ((l + 2 * m + r + 2) / 4) as u8;
+        for c in 0..3 {
+            dst_row[c] = tap3(src_row[c], src_row[c], src_row[3 + c]);
+            let last = row_stride - 3 + c;
+            dst_row[last] = tap3(src_row[last - 3], src_row[last], src_row[last]);
         }
     });
 }
 
-/// Number of RGB bytes per parallel chunk in the unsharp blend. Each
-/// byte is independent, so any chunking yields identical output; this
-/// size mirrors the compositor's per-chunk granularity.
-const COMBINE_CHUNK_BYTES: usize = 4_096 * 3;
+/// `[1, 2, 1] / 4` tap with round-to-nearest (`+ 2` before the divide).
+#[inline]
+fn tap3(l: u8, m: u8, r: u8) -> u8 {
+    ((u16::from(l) + 2 * u16::from(m) + u16::from(r) + 2) / 4) as u8
+}
 
-/// Final unsharp blend: `out = orig + amount * (orig - blurred)`, with
-/// channel-wise clamp to `[0, 255]`. Bytes are independent, so the blend
-/// is dispatched in parallel chunks; `blurred` is sliced by the chunk's
-/// global offset.
+/// Fixed-point scale for `amount` in the fused blend (8.8).
+const AMOUNT_ONE: i32 = 256;
+
+/// Vertical 3-tap `[1, 2, 1] / 4` blur fused with the unsharp blend,
+/// written in place into `plane_data`.
+///
+/// Each output row `y` reads three rows (`y-1`, `y`, `y+1`,
+/// clamp-to-edge) of the horizontally blurred `blurred_h` scratch,
+/// forms the fully blurred byte, and immediately applies
+/// `out = orig + amount * (orig - blurred)` with a `[0, 255]` clamp to
+/// the original byte at the same position.  Rows stay independent —
+/// every neighbour read comes from the scratch, never from
+/// `plane_data` — so the pass is row-parallel and byte-identical
+/// regardless of thread count.  Fusing the two former passes (vertical
+/// blur into a second scratch, then blend) removes one full-frame
+/// write + read and the second scratch buffer.
+///
+/// The blend runs in 8.8 fixed point (`amount` quantised to 1/256) and
+/// truncates like the former float formula's `as u8` did; the
+/// quantisation shifts the result by at most one LSB.
 ///
 /// # Panics
 ///
-/// Panics if `blurred.len() != plane_data.len()` (checked up front,
+/// Panics if `blurred_h.len() != plane_data.len()` (checked up front,
 /// before any parallel work, to keep the panic out of the rayon worker).
-fn unsharp_combine(plane_data: &mut [u8], blurred: &[u8], amount: f32) {
+fn gauss_v_unsharp(plane_data: &mut [u8], blurred_h: &[u8], width: usize, amount: f32) {
     assert_eq!(
         plane_data.len(),
-        blurred.len(),
-        "unsharp_combine: blurred length must equal plane_data",
+        blurred_h.len(),
+        "gauss_v_unsharp: blurred_h length must equal plane_data",
     );
-    for_each_chunk_mut(plane_data, COMBINE_CHUNK_BYTES, |off, chunk| {
-        let blur_chunk = &blurred[off..off + chunk.len()];
-        for (orig, blur) in chunk.iter_mut().zip(blur_chunk.iter()) {
-            let o = f32::from(*orig);
-            let b = f32::from(*blur);
-            let mixed = o + amount * (o - b);
-            *orig = mixed.clamp(0.0, 255.0) as u8;
+    let row_stride = width * 3;
+    let height = plane_data.len() / row_stride;
+    // `amount` is validated to `[0, MAX_AMOUNT]`, so this cast is total.
+    let amount_q = (amount * AMOUNT_ONE as f32).round() as i32;
+    let max_q = 255 * AMOUNT_ONE;
+    for_each_row_mut(plane_data, row_stride, |y, row| {
+        let ym = y.saturating_sub(1);
+        let yp = (y + 1).min(height - 1);
+        let top = &blurred_h[ym * row_stride..ym * row_stride + row_stride];
+        let mid = &blurred_h[y * row_stride..y * row_stride + row_stride];
+        let bot = &blurred_h[yp * row_stride..yp * row_stride + row_stride];
+        for (((orig, &l), &m), &r) in row.iter_mut().zip(top).zip(mid).zip(bot) {
+            let blurred = i32::from(tap3(l, m, r));
+            let o = i32::from(*orig);
+            let mixed = (o * AMOUNT_ONE + amount_q * (o - blurred)).clamp(0, max_q);
+            // `mixed >> 8 <= 255` after the clamp, so the cast is exact.
+            *orig = (mixed >> 8) as u8;
         }
     });
 }
@@ -217,7 +226,6 @@ impl PlaneEffect for SharpenEffect {
         self.frame_h = context.height;
         let frame_bytes = (context.width as usize) * (context.height as usize) * 3;
         self.scratch_h = vec![0u8; frame_bytes];
-        self.scratch_v = vec![0u8; frame_bytes];
         Ok(())
     }
 
@@ -243,7 +251,7 @@ impl PlaneEffect for SharpenEffect {
             });
         }
         // Short-circuit the no-op case so an `amount = 0.0` default does
-        // not waste two passes plus a blend.
+        // not waste two passes.
         if self.config.amount == 0.0 {
             return Ok(());
         }
@@ -254,8 +262,7 @@ impl PlaneEffect for SharpenEffect {
         );
 
         gauss_h(plane.data, &mut self.scratch_h, width);
-        gauss_v(&self.scratch_h, &mut self.scratch_v, width, height);
-        unsharp_combine(plane.data, &self.scratch_v, self.config.amount);
+        gauss_v_unsharp(plane.data, &self.scratch_h, width, self.config.amount);
         Ok(())
     }
 }
@@ -393,6 +400,59 @@ mod tests {
         // producing intermediate garbage.)
         assert_eq!(data[0], 0);
         assert_eq!(data[9], 255);
+    }
+
+    #[test]
+    fn matches_three_pass_float_reference_within_one_lsb() {
+        // Straightforward reference: separable [1,2,1]/4 blur (two
+        // explicit passes, clamp-to-edge) then the float unsharp blend.
+        // The fused fixed-point kernel must agree to within 1 LSB on a
+        // pseudo-random image, including the edge columns/rows.
+        let (width, height) = (13usize, 7usize);
+        let amount = 1.38_f32;
+        let src: Vec<u8> = (0..width * height * 3)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let at = |buf: &[u8], x: usize, y: usize, ch: usize| {
+            u16::from(buf[(y.min(height - 1) * width + x.min(width - 1)) * 3 + ch])
+        };
+        let tap = |left: u16, mid: u16, right: u16| (left + 2 * mid + right + 2) / 4;
+        let mut hblur = vec![0u8; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                for ch in 0..3 {
+                    let left = at(&src, x.saturating_sub(1), y, ch);
+                    hblur[(y * width + x) * 3 + ch] =
+                        tap(left, at(&src, x, y, ch), at(&src, x + 1, y, ch)) as u8;
+                }
+            }
+        }
+        let mut expected = vec![0u8; width * height * 3];
+        for y in 0..height {
+            for x in 0..width {
+                for ch in 0..3 {
+                    let above = at(&hblur, x, y.saturating_sub(1), ch);
+                    let blurred =
+                        f32::from(tap(above, at(&hblur, x, y, ch), at(&hblur, x, y + 1, ch)));
+                    let orig = f32::from(src[(y * width + x) * 3 + ch]);
+                    expected[(y * width + x) * 3 + ch] =
+                        (orig + amount * (orig - blurred)).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+
+        let mut effect = SharpenEffect::new();
+        effect
+            .configure(toml::from_str("amount = 1.38").unwrap())
+            .expect("configure");
+        let mut data = src.clone();
+        run(&mut effect, &mut data, width as u32, height as u32);
+        for (i, (&got, &exp)) in data.iter().zip(&expected).enumerate() {
+            assert!(
+                (i32::from(got) - i32::from(exp)).abs() <= 1,
+                "byte {i}: got {got}, expected {exp}"
+            );
+        }
     }
 
     #[test]
