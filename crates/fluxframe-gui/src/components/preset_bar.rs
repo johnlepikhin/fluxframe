@@ -165,12 +165,12 @@ pub fn set_dirty_state(
         None => "Daemon was started without a writable config path; Save as disabled".into(),
     }));
 
-    // Title-bar dirty marker: prepend "● " to the preset name when
-    // unsaved edits are pending. Keeps the indicator close to where
+    // Title-bar dirty marker: append " — Unsaved changes" to the preset name
+    // when unsaved edits are pending. Keeps the indicator close to where
     // the operator's eye lands when scanning header → editor.
     let subtitle = match (is_dirty, active_preset) {
-        (true, Some(name)) => format!("● {name}"),
-        (true, None) => "● (no preset)".into(),
+        (true, Some(name)) => format!("{name} — Unsaved changes"),
+        (true, None) => "Unsaved changes".into(),
         (false, Some(name)) => name.to_string(),
         (false, None) => String::new(),
     };

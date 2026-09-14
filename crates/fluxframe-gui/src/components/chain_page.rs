@@ -126,8 +126,8 @@ pub(crate) fn build(
 
 fn placeholder_row() -> adw::ActionRow {
     adw::ActionRow::builder()
-        .title("(empty)")
-        .subtitle("No effects in this section.")
+        .title("No effects added")
+        .subtitle("Use the + button to add one.")
         .build()
 }
 

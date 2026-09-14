@@ -37,7 +37,10 @@ pub enum AppMsg {
     /// without depending on the worker's `Output` type directly.
     Ipc(WorkerOutput),
     /// User clicked the preset DropDown — switch to `name`.
+    /// If dirty, shows a confirmation dialog first.
     SetPreset(String),
+    /// Confirmed by user (or no dirty state) — actually send SetPreset to daemon.
+    SetPresetConfirmed(String),
     /// Keyboard shortcut `Ctrl+<digit>` — switch to the preset at the
     /// 1-indexed slot, or no-op if the slot is empty.
     SetPresetByIndex {
@@ -103,7 +106,10 @@ pub enum AppMsg {
     SaveAs(String),
     /// User clicked Revert — refetch the active preset from the
     /// daemon, discarding any in-memory edits since the last sync.
+    /// Shows a confirmation dialog first.
     Revert,
+    /// Confirmed by user — actually send Revert to daemon.
+    RevertConfirmed,
 }
 
 /// Record of an in-flight `Command::Set` correlated by request tag.
@@ -356,6 +362,26 @@ impl Component for AppModel {
         match msg {
             AppMsg::Ipc(out) => self.on_ipc(out),
             AppMsg::SetPreset(name) => {
+                if self.state.is_dirty() {
+                    let name_for_confirm = name.clone();
+                    self.confirm_discard_changes(
+                        "Switch preset?",
+                        "You have unsaved changes in the current preset. Switching will discard them.",
+                        move |sender| {
+                            let _ = sender.send(AppMsg::SetPresetConfirmed(name_for_confirm.clone()));
+                        },
+                    );
+                    // Revert the dropdown selection since the user hasn't confirmed yet
+                    preset_bar::set_presets(
+                        &self.preset_bar,
+                        &self.state.presets,
+                        self.state.active_preset.as_deref(),
+                    );
+                } else {
+                    self.send_kind(Command::SetPreset { name }, PendingKind::Other);
+                }
+            }
+            AppMsg::SetPresetConfirmed(name) => {
                 self.send_kind(Command::SetPreset { name }, PendingKind::Other);
             }
             AppMsg::SetPresetByIndex { slot } => {
@@ -419,6 +445,15 @@ impl Component for AppModel {
                 );
             }
             AppMsg::Revert => {
+                self.confirm_discard_changes(
+                    "Discard unsaved changes?",
+                    "This will reload the preset from the daemon, discarding all unsaved edits.",
+                    |sender| {
+                        let _ = sender.send(AppMsg::RevertConfirmed);
+                    },
+                );
+            }
+            AppMsg::RevertConfirmed => {
                 self.send_kind(
                     Command::GetConfig { path: None },
                     PendingKind::GetConfigForRevert,
@@ -647,6 +682,33 @@ impl AppModel {
             self.state.config_path.as_deref(),
             self.state.active_preset.as_deref(),
         );
+    }
+
+    /// Show a confirmation dialog when the user attempts a destructive action
+    /// (e.g., switching presets or reverting when there are unsaved changes).
+    /// On "discard", calls the provided closure to send the confirmed message.
+    /// On "cancel", does nothing.
+    fn confirm_discard_changes<F: Fn(&Sender<AppMsg>) + 'static>(
+        &self,
+        heading: &str,
+        body: &str,
+        on_discard: F,
+    ) {
+        let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+        dialog.add_response("cancel", "Cancel");
+        dialog.add_response("discard", "Discard");
+        dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+
+        let sender = self.input_sender.clone();
+        dialog.connect_response(None, move |_dlg, response| {
+            if response == "discard" {
+                on_discard(&sender);
+            }
+        });
+
+        dialog.present(Some(&self.preset_bar.root));
     }
 
     /// Show a small modal asking the operator for a new preset name.

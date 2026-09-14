@@ -157,8 +157,20 @@ impl Worker for IpcWorker {
                 }
             },
             Err(e) => {
+                let hint = match e.kind() {
+                    std::io::ErrorKind::ConnectionRefused => {
+                        "the daemon is not running or not listening on this socket"
+                    }
+                    std::io::ErrorKind::NotFound => {
+                        "the socket file does not exist — check the daemon's [control] config"
+                    }
+                    std::io::ErrorKind::PermissionDenied => {
+                        "permission denied — check the socket file's owner/mode"
+                    }
+                    _ => "connection failed",
+                };
                 let _ = sender.output(WorkerOutput::Disconnected {
-                    reason: format!("connect to {} failed: {e}", socket_path.display()),
+                    reason: format!("{hint} ({}: {e})", socket_path.display()),
                 });
                 Self { stream: None }
             }
