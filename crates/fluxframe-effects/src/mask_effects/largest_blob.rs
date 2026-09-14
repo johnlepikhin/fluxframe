@@ -9,15 +9,19 @@
 //! analysis with "keep the largest" rule removes the noise without
 //! touching the subject.
 //!
-//! Algorithm: BFS labeling with 4-connectivity over the binary mask
-//! `mask >= level`. After labeling, every pixel not in the largest
-//! component is set to `0.0`; pixels in the largest component keep
-//! their original confidence value (so a subsequent `feather` step
-//! still produces soft edges).
+//! Algorithm: run-based connected-component labeling with
+//! 4-connectivity over the binary mask `mask >= level`. Each row is
+//! split into horizontal runs of foreground pixels; a run is joined
+//! (union-find) with every run of the previous row it overlaps in x.
+//! Components are therefore sets of runs, and the whole analysis is
+//! linear in the number of runs rather than pixels — on a real mask
+//! that is a few hundred runs against 65 k pixels. After labeling,
+//! every pixel not in the largest component is set to `0.0`; pixels
+//! in the largest component keep their original confidence value (so
+//! a subsequent `feather` step still produces soft edges).
 //!
-//! Cost is linear in the number of pixels — at 256×256 model
-//! resolution the loop runs over 65 k entries, well below 1 ms on a
-//! single core.
+//! Cost: one pass over the pixels to find runs, one pass over the
+//! runs to link them, one pass over the pixels to rewrite.
 //!
 //! Contract: `LargestBlobConfig::level` must lie in `[0.0, 1.0]`;
 //! [`MaskEffect::configure`] returns [`EffectError::InvalidConfig`]
@@ -27,8 +31,6 @@
 //! encountered first in row-major scan order wins. The result is
 //! deterministic for a given frame, but the chosen component may
 //! change between frames when the second-place component shifts.
-
-use std::collections::VecDeque;
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
@@ -66,6 +68,18 @@ impl Default for LargestBlobConfig {
     }
 }
 
+/// One horizontal run of foreground pixels: row `y`, columns
+/// `x0..=x1`, plus its union-find parent (an index into the run
+/// vector).  Runs are appended in row-major scan order, so a run's
+/// index also orders the first pixel of every component.
+#[derive(Debug, Clone, Copy)]
+struct Run {
+    y: u32,
+    x0: u32,
+    x1: u32,
+    parent: u32,
+}
+
 /// `MaskEffect` that retains only the largest connected component.
 ///
 /// Tie-breaking: equal-sized components are decided by row-major scan
@@ -74,14 +88,36 @@ impl Default for LargestBlobConfig {
 #[derive(Default)]
 pub struct LargestBlobMaskEffect {
     level: f32,
-    /// Per-pixel component label. `0` = unlabeled (background or not
-    /// yet visited); ≥ 1 = component id assigned during BFS.
-    /// Allocated lazily on first `process` so we do not need the mask
-    /// dimensions at `prepare` time.
-    labels: Vec<u32>,
-    /// BFS frontier. Reused across calls — `clear()` is O(1) and
-    /// keeps capacity.
-    queue: VecDeque<usize>,
+    /// Runs of the current frame with their union-find links. Reused
+    /// across calls — `clear()` keeps capacity, so the steady-state hot
+    /// loop does no allocation.
+    runs: Vec<Run>,
+    /// Per-run component size, indexed by run; only root entries are
+    /// meaningful after the count pass. Same reuse policy as `runs`.
+    sizes: Vec<u32>,
+}
+
+/// Union-find root of run `i` with path halving.
+fn find_root(runs: &mut [Run], mut i: usize) -> usize {
+    while runs[i].parent as usize != i {
+        let grand = runs[runs[i].parent as usize].parent;
+        runs[i].parent = grand;
+        i = grand as usize;
+    }
+    i
+}
+
+/// Join the components of runs `a` and `b`.  The smaller root index
+/// stays the root, so a component's root is always its earliest run in
+/// scan order — which is what makes the size tie-break below equal to
+/// "first component reached in row-major order".
+fn union_runs(runs: &mut [Run], a: usize, b: usize) {
+    let ra = find_root(runs, a);
+    let rb = find_root(runs, b);
+    if ra != rb {
+        let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+        runs[hi].parent = lo as u32;
+    }
 }
 
 impl LargestBlobMaskEffect {
@@ -113,8 +149,8 @@ impl LargestBlobMaskEffect {
     pub fn new() -> Self {
         Self {
             level: default_level(),
-            labels: Vec::new(),
-            queue: VecDeque::new(),
+            runs: Vec::new(),
+            sizes: Vec::new(),
         }
     }
 }
@@ -148,93 +184,106 @@ impl MaskEffect for LargestBlobMaskEffect {
         _ctx: &mut FrameContext,
     ) -> Result<(), EffectError> {
         let width = mask.width as usize;
-        let height = mask.height as usize;
-        let pixels = width * height;
-        if pixels == 0 {
+        if width == 0 || mask.height == 0 {
             return Ok(());
         }
         debug_assert_eq!(
             mask.data.len(),
-            pixels,
+            width * mask.height as usize,
             "MaskPlane invariant: data.len() must equal width * height",
         );
 
-        // Lazy scratch allocation. When the buffer must grow, `resize`
-        // already zeroes the newly appended slots; otherwise we only
-        // need to reset the prefix we are about to use. Capacity is
-        // preserved across calls so the steady-state hot loop does no
-        // allocation.
-        if self.labels.len() < pixels {
-            self.labels.resize(pixels, 0);
-        } else {
-            self.labels[..pixels].fill(0);
-        }
-
         let level = self.level;
-        let mut next_label: u32 = 1;
-        let mut largest_label: u32 = 0;
-        let mut largest_size: usize = 0;
+        let runs = &mut self.runs;
+        runs.clear();
 
-        // Pass 1: BFS labeling. `idx` walks the mask in row-major order;
-        // each foreground pixel that has not been labeled yet seeds a
-        // fresh component.
-        for seed in 0..pixels {
-            if mask.data[seed] < level || self.labels[seed] != 0 {
-                continue;
+        // Pass 1: split every row into foreground runs and link each
+        // run with the runs of the previous row it overlaps in x.
+        // Both rows' runs are sorted by x, so the overlap search is a
+        // two-pointer walk; `prev_start..prev_end` brackets the
+        // previous row inside `runs`.
+        let mut prev_start = 0usize;
+        let mut prev_end = 0usize;
+        for (y, row) in mask.data.chunks_exact(width).enumerate() {
+            let row_start = runs.len();
+            let mut x = 0usize;
+            while x < width {
+                if row[x] < level {
+                    x += 1;
+                    continue;
+                }
+                let x0 = x;
+                while x < width && row[x] >= level {
+                    x += 1;
+                }
+                runs.push(Run {
+                    y: y as u32,
+                    x0: x0 as u32,
+                    x1: (x - 1) as u32,
+                    parent: runs.len() as u32,
+                });
             }
-            self.queue.clear();
-            self.queue.push_back(seed);
-            self.labels[seed] = next_label;
-            let mut size: usize = 0;
+            let row_end = runs.len();
 
-            while let Some(idx) = self.queue.pop_front() {
-                size += 1;
-                let x = idx % width;
-                let y = idx / width;
-                // 4-connectivity neighbours. The `x > 0` / `y > 0`
-                // checks keep `idx - 1` and `idx - width` from
-                // underflowing usize when the current pixel is on the
-                // top/left edge; the upper-bound checks symmetrically
-                // guard the right/bottom edges.
-                let candidates = [
-                    (x > 0).then(|| idx - 1),
-                    (x + 1 < width).then(|| idx + 1),
-                    (y > 0).then(|| idx - width),
-                    (y + 1 < height).then(|| idx + width),
-                ];
-                for nidx in candidates.into_iter().flatten() {
-                    if mask.data[nidx] >= level && self.labels[nidx] == 0 {
-                        self.labels[nidx] = next_label;
-                        self.queue.push_back(nidx);
-                    }
+            let mut p = prev_start;
+            for ri in row_start..row_end {
+                let (x0, x1) = (runs[ri].x0, runs[ri].x1);
+                // Skip previous-row runs that end before this one starts.
+                while p < prev_end && runs[p].x1 < x0 {
+                    p += 1;
+                }
+                // Every previous-row run that starts before this one
+                // ends overlaps it.  Do not advance `p` past them: the
+                // last one may also overlap the next run of this row.
+                let mut q = p;
+                while q < prev_end && runs[q].x0 <= x1 {
+                    union_runs(runs, ri, q);
+                    q += 1;
                 }
             }
+            prev_start = row_start;
+            prev_end = row_end;
+        }
 
+        // Pass 2: component sizes by root, then the largest — strict
+        // `>` with roots visited in increasing index order means an
+        // equal-size tie goes to the component whose first run (and
+        // hence first pixel) comes first in scan order.
+        let sizes = &mut self.sizes;
+        sizes.clear();
+        sizes.resize(runs.len(), 0);
+        for ri in 0..runs.len() {
+            let root = find_root(runs, ri);
+            sizes[root] += runs[ri].x1 - runs[ri].x0 + 1;
+        }
+        let mut winner: Option<usize> = None;
+        let mut largest_size = 0u32;
+        for (ri, &size) in sizes.iter().enumerate() {
             if size > largest_size {
                 largest_size = size;
-                largest_label = next_label;
+                winner = Some(ri);
             }
-            // Pixel count fits in u32 on any conceivable mask
-            // resolution (mask resolution * model resolution ≤ 4G px),
-            // so the label counter cannot overflow in practice. Keep
-            // an explicit debug assertion so a future codebase change
-            // that introduces giant masks does not silently merge
-            // components.
-            debug_assert!(next_label < u32::MAX, "component label overflow");
-            next_label += 1;
         }
 
-        // Pass 2: zero out pixels that are not in the largest component.
-        // `largest_label == 0` only when the seed loop ran zero times —
-        // i.e. no input pixel was at or above `level`. In that case
-        // every `labels[i]` is still 0 (unlabeled) too, so the `!=`
-        // check still zeroes the whole mask. Equivalent to: "no
-        // foreground → all-zero output".
-        for (m, &label) in mask.data.iter_mut().zip(self.labels.iter()) {
-            if label != largest_label {
-                *m = 0.0;
+        // Pass 3: rewrite. Every pixel outside the winner's runs — below
+        // level, or in another component — becomes 0.0; the winner's
+        // pixels keep their confidence values.  With no foreground at
+        // all (`winner == None`) the whole mask is zeroed.
+        let mut ri = 0usize;
+        for (y, row) in mask.data.chunks_exact_mut(width).enumerate() {
+            let mut cursor = 0usize;
+            while ri < runs.len() && runs[ri].y as usize == y {
+                let (x0, x1) = (runs[ri].x0 as usize, runs[ri].x1 as usize);
+                row[cursor..x0].fill(0.0);
+                if winner != Some(find_root(runs, ri)) {
+                    row[x0..=x1].fill(0.0);
+                }
+                cursor = x1 + 1;
+                ri += 1;
             }
+            row[cursor..].fill(0.0);
         }
+        debug_assert_eq!(ri, runs.len(), "every run belongs to a row of the mask");
         Ok(())
     }
 }
@@ -358,6 +407,102 @@ mod tests {
         run(&mut effect, &mut data, 3, 3);
         assert_eq!(data[0], 1.0, "first-scanned tie winner must survive");
         assert_eq!(data[4], 0.0, "second-scanned tie loser must be zeroed");
+    }
+
+    /// The pre-run-based implementation: BFS labeling with
+    /// 4-connectivity, largest component by strict `>` in seed scan
+    /// order.  Kept as the behavioural reference for the run-based
+    /// kernel.
+    fn bfs_reference(mask: &mut [f32], width: usize, height: usize, level: f32) {
+        let pixels = width * height;
+        let mut labels = vec![0u32; pixels];
+        let mut queue = std::collections::VecDeque::new();
+        let mut next_label = 1u32;
+        let mut largest_label = 0u32;
+        let mut largest_size = 0usize;
+        for seed in 0..pixels {
+            if mask[seed] < level || labels[seed] != 0 {
+                continue;
+            }
+            queue.clear();
+            queue.push_back(seed);
+            labels[seed] = next_label;
+            let mut size = 0usize;
+            while let Some(idx) = queue.pop_front() {
+                size += 1;
+                let (x, y) = (idx % width, idx / width);
+                let candidates = [
+                    (x > 0).then(|| idx - 1),
+                    (x + 1 < width).then(|| idx + 1),
+                    (y > 0).then(|| idx - width),
+                    (y + 1 < height).then(|| idx + width),
+                ];
+                for nidx in candidates.into_iter().flatten() {
+                    if mask[nidx] >= level && labels[nidx] == 0 {
+                        labels[nidx] = next_label;
+                        queue.push_back(nidx);
+                    }
+                }
+            }
+            if size > largest_size {
+                largest_size = size;
+                largest_label = next_label;
+            }
+            next_label += 1;
+        }
+        for (m, &label) in mask.iter_mut().zip(&labels) {
+            if label != largest_label {
+                *m = 0.0;
+            }
+        }
+    }
+
+    #[test]
+    fn run_based_labeling_matches_bfs_reference_on_noise() {
+        // Dense pseudo-random noise produces hundreds of components,
+        // many of equal size, and runs that straddle several runs of
+        // the row above — every branch of the two-pointer link and the
+        // scan-order tie-break gets exercised.  Also a sparse pattern
+        // (few runs) and a striped one (runs spanning the full width).
+        let cases: [(usize, usize, u32, f32); 4] = [
+            (37, 23, 7, 0.5),
+            (64, 64, 3, 0.5),
+            (50, 9, 11, 0.3),
+            (16, 40, 5, 0.7),
+        ];
+        for (width, height, density, level) in cases {
+            let mut seed = 0x9E37_79B9u32;
+            let mut next = || {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed
+            };
+            let src: Vec<f32> = (0..width * height)
+                .map(|_| {
+                    let r = next();
+                    if r % 10 < density {
+                        0.5 + (r % 50) as f32 / 100.0
+                    } else {
+                        (r % 30) as f32 / 100.0
+                    }
+                })
+                .collect();
+
+            let mut expected = src.clone();
+            bfs_reference(&mut expected, width, height, level);
+
+            let mut effect = LargestBlobMaskEffect::new();
+            effect
+                .configure(toml::from_str(&format!("level = {level}")).unwrap())
+                .expect("configure");
+            let mut got = src.clone();
+            run(&mut effect, &mut got, width as u32, height as u32);
+            assert_eq!(
+                got, expected,
+                "{width}x{height} density {density} level {level}"
+            );
+        }
     }
 
     #[test]
