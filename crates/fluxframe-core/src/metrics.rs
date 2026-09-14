@@ -1050,6 +1050,31 @@ pub struct MetricsSnapshot {
     /// Fine-grained per-stage / per-effect timings inside `processing`
     /// (see [`StageTimings`]).  Empty when the chain records none.
     pub stages: Vec<StageSnapshot>,
+    /// CPU time consumed over the reporting window, split by thread
+    /// role.  `None` when the producer cannot sample it (non-Linux
+    /// host, teardown summary).
+    pub cpu: Option<CpuShares>,
+}
+
+/// CPU time over one reporting window as a percentage of a single
+/// core (100 = one core fully busy), split by the role of the thread
+/// that spent it.  Stage timings are wall-clock and cannot tell a
+/// blocked wait from a busy one; this can — it is the number the
+/// battery question is asked in.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CpuShares {
+    /// Whole process.
+    pub process: f64,
+    /// The frame-processing worker (effect chain + inference wait).
+    pub worker: f64,
+    /// Rayon pool threads (data-parallel kernels).
+    pub rayon: f64,
+    /// GStreamer capture side (`videoconvert` etc.).
+    pub input: f64,
+    /// GStreamer output side (colour conversion + loopback writer).
+    pub output: f64,
+    /// Everything else (control socket, reporter, detector, …).
+    pub other: f64,
 }
 
 /// Telemetry sink handed to an effect via [`crate::context::FrameContext`].
@@ -1162,6 +1187,13 @@ impl MetricsSnapshot {
     #[must_use]
     pub fn with_stages(mut self, stages: Vec<StageSnapshot>) -> Self {
         self.stages = stages;
+        self
+    }
+
+    /// Attach the per-role CPU shares for the window.
+    #[must_use]
+    pub fn with_cpu(mut self, cpu: Option<CpuShares>) -> Self {
+        self.cpu = cpu;
         self
     }
 }
@@ -1293,6 +1325,31 @@ pub fn emit_metrics_line(snap: &MetricsSnapshot, extras: Option<PeriodicExtras>)
     );
 
     emit_stage_line(&snap.stages, periodic);
+    emit_cpu_line(snap.cpu, periodic);
+}
+
+/// Per-role CPU shares on a sibling line of the main metrics line.
+/// Skipped when the producer had no sample (non-Linux host, teardown
+/// summary), so the main line's field set stays untouched.
+fn emit_cpu_line(cpu: Option<CpuShares>, periodic: bool) {
+    let Some(cpu) = cpu else {
+        return;
+    };
+    let msg = if periodic {
+        "cpu shares"
+    } else {
+        "run cpu shares"
+    };
+    tracing::info!(
+        target: "fluxframe::metrics",
+        cpu_process_pct = round2(cpu.process),
+        cpu_worker_pct = round2(cpu.worker),
+        cpu_rayon_pct = round2(cpu.rayon),
+        cpu_input_pct = round2(cpu.input),
+        cpu_output_pct = round2(cpu.output),
+        cpu_other_pct = round2(cpu.other),
+        "{msg}"
+    );
 }
 
 /// Per-stage breakdown on a sibling line of the main metrics line.

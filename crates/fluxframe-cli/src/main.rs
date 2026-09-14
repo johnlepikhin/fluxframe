@@ -22,6 +22,7 @@ mod persist;
 mod preset;
 mod runtime;
 mod runtime_metrics;
+mod thread_cpu;
 
 fn main() -> ExitCode {
     let args = cli::Cli::parse();
@@ -104,8 +105,11 @@ fn cap_rayon_pool() {
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(RAYON_MIN_THREADS);
     let target = compute_rayon_target(env_value.as_deref(), available);
+    // Named so the metrics reporter's per-thread CPU accounting can
+    // tell pool workers from everything else (see `thread_cpu`).
     match rayon::ThreadPoolBuilder::new()
         .num_threads(target)
+        .thread_name(|i| format!("rayon-{i}"))
         .build_global()
     {
         Ok(()) => {

@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use fluxframe_core::{CONSUMER_EVENT_AGE_UNSET, CounterValues, PeriodicExtras, emit_metrics_line};
 
 use crate::runtime_metrics::RuntimeMetrics;
+use crate::thread_cpu::ThreadCpuSampler;
 
 /// Granularity of the reporter's shutdown poll.  Smaller is more
 /// responsive to Ctrl-C, larger spends less CPU.  Sized to match
@@ -190,6 +191,9 @@ fn reporter_loop(
     let mut last_frames_dropped: u64 = 0;
     let mut last_emit = Instant::now();
     let mut last_emitted: Option<CounterValues> = None;
+    // Per-thread CPU accounting; `None` off Linux, in which case the
+    // `cpu shares` line is simply never emitted.
+    let mut cpu_sampler = ThreadCpuSampler::new();
     while running.load(Ordering::Acquire) && !stopped.load(Ordering::Acquire) {
         // Sleep no longer than the time remaining until the next
         // scheduled tick, but cap at POLL_INTERVAL so shutdown stays
@@ -214,7 +218,10 @@ fn reporter_loop(
         }
         last_tick = now;
 
-        let snap = metrics.snapshot();
+        // Sampled every tick, like the frame deltas, so a suppressed
+        // tick does not fold its CPU time into the next window.
+        let cpu = cpu_sampler.as_mut().and_then(ThreadCpuSampler::sample);
+        let snap = metrics.snapshot().with_cpu(cpu);
         let frames_now = snap.counters.frames_out;
         let frames_delta = frames_now.saturating_sub(last_frames_out);
         last_frames_out = frames_now;
