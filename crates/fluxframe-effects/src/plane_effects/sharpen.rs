@@ -126,20 +126,23 @@ fn gauss_h(src: &[u8], dst: &mut [u8], width: usize) {
     let row_stride = width * 3;
     for_each_row_mut(dst, row_stride, |y, dst_row| {
         let src_row = &src[y * row_stride..y * row_stride + row_stride];
-        // Interior pixels: `windows(9)` yields the left / centre / right
-        // pixel triple with no per-byte bounds checks; the two edge
-        // pixels are handled separately with clamp-to-edge.
         if width == 1 {
             dst_row.copy_from_slice(src_row);
             return;
         }
-        for (out, win) in dst_row[3..row_stride - 3]
-            .chunks_exact_mut(3)
-            .zip(src_row.windows(9).step_by(3))
+        // Interior bytes: the left / right neighbours of byte `i` are
+        // bytes `i - 3` / `i + 3`, so the whole row is one streaming
+        // zip of three shifted views — no per-pixel indexing, which
+        // lets the loop vectorise.  The two edge pixels follow with
+        // clamp-to-edge.
+        let n = row_stride;
+        for (((out, &l), &m), &r) in dst_row[3..n - 3]
+            .iter_mut()
+            .zip(&src_row[..n - 6])
+            .zip(&src_row[3..n - 3])
+            .zip(&src_row[6..])
         {
-            for c in 0..3 {
-                out[c] = tap3(win[c], win[3 + c], win[6 + c]);
-            }
+            *out = tap3(l, m, r);
         }
         for c in 0..3 {
             dst_row[c] = tap3(src_row[c], src_row[c], src_row[3 + c]);
