@@ -52,7 +52,7 @@ struct AxisTap {
     i0: usize,
     /// Upper source index (`i0 + 1`, clamped to the last element).
     i1: usize,
-    /// Weight of `i1`; `i0` gets `1 - w`.
+    /// Weight of `i1` in `[0, 1)`; `i0` gets `1 - w`.
     w: f32,
 }
 
@@ -89,11 +89,50 @@ fn lerp(a: f32, b: f32, w: f32) -> f32 {
     a + w * (b - a)
 }
 
+/// Fixed-point one for the integer RGB kernel: axis weights are
+/// quantised to `0..=WEIGHT_ONE`, so a 2-D sample is a `u32` sum of
+/// four `255 * 256 * 256` terms — no overflow, no float.
+const WEIGHT_ONE: u32 = 256;
+
+/// Round-to-nearest term for the combined 16-bit shift.
+const WEIGHT_HALF_SQ: u32 = WEIGHT_ONE * WEIGHT_ONE / 2;
+
+/// [`AxisTap`] with the weight quantised to 8.8 fixed point.  Same
+/// sample positions; only the blend arithmetic changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AxisTapQ8 {
+    i0: usize,
+    i1: usize,
+    /// Weight of `i1` in `0..=WEIGHT_ONE`.
+    w: u32,
+}
+
+impl From<AxisTap> for AxisTapQ8 {
+    fn from(t: AxisTap) -> Self {
+        // `w < 1.0`, so the product is at most 256 after rounding and
+        // the saturating cast is total.
+        let w = (t.w * WEIGHT_ONE as f32 + 0.5) as u32;
+        Self {
+            i0: t.i0,
+            i1: t.i1,
+            w,
+        }
+    }
+}
+
 /// Bilinear resize for packed RGB (3 bytes per pixel).
 ///
 /// `src` length must equal `src_w * src_h * 3`, `dst` length must
 /// equal `dst_w * dst_h * 3`.  Allocates only the two small per-axis
 /// tap tables (`dst_w + dst_h` entries).
+///
+/// The blend runs in 8.8 fixed point per axis (16.16 combined): the
+/// four source bytes are weighted with integer multiplies and one
+/// shift, which is what makes this kernel affordable at frame
+/// resolution — the composite runs it every frame for `auto_frame`
+/// and for the model pre-resize.  Versus the exact float blend the
+/// result is within one LSB; positions where a weight is exactly 0
+/// or 1/2 (identity, 2× box average) are exact.
 ///
 /// # Panics
 ///
@@ -111,25 +150,35 @@ pub fn resize_rgb_bilinear(
     if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
         return;
     }
-    let xs = axis_taps(src_w, dst_w);
-    let ys = axis_taps(src_h, dst_h);
+    let xs: Vec<AxisTapQ8> = axis_taps(src_w, dst_w)
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    let ys: Vec<AxisTapQ8> = axis_taps(src_h, dst_h)
+        .into_iter()
+        .map(Into::into)
+        .collect();
     let src_row = src_w as usize * 3;
     // Output rows are independent — each reads the shared `src` and
     // writes only its own row — so dispatch them row-parallel.
     for_each_row_mut(dst, dst_w as usize * 3, |y, dst_row| {
         let ty = ys[y];
+        let (below, above) = (ty.w, WEIGHT_ONE - ty.w);
         let row0 = &src[ty.i0 * src_row..ty.i0 * src_row + src_row];
         let row1 = &src[ty.i1 * src_row..ty.i1 * src_row + src_row];
         for (tx, out) in xs.iter().zip(dst_row.chunks_exact_mut(3)) {
+            let (right, left) = (tx.w, WEIGHT_ONE - tx.w);
             let p00 = &row0[tx.i0 * 3..tx.i0 * 3 + 3];
             let p01 = &row0[tx.i1 * 3..tx.i1 * 3 + 3];
             let p10 = &row1[tx.i0 * 3..tx.i0 * 3 + 3];
             let p11 = &row1[tx.i1 * 3..tx.i1 * 3 + 3];
             for c in 0..3 {
-                let top = lerp(f32::from(p00[c]), f32::from(p01[c]), tx.w);
-                let bot = lerp(f32::from(p10[c]), f32::from(p11[c]), tx.w);
-                let v = lerp(top, bot, ty.w);
-                out[c] = v.round().clamp(0.0, 255.0) as u8;
+                let top = u32::from(p00[c]) * left + u32::from(p01[c]) * right;
+                let bot = u32::from(p10[c]) * left + u32::from(p11[c]) * right;
+                // Weights sum to 256 on each axis, so `v <= 255` and
+                // the narrowing cast is exact.
+                let v = (top * above + bot * below + WEIGHT_HALF_SQ) >> 16;
+                out[c] = v as u8;
             }
         }
     });
@@ -315,6 +364,73 @@ mod tests {
         for tap in axis_taps(1, 5) {
             assert_eq!((tap.i0, tap.i1), (0, 0));
         }
+    }
+
+    /// Exact float bilinear of a packed-RGB image at pixel-centre
+    /// positions — the reference the integer kernel is held against.
+    fn rgb_bilinear_reference(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+        let mut out = vec![0u8; (dw * dh * 3) as usize];
+        for y in 0..dh {
+            let sy = ((y as f32 + 0.5) * sh as f32 / dh as f32 - 0.5).max(0.0);
+            let y0 = (sy.floor() as u32).min(sh - 1);
+            let y1 = (y0 + 1).min(sh - 1);
+            let wy = sy - y0 as f32;
+            for x in 0..dw {
+                let sx = ((x as f32 + 0.5) * sw as f32 / dw as f32 - 0.5).max(0.0);
+                let x0 = (sx.floor() as u32).min(sw - 1);
+                let x1 = (x0 + 1).min(sw - 1);
+                let wx = sx - x0 as f32;
+                for c in 0..3 {
+                    let at = |yy: u32, xx: u32| f32::from(src[((yy * sw + xx) * 3 + c) as usize]);
+                    let v = (1.0 - wx) * (1.0 - wy) * at(y0, x0)
+                        + wx * (1.0 - wy) * at(y0, x1)
+                        + (1.0 - wx) * wy * at(y1, x0)
+                        + wx * wy * at(y1, x1);
+                    out[((y * dw + x) * 3 + c) as usize] = v.round() as u8;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rgb_fixed_point_matches_float_reference_within_one_lsb() {
+        // Up- and downscale of a pseudo-random image: the 8.8 weights
+        // may shift a value by one LSB, never more.
+        for &(sw, sh, dw, dh) in &[(16u32, 9u32, 48u32, 27u32), (48, 27, 16, 9), (13, 7, 5, 11)] {
+            let src: Vec<u8> = (0..sw * sh * 3)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+                .collect();
+            let expected = rgb_bilinear_reference(&src, sw, sh, dw, dh);
+            let mut dst = vec![0u8; (dw * dh * 3) as usize];
+            resize_rgb_bilinear(&src, sw, sh, &mut dst, dw, dh);
+            for (i, (&got, &exp)) in dst.iter().zip(&expected).enumerate() {
+                assert!(
+                    (i32::from(got) - i32::from(exp)).abs() <= 1,
+                    "{sw}x{sh}->{dw}x{dh} byte {i}: {got} vs {exp}"
+                );
+            }
+        }
+    }
+
+    /// Wall-clock probe for the `auto_frame` crop upscale (a ~1.3×
+    /// zoom at 800×448), which `videotestsrc` never exercises because
+    /// its mask covers the whole frame.  Run with
+    /// `cargo test --release -p fluxframe-effects -- --ignored --nocapture resize_rgb_upscale_timing`.
+    #[test]
+    #[ignore = "timing probe, not a correctness test"]
+    fn resize_rgb_upscale_timing() {
+        let (sw, sh, dw, dh) = (615u32, 344u32, 800u32, 448u32);
+        let src: Vec<u8> = (0..sw * sh * 3).map(|i| (i % 251) as u8).collect();
+        let mut dst = vec![0u8; (dw * dh * 3) as usize];
+        resize_rgb_bilinear(&src, sw, sh, &mut dst, dw, dh);
+        let iters = 200;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            resize_rgb_bilinear(&src, sw, sh, &mut dst, dw, dh);
+        }
+        let per_call = start.elapsed() / iters;
+        println!("resize_rgb_bilinear {sw}x{sh}->{dw}x{dh}: {per_call:?} per call");
     }
 
     #[test]
