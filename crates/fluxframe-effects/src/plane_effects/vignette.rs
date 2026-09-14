@@ -71,13 +71,22 @@ impl Default for VignetteConfig {
     }
 }
 
+/// Fixed-point one for the attenuation LUT: a factor of exactly
+/// `LUT_ONE` leaves the pixel untouched (`(c * 256 + 128) >> 8 == c`),
+/// so the untouched centre is bit-exact.
+const LUT_ONE: u16 = 256;
+
+/// Round-to-nearest term for the `>> 8` in the apply loop.
+const LUT_ONE_HALF: u32 = LUT_ONE as u32 / 2;
+
 /// `PlaneEffect` applying a smooth radial vignette.
 pub struct VignetteEffect {
     config: VignetteConfig,
-    /// Per-pixel multiplicative attenuation factors in `0..=255`, laid
-    /// out as `width * height` in row-major order. Built once in
-    /// `prepare` so the hot loop avoids per-pixel `sqrt`.
-    lut: Vec<u8>,
+    /// Per-pixel multiplicative attenuation factors in 8.8 fixed point
+    /// (`0..=LUT_ONE`), laid out as `width * height` in row-major
+    /// order. Built once in `prepare` so the hot loop avoids per-pixel
+    /// `sqrt`.
+    lut: Vec<u16>,
     frame_w: u32,
     frame_h: u32,
 }
@@ -185,7 +194,7 @@ impl PlaneEffect for VignetteEffect {
         self.frame_h = context.height;
         let width = context.width as usize;
         let height = context.height as usize;
-        self.lut = vec![255u8; width * height];
+        self.lut = vec![LUT_ONE; width * height];
         if width == 0 || height == 0 {
             return Ok(());
         }
@@ -210,7 +219,8 @@ impl PlaneEffect for VignetteEffect {
                 let d = (dx * dx + dy * dy).sqrt() / r_max;
                 let falloff = smoothstep(inner, 1.0, d);
                 let m = (1.0 - strength * falloff).clamp(0.0, 1.0);
-                self.lut[y * width + x] = (m * 255.0 + 0.5) as u8;
+                // `m <= 1.0`, so the product is at most LUT_ONE.
+                self.lut[y * width + x] = (m * f32::from(LUT_ONE) + 0.5) as u16;
             }
         }
         Ok(())
@@ -256,13 +266,12 @@ impl PlaneEffect for VignetteEffect {
         for_each_row_mut(plane.data, width * 3, |y, row| {
             let lut_row = &lut[y * width..y * width + width];
             for (pixel, &m) in row.chunks_exact_mut(3).zip(lut_row.iter()) {
-                let m = u16::from(m);
-                // Integer multiply-divide: `(c * m + 127) / 255` rounds to
-                // the nearest integer; max value is 255 * 255 = 65 025
-                // which fits in u16.
+                let m = u32::from(m);
+                // 8.8 fixed point: `(c * m + 128) >> 8` rounds to nearest
+                // and is a multiply + shift instead of a divide.  `m <=
+                // LUT_ONE` keeps the result within `0..=255`.
                 for c in pixel.iter_mut() {
-                    let v = u16::from(*c);
-                    *c = ((v * m + 127) / 255) as u8;
+                    *c = ((u32::from(*c) * m + LUT_ONE_HALF) >> 8) as u8;
                 }
             }
         });
@@ -337,6 +346,55 @@ mod tests {
         let original = data.clone();
         run(&mut effect, &mut data, 4, 4);
         assert_eq!(data, original, "strength=0 must be a no-op");
+    }
+
+    #[test]
+    fn untouched_lut_entries_are_bit_exact_identity() {
+        // Inside `inner_radius` the LUT is exactly LUT_ONE; those pixels
+        // must come out byte-identical, not off by rounding.
+        let mut effect = VignetteEffect::new();
+        let params: RawEffectParams =
+            toml::from_str("strength = 1.0\ninner_radius = 0.99").unwrap();
+        effect.configure(params).expect("configure");
+        let w = 32u32;
+        let h = 32u32;
+        let mut data: Vec<u8> = (0..(w * h * 3)).map(|i| (i * 7 % 256) as u8).collect();
+        let original = data.clone();
+        run(&mut effect, &mut data, w, h);
+        let idx = |x: u32, y: u32| ((y * w + x) * 3) as usize;
+        // Centre pixel sits far inside inner_radius.
+        assert_eq!(effect.lut[(h / 2 * w + w / 2) as usize], LUT_ONE);
+        assert_eq!(
+            &data[idx(16, 16)..idx(16, 16) + 3],
+            &original[idx(16, 16)..idx(16, 16) + 3]
+        );
+    }
+
+    #[test]
+    fn fixed_point_apply_matches_byte_scale_within_one_lsb() {
+        // Reference: the former `(c * m255 + 127) / 255` with the
+        // attenuation quantised to a byte.  The 8.8 form may differ by
+        // one LSB from it, never more.
+        let mut effect = VignetteEffect::new();
+        let params: RawEffectParams =
+            toml::from_str("strength = 0.89\ninner_radius = 0.48").unwrap();
+        effect.configure(params).expect("configure");
+        let w = 40u32;
+        let h = 24u32;
+        let mut data: Vec<u8> = (0..(w * h * 3))
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let original = data.clone();
+        run(&mut effect, &mut data, w, h);
+        for (i, (&got, &orig)) in data.iter().zip(&original).enumerate() {
+            let m = f32::from(effect.lut[i / 3]) / f32::from(LUT_ONE);
+            let m255 = (m * 255.0 + 0.5) as u32;
+            let expected = i64::from((u32::from(orig) * m255 + 127) / 255);
+            assert!(
+                (i64::from(got) - expected).abs() <= 1,
+                "byte {i}: got {got}, byte-scale reference {expected}"
+            );
+        }
     }
 
     #[test]
