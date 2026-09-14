@@ -62,6 +62,11 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
     // still had to go through the bootstrap filter.
     crate::logging::apply_config_level(&cfg.logging.level);
 
+    // The rayon pool can only be built once per process and must exist
+    // before the first parallel kernel runs, so it is sized here — the
+    // first point where the validated config is in hand.
+    crate::cap_rayon_pool(cfg.realtime.processing_threads);
+
     // Resolve the preset once up-front so a misnamed preset fails fast
     // (before we touch any GStreamer state) and the auto input loop
     // does not re-enter a doomed configuration on each

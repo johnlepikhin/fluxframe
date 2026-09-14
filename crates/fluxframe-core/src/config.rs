@@ -86,6 +86,15 @@ pub const MAX_OUTPUT_SCALE: f32 = 1.0;
 /// only to catch typos like `metrics_interval_secs = 50000` that
 /// would effectively silence the reporter.
 pub const MAX_METRICS_INTERVAL_SECS: u32 = 3600;
+/// Default for `[realtime] processing_threads`: `0` = let the daemon
+/// choose.  The image kernels are memory-bound at frame resolution —
+/// measured at 800×448: 4 threads cost 32 % of a core for a 8.8 ms
+/// processing p50, 2 threads 27.6 % for 9.7 ms — so the auto pick
+/// favours CPU time over the last millisecond of latency.
+pub const DEFAULT_PROCESSING_THREADS: u32 = 0;
+/// Upper bound on a positive `processing_threads`.  Enough for any
+/// desktop; anything larger is almost certainly a typo.
+pub const MAX_PROCESSING_THREADS: u32 = 64;
 
 /// Upper bound on `input.auto.poll_interval_secs` accepted by
 /// [`FluxConfig::validate`].  Larger settings effectively wedge the
@@ -523,6 +532,12 @@ pub struct RealtimeConfig {
     /// is unconditional).
     #[serde(default = "default_metrics_interval_secs")]
     pub metrics_interval_secs: u32,
+    /// Worker threads for the data-parallel image kernels (the rayon
+    /// pool).  `0` (default) lets the daemon pick; see
+    /// [`DEFAULT_PROCESSING_THREADS`].  The `FLUXFRAME_RAYON_THREADS`
+    /// environment variable still overrides both.
+    #[serde(default = "default_processing_threads")]
+    pub processing_threads: u32,
 }
 
 impl Default for RealtimeConfig {
@@ -532,7 +547,46 @@ impl Default for RealtimeConfig {
             drop_late_frames: default_drop_late(),
             max_inflight_frames: default_max_inflight(),
             metrics_interval_secs: default_metrics_interval_secs(),
+            processing_threads: default_processing_threads(),
         }
+    }
+}
+
+impl RealtimeConfig {
+    /// Range checks for the `[realtime]` table; part of
+    /// [`FluxConfig::validate`].
+    fn validate(&self) -> Result<(), crate::error::FluxError> {
+        if self.max_inflight_frames == 0 || self.max_inflight_frames > MAX_INFLIGHT_FRAMES {
+            return Err(config_err(format!(
+                "realtime.max_inflight_frames must be in 1..={MAX_INFLIGHT_FRAMES}, got {}",
+                self.max_inflight_frames
+            )));
+        }
+        if self.max_latency_ms == 0 || self.max_latency_ms > MAX_LATENCY_MS {
+            return Err(config_err(format!(
+                "realtime.max_latency_ms must be in 1..={MAX_LATENCY_MS}, got {}",
+                self.max_latency_ms
+            )));
+        }
+        // `0` is the documented "disable periodic reporting" sentinel;
+        // any positive value must stay within the sane upper bound so
+        // `metrics_interval_secs = 50000` does not silently turn into
+        // a ~14 h cadence the operator never sees.
+        if self.metrics_interval_secs > MAX_METRICS_INTERVAL_SECS {
+            return Err(config_err(format!(
+                "realtime.metrics_interval_secs must be 0 (disabled) or in 1..={MAX_METRICS_INTERVAL_SECS}, got {}",
+                self.metrics_interval_secs
+            )));
+        }
+        // `0` is the documented "auto" sentinel; a positive count is
+        // taken verbatim, so bound it against typos.
+        if self.processing_threads > MAX_PROCESSING_THREADS {
+            return Err(config_err(format!(
+                "realtime.processing_threads must be 0 (auto) or in 1..={MAX_PROCESSING_THREADS}, got {}",
+                self.processing_threads
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -986,31 +1040,7 @@ impl FluxConfig {
         // `OutputConfig.scale: OutputScale` is validated at construction
         // (TOML deserialize / TryFrom); no runtime re-check needed.
 
-        if self.realtime.max_inflight_frames == 0
-            || self.realtime.max_inflight_frames > MAX_INFLIGHT_FRAMES
-        {
-            return Err(config_err(format!(
-                "realtime.max_inflight_frames must be in 1..={MAX_INFLIGHT_FRAMES}, got {}",
-                self.realtime.max_inflight_frames
-            )));
-        }
-        if self.realtime.max_latency_ms == 0 || self.realtime.max_latency_ms > MAX_LATENCY_MS {
-            return Err(config_err(format!(
-                "realtime.max_latency_ms must be in 1..={MAX_LATENCY_MS}, got {}",
-                self.realtime.max_latency_ms
-            )));
-        }
-
-        // `0` is the documented "disable periodic reporting" sentinel;
-        // any positive value must stay within the sane upper bound so
-        // `metrics_interval_secs = 50000` does not silently turn into
-        // a ~14 h cadence the operator never sees.
-        if self.realtime.metrics_interval_secs > MAX_METRICS_INTERVAL_SECS {
-            return Err(config_err(format!(
-                "realtime.metrics_interval_secs must be 0 (disabled) or in 1..={MAX_METRICS_INTERVAL_SECS}, got {}",
-                self.realtime.metrics_interval_secs
-            )));
-        }
+        self.realtime.validate()?;
 
         // Auto-pick poll cadence: `0` would busy-loop on the device
         // scanner; absurdly large values silently disable the polling
@@ -1183,6 +1213,9 @@ fn default_max_inflight() -> u32 {
 }
 fn default_metrics_interval_secs() -> u32 {
     DEFAULT_METRICS_INTERVAL_SECS
+}
+fn default_processing_threads() -> u32 {
+    DEFAULT_PROCESSING_THREADS
 }
 fn default_log_level() -> String {
     DEFAULT_LOG_LEVEL.to_string()

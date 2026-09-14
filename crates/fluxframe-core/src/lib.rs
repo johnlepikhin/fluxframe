@@ -105,6 +105,19 @@ device = "/dev/video1"
     }
 
     #[test]
+    fn config_processing_threads_defaults_to_auto_and_is_bounded() {
+        let mut cfg = FluxConfig::default();
+        assert_eq!(cfg.realtime.processing_threads, 0, "0 = auto");
+        cfg.realtime.processing_threads = 2;
+        cfg.validate().expect("explicit count accepted");
+        cfg.realtime.processing_threads = 1000;
+        let err = cfg
+            .validate()
+            .expect_err("absurd thread count must be rejected");
+        assert!(format!("{err}").contains("processing_threads"));
+    }
+
+    #[test]
     fn config_validation_rejects_excessive_metrics_interval() {
         let mut cfg = FluxConfig::default();
         cfg.realtime.metrics_interval_secs = 50_000;
