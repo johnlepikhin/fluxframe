@@ -22,6 +22,7 @@ mod persist;
 mod preset;
 mod runtime;
 mod runtime_metrics;
+mod session;
 mod thread_cpu;
 
 fn main() -> ExitCode {

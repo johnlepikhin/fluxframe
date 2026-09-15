@@ -30,6 +30,7 @@ use crate::control::{
 use crate::metrics_reporter::MetricsReporter;
 use crate::preset;
 use crate::runtime_metrics::RuntimeMetrics;
+use crate::session::ControlSession;
 
 /// Worker-response cap for the listener thread. The worker only polls
 /// between frames; at 30 fps one cycle is ~33 ms, so 5 s is generous
@@ -75,33 +76,52 @@ impl control::CommandHandler for ChannelHandler {
     }
 }
 
-/// Spawn the control listener when `[control].enabled = true`.
-/// Returns the listener handle (kept alive for the run) and the
-/// receiver the worker reads commands from. Returns `(None, None)`
-/// when the feature is disabled or the listener fails to bind
-/// (logged but not fatal).
-fn maybe_spawn_control(
-    cfg: &FluxConfig,
-) -> (
-    Option<ListenerHandle>,
-    Option<crossbeam_channel::Receiver<ControlEnvelope>>,
-) {
-    if !cfg.control.enabled {
-        return (None, None);
-    }
-    let socket_path = cfg
-        .control
-        .socket_path
-        .clone()
-        .unwrap_or_else(control::default_socket_path);
-    let (tx, rx) = crossbeam_channel::bounded::<ControlEnvelope>(CONTROL_CHANNEL_DEPTH);
-    let handler = ChannelHandler { tx };
-    match control::spawn(socket_path, handler) {
-        Ok(handle) => (Some(handle), Some(rx)),
-        Err(e) => {
-            warn!(error = %e, "control socket failed to bind; live-reconfig disabled");
-            (None, None)
+/// The control socket plus the receiving end of its command channel.
+///
+/// Owned by `commands::run` for the whole process rather than by a
+/// pipeline run: runs end and restart whenever the camera goes away,
+/// and the socket — with the clients connected to it — must survive
+/// that. Dropping the plane unlinks the socket file.
+pub(crate) struct ControlPlane {
+    _listener: Option<ListenerHandle>,
+    rx: Option<crossbeam_channel::Receiver<ControlEnvelope>>,
+}
+
+impl ControlPlane {
+    /// Spawn the listener when `[control].enabled = true`. A bind
+    /// failure is logged, not fatal: the daemon then runs without live
+    /// reconfiguration.
+    pub(crate) fn spawn(cfg: &FluxConfig) -> Self {
+        let disabled = Self {
+            _listener: None,
+            rx: None,
+        };
+        if !cfg.control.enabled {
+            return disabled;
         }
+        let socket_path = cfg
+            .control
+            .socket_path
+            .clone()
+            .unwrap_or_else(control::default_socket_path);
+        let (tx, rx) = crossbeam_channel::bounded::<ControlEnvelope>(CONTROL_CHANNEL_DEPTH);
+        let handler = ChannelHandler { tx };
+        match control::spawn(socket_path, handler) {
+            Ok(handle) => Self {
+                _listener: Some(handle),
+                rx: Some(rx),
+            },
+            Err(e) => {
+                warn!(error = %e, "control socket failed to bind; live-reconfig disabled");
+                disabled
+            }
+        }
+    }
+
+    /// Receiver the worker drains commands from; `None` when the socket
+    /// is disabled.
+    pub(crate) fn rx(&self) -> Option<&crossbeam_channel::Receiver<ControlEnvelope>> {
+        self.rx.as_ref()
     }
 }
 
@@ -130,30 +150,70 @@ fn command_label(cmd: &ControlCommand) -> &'static str {
     }
 }
 
-/// Apply a single control command. Returns the response the worker
-/// will hand back to the listener thread.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "command dispatcher; refactor deferred"
-)]
-fn apply_control_command(
-    cfg: &mut FluxConfig,
-    config_path: Option<&std::path::Path>,
-    processing_ctx: &ProcessingContext,
-    chain: &mut EffectChain,
-    active_preset_name: &mut String,
-    active_preset: &mut Preset,
-    telemetry: &fluxframe_core::EffectTelemetry,
-    cmd: ControlCommand,
-) -> ControlResponse {
-    match cmd {
+/// Answer the commands that only read the session; `None` for every
+/// command that changes the preset or the chain.
+///
+/// Shared by [`apply_control_command`] and [`apply_offline_command`], so
+/// a read-only command behaves the same with and without a running
+/// pipeline.
+fn apply_read_only_command(
+    session: &ControlSession,
+    cmd: &ControlCommand,
+) -> Option<ControlResponse> {
+    let response = match cmd {
         ControlCommand::ListPresets => {
-            let names: Vec<&str> = cfg.presets.keys().map(String::as_str).collect();
+            let names: Vec<&str> = session.cfg.presets.keys().map(String::as_str).collect();
             ControlResponse::ok_with(serde_json::json!(names))
         }
         ControlCommand::CurrentPreset => {
-            ControlResponse::ok_with(serde_json::json!(active_preset_name.clone()))
+            ControlResponse::ok_with(serde_json::json!(session.active_preset_name))
         }
+        ControlCommand::GetConfig { path } => {
+            apply_get_config_command(&session.active_preset, path.as_deref())
+        }
+        ControlCommand::ListEffects => apply_list_effects_command(),
+        ControlCommand::ConfigPath => apply_config_path_command(session.config_path.as_deref()),
+        _ => return None,
+    };
+    Some(response)
+}
+
+/// Answer a control command while no pipeline is running: the
+/// auto-input poll, camera acquire backoff, in-place recovery.
+///
+/// Read-only commands are served from the session. Anything that would
+/// reconfigure or rebuild the chain is refused: there is no chain to
+/// apply it to, and queueing it would make the reply lie about the
+/// outcome.
+fn apply_offline_command(session: &ControlSession, cmd: &ControlCommand) -> ControlResponse {
+    apply_read_only_command(session, cmd).unwrap_or_else(|| {
+        ControlResponse::err(
+            "pipeline is not running (waiting for the camera)",
+            Some("read-only commands keep working; retry once the camera is back".into()),
+        )
+    })
+}
+
+/// Apply a single control command against the running chain. Returns
+/// the response the worker hands back to the listener thread.
+fn apply_control_command(
+    session: &mut ControlSession,
+    processing_ctx: &ProcessingContext,
+    chain: &mut EffectChain,
+    telemetry: &fluxframe_core::EffectTelemetry,
+    cmd: ControlCommand,
+) -> ControlResponse {
+    if let Some(response) = apply_read_only_command(session, &cmd) {
+        return response;
+    }
+    let ControlSession {
+        cfg,
+        config_path,
+        active_preset_name,
+        active_preset,
+    } = session;
+    let config_path = config_path.as_deref();
+    match cmd {
         ControlCommand::SetPreset { name } => {
             let Some(new_preset) = cfg.presets.get(&name) else {
                 let available: Vec<&str> = cfg.presets.keys().map(String::as_str).collect();
@@ -199,9 +259,6 @@ fn apply_control_command(
             effect,
             enabled,
         } => apply_set_enabled_command(chain, active_preset, telemetry, section, &effect, enabled),
-        ControlCommand::GetConfig { path } => {
-            apply_get_config_command(active_preset, path.as_deref())
-        }
         ControlCommand::Reload => apply_reload_command(
             cfg,
             config_path,
@@ -210,14 +267,12 @@ fn apply_control_command(
             active_preset_name,
             active_preset,
         ),
-        ControlCommand::ListEffects => apply_list_effects_command(),
         ControlCommand::SavePreset => {
             apply_save_preset_command(cfg, config_path, active_preset_name, active_preset)
         }
         ControlCommand::SavePresetAs { name } => {
             apply_save_preset_as_command(cfg, config_path, active_preset, &name)
         }
-        ControlCommand::ConfigPath => apply_config_path_command(config_path),
         // `ControlCommand` is `#[non_exhaustive]`; a future variant
         // that this build does not yet handle gets a structured
         // error rather than panicking the worker thread.
@@ -1281,6 +1336,46 @@ pub(crate) fn wait_for_shutdown(total: Duration) -> bool {
     is_shutdown_requested()
 }
 
+/// [`wait_for_shutdown`] that keeps answering the control socket.
+///
+/// Used wherever the daemon waits with no worker loop draining commands
+/// — the auto-input poll, camera acquire backoff, in-place recovery — so
+/// a client is answered promptly (see [`apply_offline_command`]) instead
+/// of timing out after [`WORKER_RESPONSE_TIMEOUT`]. Queued commands are
+/// answered before shutdown is checked, so none is left without a reply.
+pub(crate) fn wait_serving_control(
+    total: Duration,
+    control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
+    session: &ControlSession,
+) -> bool {
+    let Some(rx) = control_rx else {
+        return wait_for_shutdown(total);
+    };
+    let deadline = Instant::now() + total;
+    loop {
+        let step = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(100));
+        match rx.recv_timeout(step) {
+            Ok(envelope) => {
+                // Best-effort, as in `drain_control_commands`.
+                let _ = envelope
+                    .reply_tx
+                    .send(apply_offline_command(session, &envelope.cmd));
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            // The listener is gone; keep the wait's timing honest.
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => std::thread::sleep(step),
+        }
+        if is_shutdown_requested() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+    }
+}
+
 /// Make sure the process-wide Ctrl-C handler is installed.  Idempotent
 /// — call from anywhere that needs the handler before opening a slot
 /// (currently: per-run setup and the `device = "auto"` wait loop).
@@ -1476,17 +1571,17 @@ pub(crate) fn classify_output(cfg: &FluxConfig) -> OutputSpec {
 ///
 /// Propagates [`FluxError`] from pipeline construction, effect chain
 /// preparation, or runtime failures.
-#[tracing::instrument(skip_all, fields(sink = ?cfg.output.device, preset = preset_name))]
+#[tracing::instrument(skip_all, fields(sink = ?cfg.output.device, preset = %session.active_preset_name))]
 pub(crate) fn run_testsrc_chain(
     cfg: &FluxConfig,
-    preset_name: &str,
-    config_path: Option<&std::path::Path>,
+    session: &mut ControlSession,
+    control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
     chain: EffectChain,
 ) -> Result<(), FluxError> {
     run_chain(
         cfg,
-        preset_name,
-        config_path,
+        session,
+        control_rx,
         chain,
         "testsrc",
         InputPipeline::build_testsrc,
@@ -1500,11 +1595,11 @@ pub(crate) fn run_testsrc_chain(
 /// Propagates [`FluxError`] from pipeline construction (including a
 /// structured [`PipelineError::InputDeviceUnavailable`] when the
 /// pre-open check fails), effect chain preparation, or runtime failures.
-#[tracing::instrument(skip_all, fields(device = %cfg.input.device, sink = ?cfg.output.device, preset = preset_name))]
+#[tracing::instrument(skip_all, fields(device = %cfg.input.device, sink = ?cfg.output.device, preset = %session.active_preset_name))]
 pub(crate) fn run_v4l2_chain(
     cfg: &FluxConfig,
-    preset_name: &str,
-    config_path: Option<&std::path::Path>,
+    session: &mut ControlSession,
+    control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
     chain: EffectChain,
 ) -> Result<(), FluxError> {
     // Detect the camera's native fps so the operator's `[input] fps`
@@ -1545,20 +1640,12 @@ pub(crate) fn run_v4l2_chain(
     // attempt. Output fps comes from `cfg.input.fps`; only the *input*
     // adopts the detected native fps (width/height stay operator-set).
     let device_path_for_builder = device_path.clone();
-    run_chain(
-        cfg,
-        preset_name,
-        config_path,
-        chain,
-        "v4l2src",
-        move |params| {
-            let detected =
-                fluxframe_gst::v4l2_caps::detect_native_mode(&device_path_for_builder, params.fps)?;
-            let resolved =
-                InputParams::new(params.width, params.height, detected.fps, params.format);
-            InputPipeline::build_v4l2(&device_path_for_builder, resolved)
-        },
-    )
+    run_chain(cfg, session, control_rx, chain, "v4l2src", move |params| {
+        let detected =
+            fluxframe_gst::v4l2_caps::detect_native_mode(&device_path_for_builder, params.fps)?;
+        let resolved = InputParams::new(params.width, params.height, detected.fps, params.format);
+        InputPipeline::build_v4l2(&device_path_for_builder, resolved)
+    })
 }
 
 /// Shared driver for all input backends: takes a closure that builds the
@@ -1566,8 +1653,8 @@ pub(crate) fn run_v4l2_chain(
 /// lives in exactly one place.
 fn run_chain<F>(
     cfg: &FluxConfig,
-    preset_name: &str,
-    config_path: Option<&std::path::Path>,
+    session: &mut ControlSession,
+    control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
     mut chain: EffectChain,
     source_label: &'static str,
     input_builder: F,
@@ -1635,7 +1722,15 @@ where
     // non-`Some` arms (clean shutdown, or a permanent error), so the
     // invisible window opens here rather than in `run_auto` — which
     // only ever sees `device = "auto"`.
-    let input = match prepare_input(cfg, &input_builder, &output, &metrics, &mut chain) {
+    let input = match prepare_input(
+        cfg,
+        &input_builder,
+        &output,
+        &metrics,
+        &mut chain,
+        control_rx,
+        session,
+    ) {
         Ok(Some(input)) => input,
         Ok(None) => {
             // Shutdown requested while waiting for the camera;
@@ -1687,11 +1782,6 @@ where
     // `Drop` impl joins the thread before we tear down counters.
     let _reporter = spawn_metrics_reporter(cfg, &metrics, &running);
 
-    // Stage 13 control socket. Spawned only when explicitly enabled.
-    // The handle owns the listener thread; dropping it unlinks the
-    // socket file at end-of-run.
-    let (control_handle, control_rx) = maybe_spawn_control(cfg);
-
     // Stage 15 idle runtime: detector spawn + state machine + cached
     // placeholder. Returns `None` (Stage 14 fallthrough) when idle
     // mode is disabled, the sink is non-V4L2, or the host is non-Linux.
@@ -1703,12 +1793,11 @@ where
     let process_result = run_supervised_loop(
         WorkerDeps {
             cfg,
-            config_path,
-            initial_preset_name: preset_name,
             processing_ctx: &processing_ctx,
             metrics: &metrics,
-            control_rx: control_rx.as_ref(),
+            control_rx,
         },
+        session,
         &running,
         &slot,
         &mut chain,
@@ -1719,8 +1808,6 @@ where
             failure: &input_failure,
         },
     );
-
-    drop(control_handle);
 
     // Ensure the bus listener wakes and exits.  Dropping `_bus_listener`
     // at the end of the function calls `BusListener::stop` via Drop, but
@@ -1784,6 +1871,8 @@ fn prepare_input<F>(
     output: &OutputPipeline,
     metrics: &RuntimeMetrics,
     chain: &mut EffectChain,
+    control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
+    session: &ControlSession,
 ) -> Result<Option<Arc<InputPipeline>>, FluxError>
 where
     F: Fn(InputParams) -> Result<InputPipeline, PipelineError>,
@@ -1802,7 +1891,15 @@ where
     } else {
         None
     };
-    match acquire_input(cfg, input_builder, output, metrics, placeholder.as_deref()) {
+    match acquire_input(
+        cfg,
+        input_builder,
+        output,
+        metrics,
+        placeholder.as_deref(),
+        control_rx,
+        session,
+    ) {
         Ok(Some(input)) => Ok(Some(Arc::new(input))),
         Ok(None) => {
             teardown_partial(output, chain);
@@ -1889,6 +1986,8 @@ fn acquire_input<F>(
     output: &OutputPipeline,
     metrics: &RuntimeMetrics,
     placeholder: Option<&dyn crate::idle::Placeholder>,
+    control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
+    session: &ControlSession,
 ) -> Result<Option<InputPipeline>, FluxError>
 where
     F: Fn(InputParams) -> Result<InputPipeline, PipelineError>,
@@ -1946,6 +2045,8 @@ where
                     cfg.input.format,
                     output,
                     metrics,
+                    control_rx,
+                    session,
                 )?;
                 if !cont {
                     // Shutdown requested during the backoff sleep.
@@ -1978,6 +2079,8 @@ fn backoff_after_contention(
     format: fluxframe_core::frame::PixelFormat,
     output: &OutputPipeline,
     metrics: &RuntimeMetrics,
+    control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
+    session: &ControlSession,
 ) -> Result<bool, FluxError> {
     metrics.counters.inc_input_acquire_failures();
     let kind = fe.to_string();
@@ -1998,20 +2101,9 @@ fn backoff_after_contention(
     }
     // Output itself broken → genuinely fatal (propagates).
     push_placeholder(placeholder, ph_w, ph_h, format, output, metrics)?;
-    // Sleep the backoff in short chunks so Ctrl-C is honoured within
-    // ~100 ms regardless of the current backoff.
-    let deadline = Instant::now() + backoff;
-    while Instant::now() < deadline {
-        if is_shutdown_requested() {
-            return Ok(false);
-        }
-        std::thread::sleep(
-            deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(100)),
-        );
-    }
-    Ok(true)
+    // Ctrl-C is honoured within ~100 ms regardless of the current
+    // backoff, and the control socket keeps answering meanwhile.
+    Ok(!wait_serving_control(backoff, control_rx, session))
 }
 
 /// Build the [`BusListener`] watching both pipelines.  The listener is
@@ -2095,8 +2187,13 @@ fn next_action(running: bool, input_failed: bool, worker_failed: bool) -> LoopAc
 /// detector on every camera hiccup would reset its verdict to `Unknown`
 /// (read as "consumer present"), so idle would stop engaging until the
 /// consumer next reconnected.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`session` is the one `&mut` collaborator and cannot ride in the `Copy` WorkerDeps"
+)]
 fn run_supervised_loop(
     deps: WorkerDeps<'_>,
+    session: &mut ControlSession,
     running: &AtomicBool,
     slot: &LatestFrameSlot,
     chain: &mut EffectChain,
@@ -2121,6 +2218,7 @@ fn run_supervised_loop(
         };
         let worker_result = run_process_loop(
             WorkerDeps { ..deps },
+            session,
             running,
             slot,
             chain,
@@ -2139,6 +2237,8 @@ fn run_supervised_loop(
             LoopAction::ReacquireInput => {
                 entry_generation = recover_input(
                     deps.cfg,
+                    deps.control_rx,
+                    session,
                     input.pipeline,
                     output,
                     idle.as_mut(),
@@ -2172,6 +2272,8 @@ fn run_supervised_loop(
 )]
 fn recover_input(
     cfg: &FluxConfig,
+    control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
+    session: &ControlSession,
     input: &Arc<InputPipeline>,
     output: &OutputPipeline,
     idle: Option<&mut IdleRuntime>,
@@ -2256,7 +2358,7 @@ fn recover_input(
             // consumers that filter on capabilities drop a node that
             // stops producing.
             push_fill(metrics);
-            wait_for_shutdown(backoff)
+            wait_serving_control(backoff, control_rx, session)
         },
     )?;
     // Clear again: `reacquire` may have let a first frame land while we
@@ -2574,21 +2676,15 @@ struct WorkerState {
     /// per-frame debug noise.
     prev_fallback: bool,
     frames_seen: u64,
-    active_preset_name: String,
-    /// Owned config used for per-command lookups.
-    working_cfg: FluxConfig,
-    /// Working copy of the currently active preset.
-    active_preset: Preset,
+    // Deliberately no preset or config state: that lives in
+    // `ControlSession`, which outlives this struct. `WorkerState` is
+    // rebuilt every time the worker loop is re-entered after camera
+    // recovery, and keeping the preset here used to roll it back to the
+    // startup one while the edited chain kept running.
 }
 
 impl WorkerState {
-    fn new(cfg: &FluxConfig, initial_preset_name: &str, metrics: &RuntimeMetrics) -> Self {
-        let working_cfg: FluxConfig = cfg.clone();
-        let active_preset = working_cfg
-            .presets
-            .get(initial_preset_name)
-            .cloned()
-            .unwrap_or_default();
+    fn new(metrics: &RuntimeMetrics) -> Self {
         Self {
             frame_context: FrameContext {
                 telemetry: metrics.effect_telemetry(),
@@ -2596,9 +2692,6 @@ impl WorkerState {
             },
             prev_fallback: false,
             frames_seen: 0,
-            active_preset_name: initial_preset_name.to_string(),
-            working_cfg,
-            active_preset,
         }
     }
 }
@@ -2608,11 +2701,11 @@ impl WorkerState {
 /// worker reads from the slot, so the swap is atomic with respect to
 /// frame boundaries.
 fn drain_control_commands(
-    state: &mut WorkerState,
+    session: &mut ControlSession,
     control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
-    config_path: Option<&std::path::Path>,
     processing_ctx: &ProcessingContext,
     chain: &mut EffectChain,
+    telemetry: &fluxframe_core::EffectTelemetry,
 ) {
     let Some(rx) = control_rx else {
         return;
@@ -2624,16 +2717,8 @@ fn drain_control_commands(
         // command for diagnosis.
         let cmd_kind = command_label(&envelope.cmd);
         let start = Instant::now();
-        let response = apply_control_command(
-            &mut state.working_cfg,
-            config_path,
-            processing_ctx,
-            chain,
-            &mut state.active_preset_name,
-            &mut state.active_preset,
-            &state.frame_context.telemetry,
-            envelope.cmd,
-        );
+        let response =
+            apply_control_command(session, processing_ctx, chain, telemetry, envelope.cmd);
         tracing::debug!(
             command = cmd_kind,
             elapsed_us = start.elapsed().as_micros() as u64,
@@ -3051,13 +3136,11 @@ enum IdleTickAction {
 /// stacked three abstraction levels on top of each other; this helper
 /// owns one of them.
 ///
-/// `state` is taken as `&WorkerState` (not mutable) — the only field
-/// read is `state.working_cfg.idle`, which the idle state machine uses
-/// as its timing source.  Mutability on the per-iteration counters is
-/// reserved for [`process_one_frame`].
+/// `session` is only read — the one field used is `session.cfg.idle`,
+/// which the idle state machine uses as its timing source.
 fn tick_idle(
     idle: Option<&mut IdleRuntime>,
-    state: &WorkerState,
+    session: &ControlSession,
     slot: &LatestFrameSlot,
     output: &OutputPipeline,
     metrics: &RuntimeMetrics,
@@ -3123,7 +3206,7 @@ fn tick_idle(
         crate::idle::ConsumerStatus::from_u8(idle_rt.consumer_status.load(Ordering::Acquire));
     let tick = idle_rt
         .state_machine
-        .tick(status, Instant::now(), &state.working_cfg.idle);
+        .tick(status, Instant::now(), &session.cfg.idle);
     handle_idle_edge(idle_rt, tick.edge, slot, output, metrics);
     let active_allowed = active_allowed(tick.level, idle_rt.engine_ready.load(Ordering::Acquire));
     if !active_allowed {
@@ -3161,14 +3244,14 @@ fn tick_idle(
 
 /// Stable-during-run dependencies handed to [`run_process_loop`].
 ///
-/// The supervisor's worker loop reaches for ~10 values — most of
-/// them never change across iterations (the merged `FluxConfig`, the
-/// config-file path used by `reload`, the preset name we started on,
-/// the processing context, the metrics bundle). Bundling them in one
-/// struct keeps the loop's signature small enough to drop the
-/// `#[allow(clippy::too_many_arguments)]` and makes the genuinely
-/// per-iteration handles (`running`, `slot`, `chain`, `output`,
-/// `control_rx`, `idle`) stand out at the call site.
+/// The supervisor's worker loop reaches for ~10 values — some of them
+/// never change across iterations (the run's `FluxConfig`, the
+/// processing context, the metrics bundle, the control receiver).
+/// Bundling those in one struct keeps the loop's signature manageable
+/// and makes the genuinely per-iteration handles (`running`, `slot`,
+/// `chain`, `output`, `idle`) stand out at the call site. The
+/// [`ControlSession`] travels separately: it is mutable and outlives
+/// the run.
 ///
 /// All fields are borrowed references, so the struct is `Copy` and
 /// can be passed by value to the loop without imposing a borrow
@@ -3176,8 +3259,6 @@ fn tick_idle(
 #[derive(Clone, Copy)]
 struct WorkerDeps<'a> {
     cfg: &'a FluxConfig,
-    config_path: Option<&'a std::path::Path>,
-    initial_preset_name: &'a str,
     processing_ctx: &'a ProcessingContext,
     metrics: &'a RuntimeMetrics,
     /// Control-socket receiver, or `None` when the socket is disabled.
@@ -3212,8 +3293,13 @@ impl InputFailureWatch<'_> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "`session` is the one `&mut` collaborator and cannot ride in the `Copy` WorkerDeps"
+)]
 fn run_process_loop(
     deps: WorkerDeps<'_>,
+    session: &mut ControlSession,
     running: &AtomicBool,
     slot: &LatestFrameSlot,
     chain: &mut EffectChain,
@@ -3221,7 +3307,7 @@ fn run_process_loop(
     mut idle: Option<&mut IdleRuntime>,
     input_failure: InputFailureWatch<'_>,
 ) -> Result<(), FluxError> {
-    let mut state = WorkerState::new(deps.cfg, deps.initial_preset_name, deps.metrics);
+    let mut state = WorkerState::new(deps.metrics);
     // Leaving on a *new* input failure hands control to the supervisor,
     // which recovers the camera and calls back in. Without this the loop
     // would spin against a dead input: `tick_idle` still reports Active
@@ -3229,11 +3315,11 @@ fn run_process_loop(
     // through to a `recv_timeout` that can never succeed.
     while running.load(Ordering::Acquire) && !input_failure.tripped() {
         drain_control_commands(
-            &mut state,
+            session,
             deps.control_rx,
-            deps.config_path,
             deps.processing_ctx,
             chain,
+            &state.frame_context.telemetry,
         );
 
         // Stage 15 idle integration: tick the state machine, dispatch
@@ -3242,7 +3328,7 @@ fn run_process_loop(
         // cached fill).
         match tick_idle(
             idle.as_deref_mut(),
-            &state,
+            session,
             slot,
             output,
             deps.metrics,
@@ -4129,17 +4215,11 @@ mod tests {
         let mut cfg = base_cfg();
         cfg.presets.insert("a".into(), Preset::default());
         cfg.presets.insert("b".into(), Preset::default());
-        let mut chain = stub_chain();
-        let mut name = "a".to_string();
-        let mut preset = Preset::default();
-        let ctx = stub_ctx();
+        let mut session = test_session(cfg, "a");
         let resp = apply_control_command(
-            &mut cfg,
-            None,
-            &ctx,
-            &mut chain,
-            &mut name,
-            &mut preset,
+            &mut session,
+            &stub_ctx(),
+            &mut stub_chain(),
             &fluxframe_core::EffectTelemetry::default(),
             ControlCommand::ListPresets,
         );
@@ -4303,17 +4383,11 @@ mod tests {
     fn apply_control_command_set_preset_unknown_name_lists_available() {
         let mut cfg = base_cfg();
         cfg.presets.insert("alpha".into(), Preset::default());
-        let mut chain = stub_chain();
-        let mut name = "alpha".to_string();
-        let mut preset = Preset::default();
-        let ctx = stub_ctx();
+        let mut session = test_session(cfg, "alpha");
         let resp = apply_control_command(
-            &mut cfg,
-            None,
-            &ctx,
-            &mut chain,
-            &mut name,
-            &mut preset,
+            &mut session,
+            &stub_ctx(),
+            &mut stub_chain(),
             &fluxframe_core::EffectTelemetry::default(),
             ControlCommand::SetPreset {
                 name: "missing".into(),
@@ -4328,6 +4402,99 @@ mod tests {
             ControlResponse::Ok { .. } => panic!("expected Err"),
             _ => panic!("non-exhaustive Response variant"),
         }
+    }
+
+    fn test_session(cfg: FluxConfig, preset_name: &str) -> ControlSession {
+        let active_preset = cfg.presets.get(preset_name).cloned().unwrap_or_default();
+        ControlSession {
+            cfg,
+            config_path: None,
+            active_preset_name: preset_name.into(),
+            active_preset,
+        }
+    }
+
+    /// The preset state lives in the session, not in the per-run worker
+    /// state: a switch made through the socket must stay what
+    /// `current_preset` reports after the pipeline around it is rebuilt.
+    #[test]
+    fn preset_switch_lands_in_the_session() {
+        let mut cfg = base_cfg();
+        cfg.presets.insert("alpha".into(), Preset::default());
+        cfg.presets.insert("beta".into(), Preset::default());
+        let mut session = test_session(cfg, "alpha");
+        let resp = apply_control_command(
+            &mut session,
+            &stub_ctx(),
+            &mut stub_chain(),
+            &fluxframe_core::EffectTelemetry::default(),
+            ControlCommand::SetPreset {
+                name: "beta".into(),
+            },
+        );
+        ok_payload(&resp);
+        assert_eq!(session.active_preset_name, "beta");
+        let current = apply_offline_command(&session, &ControlCommand::CurrentPreset);
+        assert_eq!(ok_payload(&current), &serde_json::json!("beta"));
+    }
+
+    #[test]
+    fn offline_commands_serve_reads_and_refuse_edits() {
+        let mut cfg = base_cfg();
+        cfg.presets.insert("alpha".into(), Preset::default());
+        let session = test_session(cfg, "alpha");
+        for cmd in [
+            ControlCommand::ListPresets,
+            ControlCommand::CurrentPreset,
+            ControlCommand::ListEffects,
+            ControlCommand::GetConfig { path: None },
+            ControlCommand::ConfigPath,
+        ] {
+            let resp = apply_offline_command(&session, &cmd);
+            assert!(
+                matches!(resp, ControlResponse::Ok { .. }),
+                "{cmd:?} must be answered without a pipeline, got {resp:?}"
+            );
+        }
+        for cmd in [
+            ControlCommand::SetPreset {
+                name: "alpha".into(),
+            },
+            ControlCommand::SetChain {
+                section: SubchainKind::Background,
+                chain: Vec::new(),
+            },
+            ControlCommand::Reload,
+            ControlCommand::SavePreset,
+        ] {
+            let resp = apply_offline_command(&session, &cmd);
+            assert!(
+                err_reason(&resp).contains("pipeline is not running"),
+                "{cmd:?} must be refused without a pipeline"
+            );
+        }
+    }
+
+    /// While the daemon waits for a camera no worker loop drains the
+    /// socket; the wait itself must answer, or every request times out
+    /// after `WORKER_RESPONSE_TIMEOUT`.
+    #[test]
+    fn waiting_without_a_pipeline_still_answers_the_socket() {
+        let mut cfg = base_cfg();
+        cfg.presets.insert("alpha".into(), Preset::default());
+        let session = test_session(cfg, "alpha");
+        let (tx, rx) = crossbeam_channel::bounded::<ControlEnvelope>(CONTROL_CHANNEL_DEPTH);
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(REPLY_CHANNEL_DEPTH);
+        tx.send(ControlEnvelope {
+            cmd: ControlCommand::CurrentPreset,
+            reply_tx,
+        })
+        .expect("command channel is open");
+        let _ = wait_serving_control(Duration::from_millis(20), Some(&rx), &session);
+        let reply = reply_rx
+            .try_recv()
+            .expect("the wait answered the queued command");
+        assert_eq!(ok_payload(&reply), &serde_json::json!("alpha"));
     }
 
     #[test]

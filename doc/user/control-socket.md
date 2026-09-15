@@ -116,6 +116,14 @@ Only presets can be changed through the socket. The global tables (`[input]`,
 startup and are never modified by a save. To change them, edit the file and
 restart the daemon.
 
+The socket stays available for the whole life of the daemon, including while it
+waits for a camera that is busy or unplugged. During such a wait there is no
+running pipeline: `list_presets`, `current_preset`, `get_config`,
+`list_effects` and `config_path` are answered as usual, and every other command
+fails with `pipeline is not running (waiting for the camera)`. Retry it once
+the camera is back. Unsaved changes made before the camera was lost are kept and
+applied to the pipeline when it restarts.
+
 ## Examples
 
 Cycle through presets from a desktop keyboard shortcut:

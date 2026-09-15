@@ -13,16 +13,18 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::Receiver;
 use fluxframe_core::{FluxConfig, FluxError, InputDevice};
 use tracing::{info, warn};
 
 use crate::cli::RunArgs;
 use crate::config_merge::{CliOverrides, apply, load, resolve_load_path, resolve_writable_path};
-use crate::preset;
 use crate::runtime::{
-    InputSpec, OutputSpec, classify_input, classify_output, ensure_ctrlc_handler,
-    is_shutdown_requested, run_testsrc_chain, run_v4l2_chain, wait_for_shutdown,
+    ControlEnvelope, ControlPlane, InputSpec, OutputSpec, classify_input, classify_output,
+    ensure_ctrlc_handler, is_shutdown_requested, run_testsrc_chain, run_v4l2_chain,
+    wait_serving_control,
 };
+use crate::session::ControlSession;
 
 /// Entry point for `fluxframe run`.
 ///
@@ -67,28 +69,29 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
     // first point where the validated config is in hand.
     crate::cap_rayon_pool(cfg.realtime.processing_threads);
 
-    // Resolve the preset once up-front so a misnamed preset fails fast
-    // (before we touch any GStreamer state) and the auto input loop
-    // does not re-enter a doomed configuration on each
-    // device-appearance event. We store the name as `String` so the
-    // borrow does not span the per-iteration `cfg.clone()` in
-    // `run_auto`.
-    let (resolved_name, _preset) = preset::resolve(&cfg, args.preset.as_deref())?;
-    let preset_name = resolved_name.to_string();
+    // One session and one control socket for the whole process. The runs
+    // below come and go with the camera; the active preset, its unsaved
+    // edits and the clients connected to the socket must not. Resolving
+    // the preset here also makes a misnamed one fail fast, before any
+    // GStreamer state exists.
+    let mut session = ControlSession::new(cfg, writable_path, args.preset.as_deref())?;
     info!(
-        input = %cfg.input.device,
-        output = %cfg.output.device,
-        width = cfg.input.width,
-        height = cfg.input.height,
-        fps = cfg.input.fps,
-        preset = %preset_name,
-        config = ?writable_path,
+        input = %session.cfg.input.device,
+        output = %session.cfg.output.device,
+        width = session.cfg.input.width,
+        height = session.cfg.input.height,
+        fps = session.cfg.input.fps,
+        preset = %session.active_preset_name,
+        config = ?session.config_path,
         "merged configuration"
     );
+    let control = ControlPlane::spawn(&session.cfg);
 
-    match &cfg.input.device {
-        InputDevice::Auto => run_auto(&cfg, &preset_name, writable_path.as_deref()),
-        _ => run_once(&cfg, &preset_name, writable_path.as_deref()),
+    if matches!(session.cfg.input.device, InputDevice::Auto) {
+        run_auto(&mut session, control.rx())
+    } else {
+        let cfg = session.cfg.clone();
+        run_once(&cfg, &mut session, control.rx())
     }
 }
 
@@ -103,11 +106,11 @@ pub fn run(args: RunArgs) -> Result<(), FluxError> {
 /// candidate device or a recurring transient failure does not flood
 /// the operator's journal (1800 lines / hour at the default 2 s poll).
 fn run_auto(
-    cfg: &FluxConfig,
-    preset_name: &str,
-    config_path: Option<&std::path::Path>,
+    session: &mut ControlSession,
+    control_rx: Option<&Receiver<ControlEnvelope>>,
 ) -> Result<(), FluxError> {
     ensure_ctrlc_handler();
+    let cfg = &session.cfg;
     let interval = Duration::from_secs(u64::from(cfg.input.auto.poll_interval_secs.max(1)));
     let exclude = compute_excludes(cfg);
     info!(
@@ -148,7 +151,9 @@ fn run_auto(
         if let Some(path) = fluxframe_gst::v4l2_caps::pick_input_device(&candidates, &exclude) {
             last_no_devices_logged = false;
             info!(device = %path.display(), "auto-input picked");
-            let mut resolved = cfg.clone();
+            // The session keeps `device = "auto"`, so `reload` and the
+            // next pick still see the operator's configuration.
+            let mut resolved = session.cfg.clone();
             resolved.input.device = InputDevice::Path(path.clone());
             let run_started = Instant::now();
             // The run takes the whole pipeline down with it, loopback
@@ -158,7 +163,7 @@ fn run_auto(
             // opened by `runtime::run_chain` at the point the output
             // actually stops, so every device form (not just `auto`)
             // reports it.
-            match run_once(&resolved, preset_name, config_path) {
+            match run_once(&resolved, session, control_rx) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     if !e.is_transient() {
@@ -197,7 +202,7 @@ fn run_auto(
             }
         }
         let wait = failure_backoff.unwrap_or(interval);
-        if wait_for_shutdown(wait) {
+        if wait_serving_control(wait, control_rx, session) {
             info!("auto-input loop: shutdown during wait");
             return Ok(());
         }
@@ -232,29 +237,28 @@ fn next_failure_backoff(
     }
 }
 
-/// Build the effect chain from the named preset and dispatch it to the
-/// appropriate per-backend runtime entry point. One execution; does
-/// not poll or retry.
+/// Build the effect chain from the session's active preset and dispatch
+/// it to the appropriate per-backend runtime entry point. One execution;
+/// does not poll or retry.
 ///
-/// Re-resolving the preset on each iteration of `run_auto` keeps the
-/// lifetime contract simple (no `&Preset` borrow spanning the
-/// per-iteration `cfg.clone()`) and the lookup is O(log n) over the
-/// presets map — negligible compared to GStreamer pipeline setup.
+/// The chain is built from the session's working copy, not from the
+/// preset as loaded: after a restart under `device = "auto"` the new
+/// pipeline must run what the control socket reports, unsaved edits
+/// included.
 fn run_once(
     cfg: &FluxConfig,
-    preset_name: &str,
-    config_path: Option<&std::path::Path>,
+    session: &mut ControlSession,
+    control_rx: Option<&Receiver<ControlEnvelope>>,
 ) -> Result<(), FluxError> {
-    let (name, preset) = preset::resolve(cfg, Some(preset_name))?;
-    let chain = preset::build_chain(name, preset)?;
+    let chain = session.build_chain()?;
 
     // Dispatch via `classify_input` so the testsrc-vs-V4L2 triage lives in
     // exactly one place (shared with `commands::check`).  Adding a variant
     // to `InputSpec` turns this into a compile error and prompts the
     // developer to teach the dispatch about it.
     match classify_input(cfg) {
-        InputSpec::Testsrc => run_testsrc_chain(cfg, name, config_path, chain),
-        InputSpec::V4l2(_) => run_v4l2_chain(cfg, name, config_path, chain),
+        InputSpec::Testsrc => run_testsrc_chain(cfg, session, control_rx, chain),
+        InputSpec::V4l2(_) => run_v4l2_chain(cfg, session, control_rx, chain),
         InputSpec::Unsupported(d) => Err(FluxError::Config {
             reason: format!("input '{d}' is not supported"),
             hint: Some("supported inputs: testsrc, /dev/video* (V4L2)".into()),
