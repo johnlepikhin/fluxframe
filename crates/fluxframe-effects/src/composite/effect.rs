@@ -614,7 +614,6 @@ mod tests {
             .collect();
         let segmentation = SegmentationBase::new(SegmentationConfig {
             model: "/tmp/unused.onnx".into(),
-            model_config: None,
             fallback_threshold: 3,
         });
         CompositeEffect::new(segmentation, Vec::new(), bg, Vec::new(), Vec::new())

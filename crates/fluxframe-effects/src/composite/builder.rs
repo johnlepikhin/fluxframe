@@ -1,8 +1,8 @@
 //! Build a [`CompositeEffect`] from TOML configuration.
 //!
 //! Wires together:
-//! * [`SegmentationBase`] from the `[mask]` section's `model` /
-//!   `model_config` / `fallback_threshold` fields.
+//! * [`SegmentationBase`] from the `[mask]` section's `model` and
+//!   `fallback_threshold` fields.
 //! * `MaskEffect` chain via the [`MaskEffectRegistry`].
 //! * `PlaneEffect` chain (background) via the [`PlaneEffectRegistry`].
 //! * `PlaneEffect` chain (foreground) via the same registry.
@@ -114,7 +114,6 @@ fn build_segmentation(section: &PipelineSection) -> Result<SegmentationBase, Eff
     };
     let cfg = SegmentationConfig {
         model: model.clone(),
-        model_config: section.model_config.clone(),
         fallback_threshold: section
             .fallback_threshold
             .unwrap_or(DEFAULT_FALLBACK_THRESHOLD),
@@ -199,14 +198,12 @@ fn reject_unknown_table_keys(
     // Path-fields are not allowed on background/foreground sections —
     // they belong only to the mask section.
     if section_name != "mask"
-        && (per_effect.contains_key("model")
-            || per_effect.contains_key("model_config")
-            || per_effect.contains_key("fallback_threshold"))
+        && (per_effect.contains_key("model") || per_effect.contains_key("fallback_threshold"))
     {
         return Err(EffectError::InvalidConfig {
             name: section_name.to_string(),
             reason: format!(
-                "[{section_name}] cannot define `model`, `model_config`, or `fallback_threshold` (mask section only)"
+                "[{section_name}] cannot define `model` or `fallback_threshold` (mask section only)"
             ),
             hint: None,
         });

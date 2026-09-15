@@ -161,7 +161,6 @@ fn composite_alpha_composites_foreground_over_background_fill() {
     // Segmentation stage configured with the dummy model + mock engine.
     let seg_cfg = SegmentationConfig {
         model: sidecar.model_path().to_path_buf(),
-        model_config: None,
         fallback_threshold: 3,
     };
     let segmentation =
@@ -321,7 +320,6 @@ fn post_fx(name: &str) -> Slot<dyn PostEffect> {
 fn prepared(sidecar: &ModelSidecar, chains: Chains) -> CompositeEffect {
     let segmentation = SegmentationBase::new(SegmentationConfig {
         model: sidecar.model_path().to_path_buf(),
-        model_config: None,
         fallback_threshold: 3,
     })
     .with_inference_factory(Box::new(mock_factory));

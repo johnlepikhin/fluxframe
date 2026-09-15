@@ -834,7 +834,7 @@ fn apply_set_chain_command(
             // `reject_unknown_table_keys` validation next time the
             // preset is loaded (the operator sees "sub-table has no
             // matching entry in chain"). Reserved keys (`model`,
-            // `model_config`, `fallback_threshold`) are not effect
+            // `fallback_threshold`) are not effect
             // names but the `Set` handler could conceivably put them
             // into `per_effect`; keep them so a future Set on a mask
             // sub-section stays intact.

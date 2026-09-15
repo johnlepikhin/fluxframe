@@ -322,7 +322,6 @@ mod tests {
         }) as Box<dyn InferenceEngine + Send>;
         let cfg = SegmentationConfig {
             model: PathBuf::from("/tmp/test_model.onnx"),
-            model_config: None,
             fallback_threshold: 3,
         };
         let mut base = SegmentationBase::new(cfg);
@@ -361,7 +360,6 @@ mod tests {
     fn set_counters_stores_handle() {
         let cfg = SegmentationConfig {
             model: PathBuf::from("/tmp/test_model.onnx"),
-            model_config: None,
             fallback_threshold: 3,
         };
         let base = SegmentationBase::new(cfg);
@@ -378,7 +376,6 @@ mod tests {
     fn unload_is_idempotent() {
         let cfg = SegmentationConfig {
             model: PathBuf::from("/tmp/test_model.onnx"),
-            model_config: None,
             fallback_threshold: 3,
         };
         let base = SegmentationBase::new(cfg);
@@ -397,7 +394,6 @@ mod tests {
     fn engine_ready_handle_aliases_internal_flag() {
         let cfg = SegmentationConfig {
             model: PathBuf::from("/tmp/test_model.onnx"),
-            model_config: None,
             fallback_threshold: 3,
         };
         let base = SegmentationBase::new(cfg);
@@ -416,7 +412,6 @@ mod tests {
     fn reload_without_prepare_returns_prepare_failed() {
         let cfg = SegmentationConfig {
             model: PathBuf::from("/tmp/test_model.onnx"),
-            model_config: None,
             fallback_threshold: 3,
         };
         let base = SegmentationBase::new(cfg);

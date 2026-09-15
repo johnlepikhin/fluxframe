@@ -87,12 +87,9 @@ pub struct Counters {
     // counter shape rather than encoding the source as a string.
     inference_runtime_fallback_gpu_to_cpu: AtomicU64,
     blur_runtime_fallback_gpu_to_cpu: AtomicU64,
-    // Stage 15 idle-mode counters. `idle_entered_total` increments on
-    // every Active → Idle edge; `idle_frames_pushed_total` is the count
-    // of placeholder frames emitted to the output during idle steady
-    // state. `deep_idle_entered_total` is retained but always 0 — the
-    // `DeepIdle` state was removed in Stage 16 (see the deprecated
-    // `inc_deep_idle_entered`); the field stays for wire-compat.
+    // Idle-mode counters. `idle_entered_total` increments on every
+    // Active → Idle edge; `idle_frames_pushed_total` is the count of
+    // placeholder frames emitted to the output during idle steady state.
     //
     // Scope note on `idle_frames_pushed_total`: it counts frames handed
     // to the output pipeline, not writes that reached the device. A sink
@@ -100,7 +97,6 @@ pub struct Counters {
     // growing while every capture client gets `EIO` — `output_stream_up`
     // is the signal that catches that case.
     idle_entered_total: AtomicU64,
-    deep_idle_entered_total: AtomicU64,
     idle_frames_pushed_total: AtomicU64,
     // Stage 16 input-supervisor counters. `input_acquire_attempts_total`
     // increments each time the supervisor spawns an acquire (build+start
@@ -246,7 +242,6 @@ impl Counters {
             inference_runtime_fallback_gpu_to_cpu: AtomicU64::new(0),
             blur_runtime_fallback_gpu_to_cpu: AtomicU64::new(0),
             idle_entered_total: AtomicU64::new(0),
-            deep_idle_entered_total: AtomicU64::new(0),
             idle_frames_pushed_total: AtomicU64::new(0),
             input_acquire_attempts_total: AtomicU64::new(0),
             input_acquire_failures_total: AtomicU64::new(0),
@@ -332,18 +327,6 @@ impl Counters {
     #[inline]
     pub fn inc_idle_entered(&self) {
         self.idle_entered_total.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Increment `deep_idle_entered_total`.
-    ///
-    /// Deprecated since Stage 16: the `DeepIdle` state was removed, so
-    /// nothing calls this anymore and `deep_idle_entered_total` stays 0.
-    /// The counter and this method are retained so existing dashboards
-    /// that read the field keep working (they now read a constant 0).
-    #[inline]
-    #[deprecated(note = "DeepIdle state removed in Stage 16; counter is always 0")]
-    pub fn inc_deep_idle_entered(&self) {
-        self.deep_idle_entered_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Increment `idle_frames_pushed_total` — fires every placeholder
@@ -570,7 +553,6 @@ impl Counters {
                 .blur_runtime_fallback_gpu_to_cpu
                 .load(Ordering::Relaxed),
             idle_entered_total: self.idle_entered_total.load(Ordering::Relaxed),
-            deep_idle_entered_total: self.deep_idle_entered_total.load(Ordering::Relaxed),
             idle_frames_pushed_total: self.idle_frames_pushed_total.load(Ordering::Relaxed),
             input_acquire_attempts_total: self.input_acquire_attempts_total.load(Ordering::Relaxed),
             input_acquire_failures_total: self.input_acquire_failures_total.load(Ordering::Relaxed),
@@ -640,8 +622,6 @@ pub struct CounterValues {
     pub blur_runtime_fallback_gpu_to_cpu: u64,
     /// See [`Counters::inc_idle_entered`].
     pub idle_entered_total: u64,
-    /// See [`Counters::inc_deep_idle_entered`].
-    pub deep_idle_entered_total: u64,
     /// See [`Counters::inc_idle_frames_pushed`].
     pub idle_frames_pushed_total: u64,
     /// See [`Counters::inc_input_acquire_attempts`].
@@ -1272,7 +1252,6 @@ pub fn emit_metrics_line(snap: &MetricsSnapshot, extras: Option<PeriodicExtras>)
         inference_runtime_fallback_gpu_to_cpu,
         blur_runtime_fallback_gpu_to_cpu,
         idle_entered_total,
-        deep_idle_entered_total,
         idle_frames_pushed_total,
         input_acquire_attempts_total,
         input_acquire_failures_total,
@@ -1322,7 +1301,6 @@ pub fn emit_metrics_line(snap: &MetricsSnapshot, extras: Option<PeriodicExtras>)
         inference_runtime_fallback_gpu_to_cpu = inference_runtime_fallback_gpu_to_cpu,
         blur_runtime_fallback_gpu_to_cpu = blur_runtime_fallback_gpu_to_cpu,
         idle_entered_total = idle_entered_total,
-        deep_idle_entered_total = deep_idle_entered_total,
         idle_frames_pushed_total = idle_frames_pushed_total,
         input_acquire_attempts_total = input_acquire_attempts_total,
         input_acquire_failures_total = input_acquire_failures_total,

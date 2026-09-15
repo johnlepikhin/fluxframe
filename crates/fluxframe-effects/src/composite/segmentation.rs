@@ -44,12 +44,9 @@ pub(crate) type InferenceFactory = Box<
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SegmentationConfig {
-    /// Path to the ONNX model. Required.
+    /// Path to the ONNX model. Required. Its sidecar is always
+    /// `<model>.toml`, next to the model.
     pub model: PathBuf,
-    /// Optional path to the model-config sidecar. Defaults to
-    /// `<model>.toml` next to the model.
-    #[serde(default)]
-    pub model_config: Option<PathBuf>,
     /// Consecutive-failure budget before [`SegmentationBase::process`]
     /// returns [`SegmentationOutcome::Fatal`].
     #[serde(default = "default_fallback_threshold")]
@@ -736,14 +733,12 @@ model = "/tmp/dummy.onnx"
 "#;
         let parsed: SegmentationConfig = toml::from_str(raw).expect("parse ok");
         assert_eq!(parsed.fallback_threshold, 3);
-        assert!(parsed.model_config.is_none());
     }
 
     #[test]
     fn validate_rejects_missing_model() {
         let cfg = SegmentationConfig {
             model: PathBuf::new(),
-            model_config: None,
             fallback_threshold: 3,
         };
         assert!(cfg.validate().is_err());
@@ -753,7 +748,6 @@ model = "/tmp/dummy.onnx"
     fn validate_rejects_non_onnx() {
         let cfg = SegmentationConfig {
             model: PathBuf::from("/tmp/model.bin"),
-            model_config: None,
             fallback_threshold: 3,
         };
         let err = cfg.validate().expect_err("non-onnx must fail");
@@ -764,7 +758,6 @@ model = "/tmp/dummy.onnx"
     fn validate_rejects_zero_threshold() {
         let cfg = SegmentationConfig {
             model: PathBuf::from("/tmp/m.onnx"),
-            model_config: None,
             fallback_threshold: 0,
         };
         assert!(cfg.validate().is_err());

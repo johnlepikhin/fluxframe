@@ -19,7 +19,7 @@ with the suggested fix.
 
 ### Common options
 
-`check`, `run` and `benchmark` accept:
+`check` and `run` accept:
 
 | Option                  | Description                                                                          |
 | ----------------------- | ------------------------------------------------------------------------------------ |

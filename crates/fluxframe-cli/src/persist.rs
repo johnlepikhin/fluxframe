@@ -544,7 +544,6 @@ strength = 0.3
                     "feather".into(),
                 ],
                 model: Some("./models/selfie_segmentation.onnx".into()),
-                model_config: None,
                 fallback_threshold: None,
                 per_effect: mask_per_effect,
             }),
@@ -789,7 +788,6 @@ device = \"/dev/video10\"
             mask: Some(PipelineSection {
                 chain: vec!["threshold".into()],
                 model: Some("./models/selfie.onnx".into()),
-                model_config: Some("./models/selfie.toml".into()),
                 fallback_threshold: Some(3),
                 per_effect: mask_per_effect,
             }),

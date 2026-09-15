@@ -311,14 +311,13 @@ mod tests {
     use super::*;
     use fluxframe_core::IdleConfig;
 
-    /// Build a config with explicit thresholds. The validated TOML
-    /// defaults are: teardown = 5 s, deep = 30 s; tests use shorter
-    /// values to keep the timestamp arithmetic readable.
-    fn cfg(teardown_secs: u32, deep_idle_secs: u32) -> IdleConfig {
+    /// Build a config with an explicit teardown. The validated TOML
+    /// default is 5 s; tests use shorter values to keep the timestamp
+    /// arithmetic readable.
+    fn cfg(teardown_secs: u32) -> IdleConfig {
         IdleConfig {
             enabled: true,
             teardown_secs,
-            deep_idle_secs,
             ..IdleConfig::default()
         }
     }
@@ -336,7 +335,7 @@ mod tests {
     fn active_present_stays_active() {
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
-        let tick = sm.tick(ConsumerStatus::Present, now, &cfg(5, 30));
+        let tick = sm.tick(ConsumerStatus::Present, now, &cfg(5));
         assert_eq!(sm.state(), IdleState::Active);
         assert_eq!(tick.edge, IdleEdge::None);
         assert_eq!(tick.level, IdleLevel::Active);
@@ -346,7 +345,7 @@ mod tests {
     fn active_unknown_stays_active() {
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
-        let tick = sm.tick(ConsumerStatus::Unknown, now, &cfg(5, 30));
+        let tick = sm.tick(ConsumerStatus::Unknown, now, &cfg(5));
         assert_eq!(sm.state(), IdleState::Active);
         assert_eq!(tick.edge, IdleEdge::None);
         assert_eq!(tick.level, IdleLevel::Active);
@@ -356,7 +355,7 @@ mod tests {
     fn active_absent_enters_cooldown_with_no_edge() {
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
-        let tick = sm.tick(ConsumerStatus::Absent, now, &cfg(5, 30));
+        let tick = sm.tick(ConsumerStatus::Absent, now, &cfg(5));
         assert_eq!(sm.state(), IdleState::Cooldown);
         assert_eq!(
             tick.edge,
@@ -375,11 +374,11 @@ mod tests {
     fn cooldown_present_cancels_to_active_no_edge() {
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
-        sm.tick(ConsumerStatus::Absent, now, &cfg(5, 30)); // → Cooldown
+        sm.tick(ConsumerStatus::Absent, now, &cfg(5)); // → Cooldown
         let tick = sm.tick(
             ConsumerStatus::Present,
             now + Duration::from_secs(2),
-            &cfg(5, 30),
+            &cfg(5),
         );
         assert_eq!(sm.state(), IdleState::Active);
         assert_eq!(
@@ -394,11 +393,11 @@ mod tests {
     fn cooldown_unknown_cancels_to_active_no_edge() {
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
-        sm.tick(ConsumerStatus::Absent, now, &cfg(5, 30));
+        sm.tick(ConsumerStatus::Absent, now, &cfg(5));
         let tick = sm.tick(
             ConsumerStatus::Unknown,
             now + Duration::from_secs(2),
-            &cfg(5, 30),
+            &cfg(5),
         );
         assert_eq!(sm.state(), IdleState::Active);
         assert_eq!(tick.edge, IdleEdge::None);
@@ -408,11 +407,11 @@ mod tests {
     fn cooldown_absent_before_timer_stays_cooldown() {
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
-        sm.tick(ConsumerStatus::Absent, now, &cfg(5, 30));
+        sm.tick(ConsumerStatus::Absent, now, &cfg(5));
         let tick = sm.tick(
             ConsumerStatus::Absent,
             now + Duration::from_secs(2),
-            &cfg(5, 30),
+            &cfg(5),
         );
         assert_eq!(sm.state(), IdleState::Cooldown);
         assert_eq!(tick.edge, IdleEdge::None);
@@ -423,11 +422,11 @@ mod tests {
     fn cooldown_absent_at_timer_flips_to_idle_with_edge() {
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
-        sm.tick(ConsumerStatus::Absent, now, &cfg(5, 30));
+        sm.tick(ConsumerStatus::Absent, now, &cfg(5));
         let tick = sm.tick(
             ConsumerStatus::Absent,
             now + Duration::from_secs(5),
-            &cfg(5, 30),
+            &cfg(5),
         );
         assert_eq!(sm.state(), IdleState::Idle);
         assert_eq!(
@@ -444,11 +443,11 @@ mod tests {
         // past the threshold.
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
-        sm.tick(ConsumerStatus::Absent, now, &cfg(5, 30));
+        sm.tick(ConsumerStatus::Absent, now, &cfg(5));
         let tick = sm.tick(
             ConsumerStatus::Absent,
             now + Duration::from_secs(10),
-            &cfg(5, 30),
+            &cfg(5),
         );
         assert_eq!(sm.state(), IdleState::Idle);
         assert_eq!(tick.edge, IdleEdge::EnterIdle);
@@ -464,18 +463,18 @@ mod tests {
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
         // Force into Idle.
-        sm.tick(ConsumerStatus::Absent, now, &cfg(1, 10));
+        sm.tick(ConsumerStatus::Absent, now, &cfg(1));
         sm.tick(
             ConsumerStatus::Absent,
             now + Duration::from_secs(1),
-            &cfg(1, 10),
+            &cfg(1),
         );
         assert_eq!(sm.state(), IdleState::Idle);
 
         let tick = sm.tick(
             ConsumerStatus::Present,
             now + Duration::from_secs(2),
-            &cfg(1, 10),
+            &cfg(1),
         );
         assert_eq!(sm.state(), IdleState::Active);
         assert_eq!(
@@ -490,16 +489,16 @@ mod tests {
     fn idle_unknown_resumes_active() {
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
-        sm.tick(ConsumerStatus::Absent, now, &cfg(1, 10));
+        sm.tick(ConsumerStatus::Absent, now, &cfg(1));
         sm.tick(
             ConsumerStatus::Absent,
             now + Duration::from_secs(1),
-            &cfg(1, 10),
+            &cfg(1),
         );
         let tick = sm.tick(
             ConsumerStatus::Unknown,
             now + Duration::from_secs(2),
-            &cfg(1, 10),
+            &cfg(1),
         );
         assert_eq!(sm.state(), IdleState::Active);
         assert_eq!(tick.edge, IdleEdge::ResumeActive);
@@ -512,11 +511,11 @@ mod tests {
         // so the loopback stays visible, but the state never advances.
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
-        sm.tick(ConsumerStatus::Absent, now, &cfg(1, 30));
+        sm.tick(ConsumerStatus::Absent, now, &cfg(1));
         sm.tick(
             ConsumerStatus::Absent,
             now + Duration::from_secs(1),
-            &cfg(1, 30),
+            &cfg(1),
         );
         assert_eq!(sm.state(), IdleState::Idle);
 
@@ -524,7 +523,7 @@ mod tests {
         let tick = sm.tick(
             ConsumerStatus::Absent,
             now + Duration::from_secs(120),
-            &cfg(1, 30),
+            &cfg(1),
         );
         assert_eq!(sm.state(), IdleState::Idle);
         assert_eq!(tick.edge, IdleEdge::None);
@@ -538,7 +537,7 @@ mod tests {
     #[test]
     fn full_lifecycle_walk() {
         // Active → Cooldown → Idle → Active in one walk.
-        let cfg = cfg(1, 5);
+        let cfg = cfg(1);
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
 
@@ -584,7 +583,7 @@ mod tests {
 
     #[test]
     fn level_tracks_state() {
-        let cfg = cfg(1, 5);
+        let cfg = cfg(1);
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
 
@@ -619,7 +618,6 @@ mod tests {
         let cfg = IdleConfig {
             enabled: true,
             teardown_secs: 1,
-            deep_idle_secs: 10,
             fps: 5,
             // Pin the visibility floor below `fps` so this test exercises
             // the cosmetic `fps` path, not the heartbeat clamp.
@@ -667,7 +665,7 @@ mod tests {
         // Once we land back in Active, a second consecutive Present
         // observation must not re-fire ResumeActive — there is no
         // transition, so the worker must not spawn another reload.
-        let cfg = cfg(1, 5);
+        let cfg = cfg(1);
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
 
@@ -701,7 +699,7 @@ mod tests {
         // observation must snap us back to Active with no edge —
         // mirroring the Present-after-timer path exactly. This pins
         // down the fail-open invariant against future regressions.
-        let cfg = cfg(1, 30);
+        let cfg = cfg(1);
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
 
@@ -728,7 +726,7 @@ mod tests {
     #[test]
     fn flapping_reader_does_not_destabilise() {
         // Absent → Present → Absent → Present rapid burst stays Active.
-        let cfg = cfg(5, 30);
+        let cfg = cfg(5);
         let now = t0();
         let mut sm = IdleStateMachine::new(now);
         for (i, status) in [

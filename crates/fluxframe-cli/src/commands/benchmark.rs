@@ -1,7 +1,6 @@
-//! `fluxframe benchmark` — Stage 3 implements the inference-only path.
-//!
-//! Full end-to-end pipeline benchmarking (capture + chain + sink)
-//! lands in Stage 5.
+//! `fluxframe benchmark` — inference-only latency of a segmentation
+//! model on ONNX Runtime (CPU). Capture, effects and output are not
+//! measured; a running daemon's metrics cover those.
 
 use std::time::{Duration, Instant};
 
@@ -19,12 +18,7 @@ use crate::cli::BenchmarkArgs;
 /// Returns [`FluxError`] when the model file or its sidecar config
 /// cannot be loaded, or when inference fails.
 pub fn run(args: BenchmarkArgs) -> Result<(), FluxError> {
-    let Some(model_path) = args.model else {
-        return Err(FluxError::Config {
-            reason: "Stage 3 benchmark requires --model <path>".into(),
-            hint: Some("pass --model ./models/<name>.onnx with a sibling .toml config".into()),
-        });
-    };
+    let model_path = args.model;
 
     // Note: OnnxEngine::load already canonicalises and returns ModelNotFound
     // for missing files.  We don't pre-check exists() here — it would just
@@ -69,14 +63,12 @@ pub fn run(args: BenchmarkArgs) -> Result<(), FluxError> {
 
 /// Build the synthetic input shape `(shape, total_elements)` for the
 /// given model config.  Channel count is derived from `input_color`;
-/// Stage 5 will refine the planar (YUY2/NV12) formats.
+/// planar formats (YUY2/NV12) are approximated as 3-channel.
 fn synthetic_input_shape(cfg: &ModelConfig) -> (Vec<usize>, usize) {
     use fluxframe_core::frame::PixelFormat;
-    // Rgb / Bgr / Yuy2 / Nv12 — Stage 5 will model planar (YUY2/NV12)
-    // formats explicitly; treating them as 3-channel here is a
-    // benchmark-only approximation.  Non_exhaustive future variants also
-    // default to 3.
-    // FIXME(stage-5): refine planar formats.
+    // Rgb / Bgr / Yuy2 / Nv12 are treated as 3-channel: a benchmark-only
+    // approximation, since segmentation models take packed RGB input.
+    // Non_exhaustive future variants also default to 3.
     let channels = match cfg.input_color {
         PixelFormat::Gray8 => 1usize,
         PixelFormat::Rgba => 4,

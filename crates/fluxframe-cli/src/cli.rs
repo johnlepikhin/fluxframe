@@ -1,8 +1,4 @@
 //! `clap` definitions for the `fluxframe` binary.
-//!
-//! The CLI surface mirrors §§9-12 of the spec.  Stage 0 only wires the
-//! argument structures and dispatch — the actual commands print a
-//! `not implemented yet` notice and exit 0.
 
 use std::path::PathBuf;
 
@@ -16,7 +12,7 @@ pub const DEFAULT_BENCHMARK_SECONDS: u32 = 30;
 #[command(
     name = "fluxframe",
     version,
-    about = "Realtime video processing layer for Linux (Stage 0 scaffolding).",
+    about = "Realtime camera effects for Linux, published as a virtual camera.",
     long_about = None,
 )]
 pub struct Cli {
@@ -33,24 +29,16 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// List available input and output video devices.
-    List(ListArgs),
+    List,
     /// Verify that GStreamer, devices and the configured effect chain are usable.
     Check(CheckArgs),
     /// Run the realtime processing pipeline.
     Run(RunArgs),
-    /// Benchmark capture, processing and output stages.
+    /// Measure segmentation model inference speed (ONNX Runtime, CPU).
     Benchmark(BenchmarkArgs),
 }
 
-/// Arguments accepted by `fluxframe list`.
-#[derive(Debug, Clone, clap::Args)]
-pub struct ListArgs {
-    /// Optional config file (used to resolve default backends).
-    #[arg(long, value_name = "PATH")]
-    pub config: Option<PathBuf>,
-}
-
-/// Subset of arguments shared by `check`, `run` and `benchmark`.
+/// Subset of arguments shared by `check` and `run`.
 ///
 /// Kept in one struct so that adding a new override (e.g. `--profile`) lands
 /// in every consumer atomically.  Subcommand structs use
@@ -80,7 +68,7 @@ pub struct CommonRunArgs {
 /// Arguments accepted by `fluxframe check`.
 #[derive(Debug, Clone, clap::Args)]
 pub struct CheckArgs {
-    /// Arguments shared with `run`/`benchmark`.
+    /// Arguments shared with `run`.
     #[command(flatten)]
     pub common: CommonRunArgs,
     /// Name of the preset to validate. Defaults to `"default"` when
@@ -92,7 +80,7 @@ pub struct CheckArgs {
 /// Arguments accepted by `fluxframe run`.
 #[derive(Debug, Clone, clap::Args)]
 pub struct RunArgs {
-    /// Arguments shared with `check`/`benchmark`.
+    /// Arguments shared with `check`.
     #[command(flatten)]
     pub common: CommonRunArgs,
     /// Override input frame width in pixels.  Output dimensions are
@@ -116,14 +104,11 @@ pub struct RunArgs {
 /// Arguments accepted by `fluxframe benchmark`.
 #[derive(Debug, Clone, clap::Args)]
 pub struct BenchmarkArgs {
-    /// Arguments shared with `check`/`run`.
-    #[command(flatten)]
-    pub common: CommonRunArgs,
     /// Benchmark duration in seconds.
     #[arg(long, value_name = "SECONDS", default_value_t = DEFAULT_BENCHMARK_SECONDS)]
     pub duration: u32,
-    /// ONNX model to benchmark. Benchmark runs inference-only against
-    /// this file; no preset is consulted.
+    /// ONNX model to benchmark; its `<model>.toml` sidecar must sit next
+    /// to it. No configuration or preset is read.
     #[arg(long, value_name = "PATH")]
-    pub model: Option<PathBuf>,
+    pub model: PathBuf,
 }

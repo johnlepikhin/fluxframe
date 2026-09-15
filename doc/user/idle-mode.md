@@ -103,7 +103,6 @@ physical camera is unavailable.
 | `presence_source`      | string              | `"auto"`       | Detection method, see above.                                                                                     |
 | `resync_interval_secs` | integer             | `30`           | How often the reader state is re-read from the driver. 0 disables; otherwise 5 to 3600. Applied at startup only. |
 | `poll_interval_ms`     | integer             | `250`          | Polling interval of the last-resort fallback, 100 to 5000.                                                       |
-| `deep_idle_secs`       | integer             | `30`           | Accepted for compatibility; has no effect.                                                                       |
 
 ## Log messages
 

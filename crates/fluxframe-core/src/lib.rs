@@ -21,7 +21,7 @@ pub mod protocol;
 pub mod traits;
 
 pub use config::{
-    AutoInputConfig, BackendKind, ControlConfig, FluxConfig, IdleConfig, IdlePlaceholderKind,
+    AutoInputConfig, ControlConfig, FluxConfig, IdleConfig, IdlePlaceholderKind,
     IdlePresenceSource, InputConfig, InputDevice, LoggingConfig, OutputConfig, OutputScale,
     PipelineSection, Preset, RealtimeConfig,
 };
@@ -150,7 +150,7 @@ device = "/dev/video1"
     #[test]
     fn idle_default_is_off_and_validates() {
         let cfg = FluxConfig::default();
-        assert!(!cfg.idle.enabled, "Stage 15 default is opt-in");
+        assert!(!cfg.idle.enabled, "idle mode is opt-in");
         assert!(cfg.idle.is_off());
         cfg.validate()
             .expect("default IdleConfig must validate cleanly");
@@ -170,17 +170,6 @@ device = "/dev/video1"
         cfg.idle.fps = 200;
         let err = cfg.validate().expect_err("fps>60 must be rejected");
         assert!(format!("{err}").contains("60"));
-    }
-
-    #[test]
-    fn idle_validation_accepts_deep_le_teardown() {
-        // DeepIdle removed (Stage 16): the deep > teardown cross-check
-        // is gone, so deep_idle_secs == teardown_secs now loads fine.
-        let mut cfg = FluxConfig::default();
-        cfg.idle.teardown_secs = 10;
-        cfg.idle.deep_idle_secs = 10;
-        cfg.validate()
-            .expect("deep_idle_secs == teardown_secs must be accepted after DeepIdle removal");
     }
 
     #[test]
@@ -218,24 +207,6 @@ device = "/dev/video1"
         FluxConfig::default()
             .validate()
             .expect("default backoff knobs must validate");
-    }
-
-    #[test]
-    fn idle_validation_rejects_zero_deep_idle_secs() {
-        let mut cfg = FluxConfig::default();
-        cfg.idle.deep_idle_secs = 0;
-        let err = cfg
-            .validate()
-            .expect_err("deep_idle_secs=0 must be rejected");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("deep_idle_secs"),
-            "error must mention the field, got: {msg}"
-        );
-        assert!(
-            msg.contains("> 0") || msg.contains("must be > 0"),
-            "error must point at the > 0 requirement, got: {msg}"
-        );
     }
 
     #[test]
@@ -291,7 +262,6 @@ placeholder = "color"
 placeholder_rgb = [200, 30, 30]
 fps = 5
 teardown_secs = 3
-deep_idle_secs = 20
 poll_interval_ms = 500
 "#;
         let cfg = FluxConfig::from_toml_str(toml_text).expect("parses");
@@ -300,7 +270,6 @@ poll_interval_ms = 500
         assert_eq!(cfg.idle.placeholder_rgb, [200, 30, 30]);
         assert_eq!(cfg.idle.fps, 5);
         assert_eq!(cfg.idle.teardown_secs, 3);
-        assert_eq!(cfg.idle.deep_idle_secs, 20);
         assert_eq!(cfg.idle.poll_interval_ms, 500);
     }
 
@@ -411,24 +380,38 @@ scale = 2.0
     }
 
     #[test]
-    fn config_validation_rejects_unbounded_inflight() {
-        let mut cfg = FluxConfig::default();
-        cfg.realtime.max_inflight_frames = 100;
-        let err = cfg
-            .validate()
-            .expect_err("oversized max_inflight_frames must be rejected");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("max_inflight_frames"),
-            "error must mention the offending field, got: {msg}"
-        );
-    }
-
-    #[test]
     fn config_validation_accepts_defaults() {
         FluxConfig::default()
             .validate()
             .expect("default config must validate cleanly");
+    }
+
+    #[test]
+    fn output_format_defaults_to_rgb() {
+        assert_eq!(FluxConfig::default().output.format, PixelFormat::Rgb);
+    }
+
+    /// Keys that used to be parsed but did nothing were removed outright:
+    /// a config still carrying one must fail to load and name the key,
+    /// not be silently accepted.
+    #[test]
+    fn removed_keys_are_rejected() {
+        for (table, key) in [
+            ("input", "backend = \"v4l2\""),
+            ("output", "backend = \"v4l2\""),
+            ("realtime", "max_latency_ms = 120"),
+            ("realtime", "drop_late_frames = true"),
+            ("realtime", "max_inflight_frames = 1"),
+            ("idle", "deep_idle_secs = 30"),
+        ] {
+            let name = key.split(' ').next().expect("key has a name");
+            let err = FluxConfig::from_toml_str(&format!("[{table}]\n{key}\n"))
+                .expect_err("a removed key must not load");
+            assert!(
+                format!("{err}").contains(name),
+                "error for {table}.{name} must name the key, got: {err}"
+            );
+        }
     }
 
     #[test]

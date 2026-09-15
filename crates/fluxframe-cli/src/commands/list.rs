@@ -1,14 +1,12 @@
 //! `fluxframe list` — enumerate input/output V4L2 devices.
 //!
-//! Stage 2 implementation: reads `/sys/class/video4linux/` via
+//! Reads `/sys/class/video4linux/` via
 //! [`fluxframe_gst::enumerate_devices`].  Capture/output/virtual
 //! classification is heuristic — see [`fluxframe_gst::V4l2DeviceKind`].
 
 use fluxframe_core::FluxError;
 use fluxframe_gst::{EnumerationStatus, V4l2Device, V4l2DeviceKind, enumerate_devices_status};
 use tracing::info;
-
-use crate::cli::ListArgs;
 
 /// Entry point for `fluxframe list`.
 ///
@@ -18,9 +16,9 @@ use crate::cli::ListArgs;
 /// whatever it managed to read from `/sys/class/video4linux/`.
 #[expect(
     clippy::unnecessary_wraps,
-    reason = "signature mirrors other command handlers; Stage 5 may add real failures"
+    reason = "signature mirrors the other command handlers"
 )]
-pub fn run(_args: ListArgs) -> Result<(), FluxError> {
+pub fn run() -> Result<(), FluxError> {
     let devices = match enumerate_devices_status() {
         EnumerationStatus::SysfsAbsent => {
             println!("No V4L2 devices: /sys/class/video4linux is not present.");

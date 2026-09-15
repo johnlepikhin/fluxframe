@@ -86,7 +86,7 @@ Used only when `input.device = "auto"`.
 | Key      | Type   | Default          | Description                                                                          |
 | -------- | ------ | ---------------- | ------------------------------------------------------------------------------------ |
 | `device` | string | `"/dev/video10"` | Where to publish the processed video.                                                |
-| `format` | string | `"YUY2"`         | Pixel format written to the output: `RGB`, `RGBA`, `BGR`, `YUY2`, `NV12` or `GRAY8`. |
+| `format` | string | `"RGB"`          | Pixel format written to the output: `RGB`, `RGBA`, `BGR`, `YUY2`, `NV12` or `GRAY8`. |
 | `scale`  | float  | `1.0`            | Output size relative to the input, 0.05 to 1.0.                                      |
 
 `device` values:
@@ -98,9 +98,10 @@ Used only when `input.device = "auto"`.
  - `auto` opens a local preview window.
  - `fakesink` discards the frames, for benchmarks and tests.
 
-`format = "RGB"` is recommended for v4l2loopback. It avoids a colour conversion
-(lower CPU usage) and the faint vertical colour banding that the RGB to YUY2
-conversion introduces. Use `YUY2` only for a consumer that does not accept RGB.
+The default `RGB` is the format the effect chain works in, so the output needs
+no colour conversion (lower CPU usage) and shows none of the faint vertical
+colour banding that an RGB to YUY2 conversion introduces. Set `YUY2` only for a
+consumer that does not accept RGB.
 
 The output resolution is always the input resolution multiplied by `scale`,
 rounded down to an even number of pixels. The output frame rate always equals
@@ -112,9 +113,10 @@ the input frame rate. Upscaling is not supported.
 | ----------------------- | ------- | ------- | ------------------------------------------------------------------------------------------------ |
 | `processing_threads`    | integer | `0`     | Worker threads for image processing. `0` selects automatically (currently 2); otherwise 1 to 64. |
 | `metrics_interval_secs` | integer | `30`    | Interval of the periodic metrics log line. `0` disables it; otherwise up to 3600.                |
-| `max_latency_ms`        | integer | `120`   | Accepted but currently has no effect (1 to 10000).                                               |
-| `drop_late_frames`      | boolean | `true`  | Accepted but currently has no effect.                                                            |
-| `max_inflight_frames`   | integer | `1`     | Accepted but currently has no effect (1 to 64).                                                  |
+
+Latency and frame dropping are not configurable. The camera feeds a slot that
+holds one frame: when processing falls behind, the waiting frame is replaced by
+the newest one instead of queueing, so latency does not accumulate.
 
 The environment variable `FLUXFRAME_RAYON_THREADS` overrides
 `processing_threads`. The trade-off between thread count, latency and CPU usage
@@ -157,19 +159,6 @@ disabled by default. All keys are described in [Idle mode](idle-mode.md).
 
 Named processing pipelines. `fluxframe run` uses the preset `default` unless
 `--preset` is given. See [Presets and effects](presets-and-effects.md).
-
-## Settings that are accepted but ignored
-
-The following keys are parsed and validated so that existing files keep loading,
-but they do not change behaviour:
-
- - `input.backend` and `output.backend`. The backend is always derived from
-   `device`.
- - `realtime.max_latency_ms`, `realtime.drop_late_frames`,
-   `realtime.max_inflight_frames`.
- - `model_config` in a preset's mask section. The sidecar is always read from
-   the model path with the `.toml` extension.
- - `idle.deep_idle_secs`.
 
 ## Environment variables
 

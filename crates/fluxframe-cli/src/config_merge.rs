@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use fluxframe_core::{FluxConfig, FluxError, InputDevice};
 
-/// Subset of CLI-overridable values shared between `run` and `benchmark`.
+/// Subset of CLI-overridable values shared between `run` and `check`.
 ///
 /// Preset-specific knobs (`--preset NAME`, per-effect parameters,
 /// model paths) live in the TOML config now — the CLI only steers

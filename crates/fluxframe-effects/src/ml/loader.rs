@@ -12,8 +12,8 @@ use fluxframe_core::error::InferenceError;
 /// produce a minimal placeholder config and emit a `warn!`.
 ///
 /// The placeholder is intentionally too small to be useful for any real
-/// inference effect (1x1 input) so callers are forced to ship a proper
-/// sidecar before Stage 4 effects accept the model.
+/// inference effect (1x1 input), so a model shipped without its sidecar
+/// cannot be used by mistake.
 ///
 /// # Errors
 ///
@@ -26,7 +26,7 @@ pub fn load_sidecar_or_placeholder(model_path: &Path) -> Result<ModelConfig, Inf
     } else {
         warn!(
             sidecar = %sidecar.display(),
-            "no model config sidecar found; using a 1x1 placeholder — Stage 4 effects will refuse this"
+            "no model config sidecar found; using a 1x1 placeholder — the model will not produce a usable mask"
         );
         let cfg = ModelConfig::new("<unknown>", 1, 1);
         cfg.validate()?;

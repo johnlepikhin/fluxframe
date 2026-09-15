@@ -26,10 +26,6 @@ pub const DEFAULT_WIDTH: u32 = 1280;
 pub const DEFAULT_HEIGHT: u32 = 720;
 /// Default frames-per-second target.
 pub const DEFAULT_FPS: u32 = 30;
-/// Default maximum end-to-end latency budget in milliseconds.
-pub const DEFAULT_MAX_LATENCY_MS: u32 = 120;
-/// Default cap on frames in flight through the pipeline.
-pub const DEFAULT_MAX_INFLIGHT_FRAMES: u32 = 1;
 /// Default tracing log level.
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
@@ -39,10 +35,6 @@ pub const MAX_WIDTH: u32 = 16384;
 pub const MAX_HEIGHT: u32 = 16384;
 /// Upper bound on frame rate accepted by [`FluxConfig::validate`].
 pub const MAX_FPS: u32 = 240;
-/// Upper bound on `max_inflight_frames` — protects §22 bounded-queue invariant.
-pub const MAX_INFLIGHT_FRAMES: u32 = 64;
-/// Upper bound on `max_latency_ms` accepted by [`FluxConfig::validate`].
-pub const MAX_LATENCY_MS: u32 = 10_000;
 /// Default cadence of the metrics reporter (`[realtime] metrics_interval_secs`).
 /// `0` disables periodic reporting (the teardown summary still runs).
 ///
@@ -101,29 +93,6 @@ pub const MAX_PROCESSING_THREADS: u32 = 64;
 /// auto-pick loop (a 1 h cap is well past any reasonable operator
 /// value — the cap exists only to catch typos).
 pub const MAX_POLL_INTERVAL_SECS: u32 = 3600;
-
-// ---------------------------------------------------------------------------
-// Backend selection
-// ---------------------------------------------------------------------------
-
-/// Backend selection for input/output.
-///
-/// `Auto` lets the pipeline pick the right backend from device path/string.
-/// Stage 0 only declares the enum; Stages 1-2 wire the selection logic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-#[non_exhaustive]
-pub enum BackendKind {
-    /// Pick the backend automatically based on the device string.
-    #[default]
-    Auto,
-    /// Linux V4L2 capture/loopback backend.
-    V4l2,
-    /// Synthetic test-pattern source (for development and CI).
-    Testsrc,
-    /// Discarding sink (for development and CI).
-    Fakesink,
-}
 
 // ---------------------------------------------------------------------------
 // PixelFormat <-> TOML string adapter
@@ -241,9 +210,6 @@ mod input_device_serde {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputConfig {
-    /// Capture backend selection.
-    #[serde(default)]
-    pub backend: BackendKind,
     /// Capture-device selector — see [`InputDevice`] for the parsed
     /// form. The TOML string `"auto"` (case-insensitive) maps to
     /// [`InputDevice::Auto`] and activates the `[input.auto]` polling
@@ -292,7 +258,6 @@ pub struct InputConfig {
 impl Default for InputConfig {
     fn default() -> Self {
         Self {
-            backend: BackendKind::default(),
             device: default_input_device(),
             width: default_width(),
             height: default_height(),
@@ -364,9 +329,6 @@ pub const MAX_ACQUIRE_BACKOFF_MS: u32 = 30_000;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutputConfig {
-    /// Output backend selection.  Defaults to `V4l2` (loopback device).
-    #[serde(default = "default_output_backend")]
-    pub backend: BackendKind,
     /// Sink device path or backend-specific identifier (e.g. `/dev/video10`).
     #[serde(default = "default_output_device")]
     pub device: String,
@@ -375,7 +337,9 @@ pub struct OutputConfig {
     /// so the runtime never sees an out-of-range value.
     #[serde(default)]
     pub scale: OutputScale,
-    /// Pixel format pushed to the sink.  Defaults to `YUY2` for V4L2 loopback.
+    /// Pixel format pushed to the sink.  Defaults to `RGB`, the format the
+    /// effect chain works in: no conversion after the chain, and none of
+    /// the chroma banding an RGB → YUY2 conversion introduces.
     #[serde(
         default = "default_output_format",
         serialize_with = "pixel_format_serde::serialize",
@@ -387,7 +351,6 @@ pub struct OutputConfig {
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
-            backend: default_output_backend(),
             device: default_output_device(),
             scale: OutputScale::default(),
             format: default_output_format(),
@@ -513,20 +476,13 @@ fn scale_dimension(input: u32, scale: f32) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// Realtime / scheduling configuration (`[realtime]` table).
+///
+/// Latency and frame dropping are deliberately not configurable: capture
+/// feeds a one-frame "latest wins" slot, so a late frame is replaced by
+/// the next one instead of queueing behind it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RealtimeConfig {
-    /// Maximum acceptable end-to-end latency in milliseconds before the
-    /// pipeline considers a frame late.
-    #[serde(default = "default_max_latency_ms")]
-    pub max_latency_ms: u32,
-    /// Whether the pipeline is allowed to drop late frames.
-    #[serde(default = "default_drop_late")]
-    pub drop_late_frames: bool,
-    /// Maximum number of frames in flight through the pipeline at once
-    /// (§22 bounded-queue invariant).
-    #[serde(default = "default_max_inflight")]
-    pub max_inflight_frames: u32,
     /// How often the metrics reporter emits a per-window summary, in
     /// seconds.  `0` disables periodic reporting (the teardown summary
     /// is unconditional).
@@ -543,9 +499,6 @@ pub struct RealtimeConfig {
 impl Default for RealtimeConfig {
     fn default() -> Self {
         Self {
-            max_latency_ms: default_max_latency_ms(),
-            drop_late_frames: default_drop_late(),
-            max_inflight_frames: default_max_inflight(),
             metrics_interval_secs: default_metrics_interval_secs(),
             processing_threads: default_processing_threads(),
         }
@@ -556,18 +509,6 @@ impl RealtimeConfig {
     /// Range checks for the `[realtime]` table; part of
     /// [`FluxConfig::validate`].
     fn validate(&self) -> Result<(), crate::error::FluxError> {
-        if self.max_inflight_frames == 0 || self.max_inflight_frames > MAX_INFLIGHT_FRAMES {
-            return Err(config_err(format!(
-                "realtime.max_inflight_frames must be in 1..={MAX_INFLIGHT_FRAMES}, got {}",
-                self.max_inflight_frames
-            )));
-        }
-        if self.max_latency_ms == 0 || self.max_latency_ms > MAX_LATENCY_MS {
-            return Err(config_err(format!(
-                "realtime.max_latency_ms must be in 1..={MAX_LATENCY_MS}, got {}",
-                self.max_latency_ms
-            )));
-        }
         // `0` is the documented "disable periodic reporting" sentinel;
         // any positive value must stay within the sane upper bound so
         // `metrics_interval_secs = 50000` does not silently turn into
@@ -612,12 +553,10 @@ pub struct PipelineSection {
     #[serde(default)]
     pub chain: Vec<String>,
     /// ONNX model path. Only consumed for the `[mask]` section;
-    /// ignored on background/foreground.
+    /// ignored on background/foreground. The model's sidecar is always
+    /// `<model>.toml`, next to it.
     #[serde(default)]
     pub model: Option<PathBuf>,
-    /// Optional sidecar `<model>.toml`. Mask section only.
-    #[serde(default)]
-    pub model_config: Option<PathBuf>,
     /// Consecutive-failure tolerance for the segmentation engine.
     /// Mask section only.
     #[serde(default)]
@@ -637,8 +576,7 @@ pub struct PipelineSection {
 /// These live one level above effect tables: a key such as `enabled`
 /// inside `[background.blur]` is an effect-table key and never collides
 /// with this list.
-pub const PIPELINE_RESERVED_KEYS: &[&str] =
-    &["chain", "model", "model_config", "fallback_threshold"];
+pub const PIPELINE_RESERVED_KEYS: &[&str] = &["chain", "model", "fallback_threshold"];
 
 impl PipelineSection {
     /// Whether `key` is one of [`PIPELINE_RESERVED_KEYS`] rather than an
@@ -696,7 +634,7 @@ pub struct Preset {
 // ---------------------------------------------------------------------------
 
 /// Control-socket configuration (`[control]` table). Drives the UNIX
-/// socket used for live reconfiguration (Stage 13). Disabled by
+/// socket used for live reconfiguration. Disabled by
 /// default — operators must opt in explicitly because the socket is a
 /// new (local-only) surface.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -739,25 +677,18 @@ pub enum IdlePlaceholderKind {
 
 /// Idle-mode configuration (`[idle]` table).
 ///
-/// Stage 15 introduces consumer-aware lifecycle management for the
-/// v4l2loopback sink: when no reader is attached to the output device,
-/// the supervisor tears down the input pipeline and publishes a cheap
-/// placeholder at `fps` instead of running the full effect chain. After
-/// `deep_idle_secs` of continued idleness the ONNX session is also
-/// dropped from memory, reclaiming ~150 MB.
-///
-/// Stage 15 ships with `enabled = false` so existing deployments are
-/// unaffected by the upgrade — operators opt in explicitly. A future
-/// stage may flip the default once the feature has time in the field.
+/// Consumer-aware lifecycle for the v4l2loopback sink: when no reader is
+/// attached to the output device, the supervisor tears down the input
+/// pipeline and publishes a cheap placeholder instead of running the full
+/// effect chain. Opt-in: `enabled` defaults to `false`.
 ///
 /// `deny_unknown_fields` keeps typos loud.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdleConfig {
-    /// Master switch. `false` (default in Stage 15) keeps Stage 14
-    /// behaviour exactly: no detector thread, no state machine. The
-    /// detector additionally refuses to spawn when the output sink is
-    /// not a `/dev/videoN` (V4L2) device.
+    /// Master switch. `false` (default) runs without a detector thread
+    /// or state machine. The detector additionally refuses to spawn when
+    /// the output sink is not a `/dev/videoN` (V4L2) device.
     #[serde(default)]
     pub enabled: bool,
 
@@ -803,13 +734,6 @@ pub struct IdleConfig {
     /// storm from Zoom/OBS startup without flapping the camera LED.
     #[serde(default = "default_idle_teardown_secs")]
     pub teardown_secs: u32,
-
-    /// Deprecated and ignored since Stage 16: the `DeepIdle` state was
-    /// removed (it was a no-op that never unloaded ONNX and could wedge
-    /// the daemon). The field is still accepted so existing TOML keeps
-    /// loading under `deny_unknown_fields`; its value has no effect.
-    #[serde(default = "default_idle_deep_secs")]
-    pub deep_idle_secs: u32,
 
     /// Fallback-path poll cadence in milliseconds. Lower = faster wake
     /// on consumer reconnect; higher = cheaper steady-state. The 250 ms
@@ -890,7 +814,6 @@ impl Default for IdleConfig {
             fps: default_idle_fps(),
             min_visibility_fps: default_idle_min_visibility_fps(),
             teardown_secs: default_idle_teardown_secs(),
-            deep_idle_secs: default_idle_deep_secs(),
             poll_interval_ms: default_idle_poll_interval_ms(),
             resync_interval_secs: default_idle_resync_interval_secs(),
             presence_source: IdlePresenceSource::default(),
@@ -902,9 +825,7 @@ impl IdleConfig {
     /// `true` when the configuration is equivalent to "idle disabled".
     ///
     /// Used by the serde adapter on [`FluxConfig`] to skip emitting an
-    /// `[idle]` table when the user has not opted in. This keeps
-    /// `current_config` JSON byte-identical to the Stage 14 shape for
-    /// configs that never touch idle mode.
+    /// `[idle]` table when the user has not opted in.
     #[must_use]
     pub fn is_off(&self) -> bool {
         !self.enabled
@@ -914,11 +835,6 @@ impl IdleConfig {
 /// Upper bound on `idle.teardown_secs` — 1 h is well past any
 /// realistic operator setting; the cap exists to catch typos.
 pub const MAX_IDLE_TEARDOWN_SECS: u32 = 3600;
-
-/// Upper bound on `idle.deep_idle_secs` — same rationale as
-/// [`MAX_IDLE_TEARDOWN_SECS`]; deep-idle thresholds beyond an hour
-/// negate the memory-reclaim payoff.
-pub const MAX_IDLE_DEEP_SECS: u32 = 3600;
 
 /// Lower inclusive bound on `idle.poll_interval_ms`. Below ~100 ms
 /// the sysfs poller starts to show on `top`; the wake budget gains
@@ -962,9 +878,6 @@ fn default_idle_min_visibility_fps() -> u32 {
 }
 fn default_idle_teardown_secs() -> u32 {
     5
-}
-fn default_idle_deep_secs() -> u32 {
-    30
 }
 fn default_idle_poll_interval_ms() -> u32 {
     250
@@ -1022,13 +935,11 @@ pub struct FluxConfig {
     #[serde(default)]
     pub logging: LoggingConfig,
     /// `[control]` section. Enables the UNIX-socket live-reconfig
-    /// surface (Stage 13). Disabled by default — opt-in feature.
+    /// surface. Disabled by default — opt-in feature.
     #[serde(default)]
     pub control: ControlConfig,
-    /// `[idle]` section. Stage 15 consumer-aware lifecycle. Disabled
-    /// by default — operators opt in. The `skip_serializing_if` arm
-    /// keeps `current_config` JSON byte-identical to Stage 14 when
-    /// idle is off, so existing GUI clients are unaffected.
+    /// `[idle]` section: consumer-aware lifecycle. Disabled by default,
+    /// and left out of the serialised config while disabled.
     #[serde(default, skip_serializing_if = "IdleConfig::is_off")]
     pub idle: IdleConfig,
 }
@@ -1119,17 +1030,6 @@ impl FluxConfig {
                 self.idle.teardown_secs
             )));
         }
-        if self.idle.deep_idle_secs == 0 {
-            return Err(config_err("idle.deep_idle_secs must be > 0, got 0".into()));
-        }
-        if self.idle.deep_idle_secs > MAX_IDLE_DEEP_SECS {
-            return Err(config_err(format!(
-                "idle.deep_idle_secs must be <= {MAX_IDLE_DEEP_SECS}, got {}",
-                self.idle.deep_idle_secs
-            )));
-        }
-        // DeepIdle state removed (Stage 16); deep_idle_secs kept for TOML
-        // back-compat, the deep > teardown cross-check is dropped.
         if self.idle.poll_interval_ms < MIN_IDLE_POLL_INTERVAL_MS
             || self.idle.poll_interval_ms > MAX_IDLE_POLL_INTERVAL_MS
         {
@@ -1217,19 +1117,7 @@ fn default_input_format() -> PixelFormat {
     PixelFormat::Rgb
 }
 fn default_output_format() -> PixelFormat {
-    PixelFormat::Yuy2
-}
-fn default_output_backend() -> BackendKind {
-    BackendKind::V4l2
-}
-fn default_max_latency_ms() -> u32 {
-    DEFAULT_MAX_LATENCY_MS
-}
-fn default_drop_late() -> bool {
-    true
-}
-fn default_max_inflight() -> u32 {
-    DEFAULT_MAX_INFLIGHT_FRAMES
+    PixelFormat::Rgb
 }
 fn default_metrics_interval_secs() -> u32 {
     DEFAULT_METRICS_INTERVAL_SECS
