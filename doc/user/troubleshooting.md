@@ -113,11 +113,11 @@ and post chains need a mask to work with. Add a mask section with a model.
 
 ## The model is not found or fails to load
 
-"model file not found" usually means a relative model path is resolved against a
-different working directory than intended. Relative paths are resolved against
-the directory the daemon was started from, not the configuration file's
-directory. Use an absolute path or set the working directory. Make sure the
-sidecar `.toml` file is next to the model.
+"model file not found" means the model is not where the preset says. A relative
+model path is resolved against the directory of the configuration file, not the
+directory the daemon was started from; see
+[Configuration](configuration.md#relative-paths). Make sure the sidecar `.toml`
+file is next to the model.
 
 ## The GUI shows "Daemon Unreachable"
 

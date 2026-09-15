@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use fluxframe_core::paths::ConfigBase;
 use fluxframe_core::{FluxConfig, FluxError, InputDevice, PipelineSection, Preset};
 #[cfg(feature = "ml")]
 use fluxframe_effects::ml::OnnxEngine;
@@ -14,7 +15,7 @@ use fluxframe_gst::{V4l2DeviceKind, enumerate_devices};
 use tracing::{info, warn};
 
 use crate::cli::CheckArgs;
-use crate::config_merge::{CliOverrides, apply, load, resolve_load_path};
+use crate::config_merge::{CliOverrides, apply, load, resolve_load_path, resolve_writable_path};
 use crate::preset;
 use crate::runtime::{InputSpec, OutputSpec, classify_input, classify_output};
 
@@ -33,6 +34,12 @@ pub fn run(args: CheckArgs) -> Result<(), FluxError> {
         fps: None,
     };
     let load_path = resolve_load_path(args.common.config.as_deref(), args.common.no_default_config);
+    // The same base `run` resolves relative paths against: the directory
+    // of the config file the daemon reads and saves.
+    let config_base = ConfigBase::for_config(
+        resolve_writable_path(args.common.config.as_deref(), args.common.no_default_config)
+            .as_deref(),
+    );
     let cfg = load(load_path.as_deref())?;
     let cfg = apply(cfg, &overrides);
     cfg.validate()?;
@@ -48,7 +55,7 @@ pub fn run(args: CheckArgs) -> Result<(), FluxError> {
     if let Err(e) = check_output_device(&cfg) {
         failures.push(e);
     }
-    if let Err(e) = check_preset(&cfg, args.preset.as_deref()) {
+    if let Err(e) = check_preset(&cfg, args.preset.as_deref(), &config_base) {
         failures.push(e);
     }
 
@@ -303,7 +310,11 @@ fn exclusive_caps_for_device(
 ///      section exists on disk and loads as an ONNX model.
 ///
 /// [`EffectChain`]: fluxframe_effects::EffectChain
-fn check_preset(cfg: &FluxConfig, requested: Option<&str>) -> Result<(), FluxError> {
+fn check_preset(
+    cfg: &FluxConfig,
+    requested: Option<&str>,
+    config_base: &ConfigBase,
+) -> Result<(), FluxError> {
     let (name, preset) = preset::resolve(cfg, requested)?;
 
     // Registry-level effect-name validation lives here (and only here)
@@ -319,12 +330,12 @@ fn check_preset(cfg: &FluxConfig, requested: Option<&str>) -> Result<(), FluxErr
     // Surface the same Ok/Err that `run` would see when constructing
     // its chain.  Catches: mask-without-ml, bg/fg-without-mask, and
     // composite-builder failures (per-effect TOML, model missing).
-    let _ = preset::build_chain(name, preset)?;
+    let _ = preset::build_chain(name, preset, config_base)?;
 
     #[cfg(feature = "ml")]
     if let Some(mask) = preset.mask.as_ref() {
         if let Some(model) = mask.model.as_deref() {
-            check_model_file(model)?;
+            check_model_file(&config_base.resolve(model))?;
         }
     }
 
@@ -523,7 +534,8 @@ mod tests {
     #[test]
     fn check_preset_fails_when_no_default_and_no_flag() {
         let cfg = cfg_with("[presets.custom]\n");
-        let err = check_preset(&cfg, None).expect_err("missing default → error");
+        let err =
+            check_preset(&cfg, None, &ConfigBase::default()).expect_err("missing default → error");
         let msg = format!("{err}");
         assert!(msg.contains("default"), "got: {msg}");
     }
@@ -531,7 +543,8 @@ mod tests {
     #[test]
     fn check_preset_fails_when_named_missing() {
         let cfg = cfg_with("[presets.default]\n");
-        let err = check_preset(&cfg, Some("nope")).expect_err("missing requested → error");
+        let err = check_preset(&cfg, Some("nope"), &ConfigBase::default())
+            .expect_err("missing requested → error");
         let msg = format!("{err}");
         assert!(msg.contains("'nope'"), "got: {msg}");
     }
@@ -539,7 +552,7 @@ mod tests {
     #[test]
     fn check_preset_default_with_empty_sections_passes() {
         let cfg = cfg_with("[presets.default]\n");
-        check_preset(&cfg, None).expect("empty default preset is valid");
+        check_preset(&cfg, None, &ConfigBase::default()).expect("empty default preset is valid");
     }
 
     #[test]

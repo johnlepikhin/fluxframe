@@ -57,8 +57,9 @@ pub(crate) enum FitMode {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImageFillConfig {
-    /// Path to the background image. Resolved relative to the current
-    /// working directory of the `fluxframe` process when relative.
+    /// Path to the background image. The daemon resolves a relative path
+    /// in the configuration against the config file's directory before
+    /// it reaches `configure`; here it is opened as given.
     pub path: PathBuf,
     /// Fit mode — see [`FitMode`] for the semantics.
     #[serde(default)]

@@ -30,7 +30,8 @@ pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineErro
 pub use frame::{FrameBuffer, FrameMeta, PixelFormat, Timestamp, VideoFrame};
 pub use metadata::{
     CommitStrategy, EFFECT_ENABLED_KEY, EffectMetadata, EffectSchema, ParamDescriptor, ParamKind,
-    ParamKindSchema, ParamSchema, ResolvedEffect, Scale, resolve_effect_params, split_effect_table,
+    ParamKindSchema, ParamSchema, ResolvedEffect, Scale, resolve_effect_params,
+    resolve_path_params, split_effect_table,
 };
 pub use metrics::{
     CONSUMER_EVENT_AGE_UNSET, CounterValues, Counters, CpuShares, EXTERNAL_OPENERS_UNSET,

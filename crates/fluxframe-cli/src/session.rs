@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 
+use fluxframe_core::paths::ConfigBase;
 use fluxframe_core::{FluxConfig, FluxError, Preset};
 use fluxframe_effects::EffectChain;
 
@@ -24,6 +25,9 @@ pub(crate) struct ControlSession {
     /// TOML file `reload` and `save_preset` work on; `None` when the
     /// daemon runs without one.
     pub(crate) config_path: Option<PathBuf>,
+    /// Directory relative paths in the configuration resolve against:
+    /// the directory of `config_path`.
+    pub(crate) config_base: ConfigBase,
     /// Name of the active preset.
     pub(crate) active_preset_name: String,
     /// Working copy of the active preset, unsaved edits included.
@@ -44,9 +48,11 @@ impl ControlSession {
     ) -> Result<Self, FluxError> {
         let (name, preset) = preset::resolve(&cfg, requested)?;
         let (active_preset_name, active_preset) = (name.to_string(), preset.clone());
+        let config_base = ConfigBase::for_config(config_path.as_deref());
         Ok(Self {
             cfg,
             config_path,
+            config_base,
             active_preset_name,
             active_preset,
         })
@@ -59,7 +65,11 @@ impl ControlSession {
     ///
     /// Propagates [`preset::build_chain`] failures.
     pub(crate) fn build_chain(&self) -> Result<EffectChain, FluxError> {
-        preset::build_chain(&self.active_preset_name, &self.active_preset)
+        preset::build_chain(
+            &self.active_preset_name,
+            &self.active_preset,
+            &self.config_base,
+        )
     }
 }
 

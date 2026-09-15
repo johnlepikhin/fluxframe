@@ -4,9 +4,8 @@
 # to your camera. Every key is documented in doc/user/configuration.md;
 # effects and their parameters in doc/user/presets-and-effects.md.
 #
-# Relative paths (the model below) are resolved against the daemon's
-# working directory. Either start fluxframe from ~/.config/fluxframe
-# or replace them with absolute paths.
+# Relative paths (the model below) are resolved against the directory
+# of this file, so keep the models/ directory next to it.
 
 [input]
 # "auto" picks the first available camera; use a path such as

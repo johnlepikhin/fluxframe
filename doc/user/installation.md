@@ -224,12 +224,11 @@ lists capture devices and loopback outputs. Then, with a configuration in place
 (start from [examples/fluxframe.toml](../../examples/fluxframe.toml)):
 
 ```bash
-cd ~/.config/fluxframe
 fluxframe check
 ```
 
 `check` verifies GStreamer, the input and output devices, the `exclusive_caps`
 setting, the preset and the model, and prints every problem it finds with a
 hint. It exits with status 0 when everything is usable. Model paths in the
-example configuration are relative, which is why the command runs from the
-configuration directory; see [Configuration](configuration.md#relative-paths).
+example configuration are relative to the configuration file; see
+[Configuration](configuration.md#relative-paths).

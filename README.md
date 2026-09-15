@@ -46,7 +46,6 @@ mkdir -p ~/.config/fluxframe
 cp examples/fluxframe.toml ~/.config/fluxframe/fluxframe.toml
 
 # 5. Verify devices, preset and model
-cd ~/.config/fluxframe
 /path/to/fluxframe/target/release/fluxframe check
 
 # 6. Run

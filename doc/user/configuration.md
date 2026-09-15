@@ -33,14 +33,16 @@ with an error that names the key, so a misspelled setting never goes unnoticed.
 
 ## Relative paths
 
-Relative paths in the configuration (the model path, `image_fill` images) are
-resolved against the working directory of the daemon, not against the location
-of the configuration file. Either use absolute paths or start the daemon from a
-fixed directory. The example service in
-[Running](running.md#running-as-a-user-service) sets the working directory to
-`~/.config/fluxframe`.
+Relative paths in the configuration (a preset's `model`, `image_fill` images,
+`idle.placeholder_path`) are resolved against the directory that contains the
+configuration file, so a configuration and the files next to it can be moved
+together and the daemon can be started from any directory. The file keeps the
+paths as written: saving a preset from the GUI does not turn them into absolute
+paths.
 
-`idle.placeholder_path` is not resolved at all and should always be absolute.
+Without a configuration file (`--no-default-config` and no `--config`), relative
+paths are resolved against the daemon's working directory. `control.socket_path`
+and device paths are used as given.
 
 ## `[input]`
 

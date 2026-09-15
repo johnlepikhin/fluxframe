@@ -99,7 +99,6 @@ following systemd user unit is an example to adapt:
 Description=FluxFrame virtual camera
 
 [Service]
-WorkingDirectory=%h/.config/fluxframe
 Environment=ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so
 ExecStart=%h/.cargo/bin/fluxframe run
 Restart=on-failure
@@ -115,10 +114,10 @@ systemctl --user enable --now fluxframe
 journalctl --user -u fluxframe -f
 ```
 
-The working directory makes relative model paths in the configuration resolve
-against `~/.config/fluxframe`. On systems with GNU Shepherd, define an
-equivalent service in your home configuration with the same command, environment
-and working directory.
+Relative paths in the configuration are resolved against the configuration
+file's directory, so the service needs no particular working directory. On
+systems with GNU Shepherd, define an equivalent service in your home
+configuration with the same command and environment.
 
 A service manager does not load the v4l2loopback module. Load it at boot as
 described in [Installation](installation.md#virtual-camera).

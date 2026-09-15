@@ -14,6 +14,7 @@
 //!    (bg/fg without mask is a config bug; mask without the `ml`
 //!    feature is a build mismatch).
 
+use fluxframe_core::paths::ConfigBase;
 use fluxframe_core::traits::VideoEffect;
 use fluxframe_core::{FluxConfig, FluxError, Preset};
 use fluxframe_effects::{EffectChain, PassthroughEffect};
@@ -78,6 +79,9 @@ fn resolution_error(cfg: &FluxConfig, requested: Option<&str>) -> FluxError {
 ///   bug regardless of feature flags; mask without `ml` is a build
 ///   mismatch).
 ///
+/// Relative paths in the preset (the model, image parameters) are
+/// resolved against `config_base`.
+///
 /// # Errors
 ///
 /// Returns [`FluxError::Config`] when the preset declares
@@ -87,10 +91,14 @@ fn resolution_error(cfg: &FluxConfig, requested: Option<&str>) -> FluxError {
 /// build compiled without the `ml` feature. Composite-builder failures
 /// (unknown effect names, malformed per-effect TOML, missing
 /// `mask.model`, ...) propagate via `FluxError::from(EffectError)`.
-pub fn build_chain(name: &str, preset: &Preset) -> Result<EffectChain, FluxError> {
+pub fn build_chain(
+    name: &str,
+    preset: &Preset,
+    config_base: &ConfigBase,
+) -> Result<EffectChain, FluxError> {
     reject_planes_without_mask(name, preset)?;
     if preset.mask.is_some() {
-        return build_composite_chain(name, preset);
+        return build_composite_chain(name, preset, config_base);
     }
     Ok(build_passthrough_chain(name))
 }
@@ -151,7 +159,11 @@ fn build_passthrough_chain(name: &str) -> EffectChain {
 ///
 /// [`composite`]: fluxframe_effects::composite
 #[cfg(feature = "ml")]
-fn build_composite_chain(name: &str, preset: &Preset) -> Result<EffectChain, FluxError> {
+fn build_composite_chain(
+    name: &str,
+    preset: &Preset,
+    config_base: &ConfigBase,
+) -> Result<EffectChain, FluxError> {
     use fluxframe_effects::composite::CompositeBuilder;
     use fluxframe_effects::{mask_effects, plane_effects, post_effects};
 
@@ -170,6 +182,7 @@ fn build_composite_chain(name: &str, preset: &Preset) -> Result<EffectChain, Flu
             preset.background.as_ref(),
             preset.foreground.as_ref(),
             preset.post.as_ref(),
+            config_base,
         )
         .map_err(FluxError::from)?;
     info!(
@@ -181,7 +194,11 @@ fn build_composite_chain(name: &str, preset: &Preset) -> Result<EffectChain, Flu
 }
 
 #[cfg(not(feature = "ml"))]
-fn build_composite_chain(name: &str, _preset: &Preset) -> Result<EffectChain, FluxError> {
+fn build_composite_chain(
+    name: &str,
+    _preset: &Preset,
+    _config_base: &ConfigBase,
+) -> Result<EffectChain, FluxError> {
     Err(FluxError::Config {
         reason: format!(
             "preset '{name}' has a [mask] sub-section but the binary was built \
@@ -245,7 +262,8 @@ mod tests {
     #[test]
     fn build_chain_falls_back_to_passthrough_when_empty() {
         let preset = Preset::default();
-        let chain = build_chain("raw", &preset).expect("empty preset → passthrough");
+        let chain = build_chain("raw", &preset, &ConfigBase::default())
+            .expect("empty preset → passthrough");
         assert_eq!(chain.len(), 1);
         assert_eq!(chain.names(), vec![PassthroughEffect::NAME]);
     }
@@ -258,7 +276,7 @@ mod tests {
         };
         // `EffectChain` is not `Debug`, so use a `let-else` instead of
         // `expect_err` to keep the panic message useful.
-        let Err(err) = build_chain("bg-only", &preset) else {
+        let Err(err) = build_chain("bg-only", &preset, &ConfigBase::default()) else {
             panic!("bg without mask must surface as a config error");
         };
         let msg = format!("{err}");
@@ -272,7 +290,7 @@ mod tests {
             foreground: Some(PipelineSection::default()),
             ..Preset::default()
         };
-        let Err(err) = build_chain("fg-only", &preset) else {
+        let Err(err) = build_chain("fg-only", &preset, &ConfigBase::default()) else {
             panic!("fg without mask must surface as a config error");
         };
         let msg = format!("{err}");
@@ -305,7 +323,7 @@ mod tests {
             ..Preset::default()
         };
 
-        let Ok(chain) = build_chain("composite", &preset) else {
+        let Ok(chain) = build_chain("composite", &preset, &ConfigBase::default()) else {
             panic!("mask present → composite chain should build");
         };
         // Composite collapses the whole sub-pipeline into a single
@@ -328,7 +346,7 @@ mod tests {
             ..Preset::default()
         };
 
-        let Err(err) = build_chain("composite", &preset) else {
+        let Err(err) = build_chain("composite", &preset, &ConfigBase::default()) else {
             panic!("mask without ml feature must surface as a config error");
         };
         let msg = format!("{err}");

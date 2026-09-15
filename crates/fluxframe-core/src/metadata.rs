@@ -20,9 +20,12 @@
 //! table when the operator adds an effect without an explicit
 //! `per_effect` block.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::EffectError;
+use crate::paths::ConfigBase;
 use crate::traits::RawEffectParams;
 
 /// Reserved key inside an effect's parameter table
@@ -283,6 +286,9 @@ pub fn split_effect_table(
 /// edited live. An explicit table is passed through unchanged, so the
 /// effect's serde defaults fill any field it omits.
 ///
+/// Relative [`ParamKind::Path`] values are resolved against `base` (see
+/// [`resolve_path_params`]); the preset table itself is not touched.
+///
 /// # Errors
 ///
 /// [`EffectError::InvalidConfig`] when [`split_effect_table`] rejects
@@ -292,9 +298,13 @@ pub fn resolve_effect_params(
     name: &str,
     table: Option<&toml::Value>,
     metadata: Option<&EffectMetadata>,
+    base: &ConfigBase,
 ) -> Result<ResolvedEffect, EffectError> {
-    let (enabled, params) = split_effect_table(name, table)?;
+    let (enabled, mut params) = split_effect_table(name, table)?;
     if !params.is_empty() {
+        if let Some(metadata) = metadata {
+            resolve_path_params(&mut params, metadata, base);
+        }
         return Ok(ResolvedEffect {
             enabled,
             params: toml::Value::Table(params),
@@ -312,10 +322,13 @@ pub fn resolve_effect_params(
         });
     };
     match metadata.default_config() {
-        Ok(defaults) => Ok(ResolvedEffect {
-            enabled,
-            params: toml::Value::Table(defaults),
-        }),
+        Ok(mut defaults) => {
+            resolve_path_params(&mut defaults, metadata, base);
+            Ok(ResolvedEffect {
+                enabled,
+                params: toml::Value::Table(defaults),
+            })
+        }
         Err(missing) => {
             let fields = missing
                 .iter()
@@ -334,6 +347,25 @@ pub fn resolve_effect_params(
                 )),
             })
         }
+    }
+}
+
+/// Resolve the relative [`ParamKind::Path`] values in `params` against
+/// `base`. Other parameters, absolute paths and non-string values are
+/// left untouched — a malformed value is `configure`'s to reject.
+pub fn resolve_path_params(params: &mut toml::Table, metadata: &EffectMetadata, base: &ConfigBase) {
+    for param in metadata.params {
+        if !matches!(param.kind, ParamKind::Path { .. }) {
+            continue;
+        }
+        let Some(toml::Value::String(value)) = params.get_mut(param.name) else {
+            continue;
+        };
+        let resolved = base
+            .resolve(Path::new(value.as_str()))
+            .to_string_lossy()
+            .into_owned();
+        *value = resolved;
     }
 }
 
@@ -556,8 +588,13 @@ mod tests {
 
     #[test]
     fn resolve_passes_explicit_params_through() {
-        let resolved = resolve_effect_params("fill", Some(&table("rgb = [4, 5, 6]")), None)
-            .expect("explicit params need no metadata");
+        let resolved = resolve_effect_params(
+            "fill",
+            Some(&table("rgb = [4, 5, 6]")),
+            None,
+            &ConfigBase::default(),
+        )
+        .expect("explicit params need no metadata");
         assert!(resolved.enabled);
         assert_eq!(resolved.params, table("rgb = [4, 5, 6]"));
     }
@@ -567,13 +604,19 @@ mod tests {
     /// next `set_chain` failed for `color_fill`.
     #[test]
     fn resolve_synthesises_defaults_for_flag_only_table() {
-        let resolved =
-            resolve_effect_params("fill", Some(&table("enabled = false")), Some(&FILL_META))
-                .expect("defaults synthesised");
+        let base = ConfigBase::default();
+        let resolved = resolve_effect_params(
+            "fill",
+            Some(&table("enabled = false")),
+            Some(&FILL_META),
+            &base,
+        )
+        .expect("defaults synthesised");
         assert!(!resolved.enabled);
         assert_eq!(resolved.params, table("rgb = [1, 2, 3]"));
 
-        let resolved = resolve_effect_params("fill", None, Some(&FILL_META)).expect("absent table");
+        let resolved =
+            resolve_effect_params("fill", None, Some(&FILL_META), &base).expect("absent table");
         assert!(resolved.enabled);
         assert_eq!(resolved.params, table("rgb = [1, 2, 3]"));
     }
@@ -594,12 +637,74 @@ mod tests {
                 commit: CommitStrategy::OnCommit,
             }],
         };
-        let err = resolve_effect_params("image", None, Some(&PATH_META))
+        let base = ConfigBase::default();
+        let err = resolve_effect_params("image", None, Some(&PATH_META), &base)
             .expect_err("required path without default");
         assert!(reason(&err).contains("`path`"), "{err}");
 
-        let err = resolve_effect_params("image", None, None).expect_err("no metadata");
+        let err = resolve_effect_params("image", None, None, &base).expect_err("no metadata");
         assert!(reason(&err).contains("without metadata"), "{err}");
+    }
+
+    /// An image-like effect: an optional path next to a string enum, so
+    /// resolution can be seen to touch the path and nothing else.
+    const IMAGE_META: EffectMetadata = EffectMetadata {
+        name: "image",
+        help: "",
+        params: &[
+            ParamDescriptor {
+                name: "path",
+                kind: ParamKind::Path {
+                    default: None,
+                    extensions: &[],
+                    required: false,
+                },
+                help: "",
+                commit: CommitStrategy::OnCommit,
+            },
+            ParamDescriptor {
+                name: "fit",
+                kind: ParamKind::Enum {
+                    default: "cover",
+                    variants: &["cover", "contain"],
+                },
+                help: "",
+                commit: CommitStrategy::OnCommit,
+            },
+        ],
+    };
+
+    #[test]
+    fn resolve_joins_relative_path_params_onto_the_config_base() {
+        let base = ConfigBase::for_config(Some(Path::new("/etc/ff/fluxframe.toml")));
+        let resolved = resolve_effect_params(
+            "image",
+            Some(&table("path = \"bg.png\"\nfit = \"cover\"")),
+            Some(&IMAGE_META),
+            &base,
+        )
+        .expect("resolves");
+        assert_eq!(
+            resolved.params,
+            table("path = \"/etc/ff/bg.png\"\nfit = \"cover\"")
+        );
+
+        let resolved = resolve_effect_params(
+            "image",
+            Some(&table("path = \"/srv/bg.png\"")),
+            Some(&IMAGE_META),
+            &base,
+        )
+        .expect("resolves");
+        assert_eq!(resolved.params, table("path = \"/srv/bg.png\""));
+    }
+
+    #[test]
+    fn path_resolution_leaves_non_string_values_for_configure_to_reject() {
+        let base = ConfigBase::for_config(Some(Path::new("/etc/ff/fluxframe.toml")));
+        let mut params: toml::Table = toml::from_str("path = 3").expect("valid TOML");
+        resolve_path_params(&mut params, &IMAGE_META, &base);
+        assert_eq!(params.get("path"), Some(&toml::Value::Integer(3)));
     }
 
     #[test]

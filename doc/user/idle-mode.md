@@ -47,8 +47,8 @@ placeholder = "image"
 placeholder_path = "/home/user/Pictures/away.png"
 ```
 
-The image is loaded once at startup and scaled to the output size. The path must
-be absolute.
+The image is loaded once at startup and scaled to the output size. A relative
+path is resolved against the directory of the configuration file.
 
 Chrome and other WebRTC clients list a v4l2loopback device only while it
 receives frames. `min_visibility_fps` keeps the placeholder frequent enough for
@@ -96,7 +96,7 @@ physical camera is unavailable.
 | `enabled`              | boolean             | `false`        | Enable idle mode.                                                                                                |
 | `placeholder`          | string              | `"color"`      | `color` or `image`.                                                                                              |
 | `placeholder_rgb`      | array of 3 integers | `[16, 16, 16]` | Placeholder colour.                                                                                              |
-| `placeholder_path`     | path                | none           | Absolute path to a PNG or JPEG. Required when `placeholder = "image"`.                                           |
+| `placeholder_path`     | path                | none           | PNG or JPEG file, relative to the configuration file. Required when `placeholder = "image"`.                     |
 | `fps`                  | integer             | `1`            | Placeholder frame rate, 1 to 60.                                                                                 |
 | `min_visibility_fps`   | integer             | `10`           | Minimum placeholder frame rate that keeps the device visible to browsers, 1 to 60.                               |
 | `teardown_secs`        | integer             | `5`            | Delay between the last reader leaving and closing the camera, 1 to 3600.                                         |

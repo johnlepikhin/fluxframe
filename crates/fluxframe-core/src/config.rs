@@ -705,10 +705,9 @@ pub struct IdleConfig {
     pub placeholder_rgb: [u8; 3],
 
     /// Path to a static image file for [`IdlePlaceholderKind::Image`].
-    /// Ignored when `placeholder = "color"`. Currently passed verbatim
-    /// to [`image::ImageReader::open`] — operators should use an
-    /// absolute path. Stage 15 Step 4 (supervisor wiring) will resolve
-    /// relative paths against the config-file directory.
+    /// Ignored when `placeholder = "color"`. A relative path is resolved
+    /// against the configuration file's directory; see
+    /// [`IdleConfig::resolve_paths`].
     #[serde(default)]
     pub placeholder_path: Option<PathBuf>,
 
@@ -829,6 +828,17 @@ impl IdleConfig {
     #[must_use]
     pub fn is_off(&self) -> bool {
         !self.enabled
+    }
+
+    /// This config with `placeholder_path` resolved against `base`; see
+    /// [`crate::paths::ConfigBase`].
+    #[must_use]
+    pub fn resolve_paths(&self, base: &crate::paths::ConfigBase) -> Self {
+        let mut resolved = self.clone();
+        if let Some(path) = &self.placeholder_path {
+            resolved.placeholder_path = Some(base.resolve(path).into_owned());
+        }
+        resolved
     }
 }
 
@@ -1139,6 +1149,21 @@ mod tests {
     fn cfg_with_resync(value: &str) -> Result<FluxConfig, crate::error::FluxError> {
         let text = format!("[idle]\nenabled = true\nresync_interval_secs = {value}\n");
         FluxConfig::from_toml_str(&text)
+    }
+
+    #[test]
+    fn placeholder_path_resolves_against_the_config_base() {
+        let idle = super::IdleConfig {
+            placeholder_path: Some("away.png".into()),
+            ..super::IdleConfig::default()
+        };
+        let base = crate::paths::ConfigBase::for_config(Some(std::path::Path::new(
+            "/etc/ff/fluxframe.toml",
+        )));
+        assert_eq!(
+            idle.resolve_paths(&base).placeholder_path.as_deref(),
+            Some(std::path::Path::new("/etc/ff/away.png"))
+        );
     }
 
     #[test]

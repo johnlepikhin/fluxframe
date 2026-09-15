@@ -31,6 +31,7 @@ use crate::metrics_reporter::MetricsReporter;
 use crate::preset;
 use crate::runtime_metrics::RuntimeMetrics;
 use crate::session::ControlSession;
+use fluxframe_core::paths::ConfigBase;
 
 /// Worker-response cap for the listener thread. The worker only polls
 /// between frames; at 30 fps one cycle is ~33 ms, so 5 s is generous
@@ -209,6 +210,7 @@ fn apply_control_command(
     let ControlSession {
         cfg,
         config_path,
+        config_base,
         active_preset_name,
         active_preset,
     } = session;
@@ -222,7 +224,7 @@ fn apply_control_command(
                     Some(format!("available: {}", available.join(", "))),
                 );
             };
-            let mut new_chain = match preset::build_chain(&name, new_preset) {
+            let mut new_chain = match preset::build_chain(&name, new_preset, config_base) {
                 Ok(c) => c,
                 Err(e) => return ControlResponse::err(format!("build chain failed: {e}"), None),
             };
@@ -248,12 +250,19 @@ fn apply_control_command(
             ControlResponse::ok()
         }
         ControlCommand::Set { path, value } => {
-            apply_set_command(chain, active_preset, &path, value)
+            apply_set_command(chain, active_preset, config_base, &path, value)
         }
         ControlCommand::SetChain {
             section,
             chain: new_names,
-        } => apply_set_chain_command(chain, active_preset, telemetry, section, &new_names),
+        } => apply_set_chain_command(
+            chain,
+            active_preset,
+            telemetry,
+            section,
+            &new_names,
+            config_base,
+        ),
         ControlCommand::SetEnabled {
             section,
             effect,
@@ -486,7 +495,8 @@ fn apply_reload_command(
             )),
         );
     };
-    let mut new_chain = match preset::build_chain(active_preset_name, new_preset) {
+    let config_base = ConfigBase::for_config(Some(path));
+    let mut new_chain = match preset::build_chain(active_preset_name, new_preset, &config_base) {
         Ok(c) => c,
         Err(e) => return ControlResponse::err(format!("build chain failed: {e}"), None),
     };
@@ -545,6 +555,7 @@ fn apply_get_config_command(active_preset: &Preset, path: Option<&str>) -> Contr
 fn apply_set_command(
     chain: &mut EffectChain,
     active_preset: &mut Preset,
+    config_base: &ConfigBase,
     path: &str,
     value: serde_json::Value,
 ) -> ControlResponse {
@@ -565,39 +576,11 @@ fn apply_set_command(
         Ok(v) => v,
         Err(e) => return ControlResponse::err(e, None),
     };
-    // Snapshot whether the targeted section existed BEFORE we touch
-    // the preset; the Err arm below uses this to revert any
-    // materialisation we performed on behalf of a doomed Set.
-    let was_absent = section_is_absent(active_preset, set_path.section);
-    // Mask cannot be conjured (the composite needs an ONNX model that
-    // the control protocol cannot synthesise) — return a typed error
-    // pointing the operator at a preset with `[mask]`. Plane/Post
-    // sections are materialised on demand via
-    // `ensure_plane_or_post_section_mut`.
-    if set_path.section == SubchainKind::Mask && was_absent {
-        return ControlResponse::err(
-            "preset does not have a [mask] sub-section",
-            Some(
-                "this preset has no segmentation; switch to a preset with [mask] to add post-process effects"
-                    .into(),
-            ),
-        );
-    }
-    let section_mut = if set_path.section == SubchainKind::Mask {
-        // Safe to unwrap: `was_absent == false` here (we returned above otherwise).
-        let Some(s) = mask_section_mut(active_preset) else {
-            debug_assert!(
-                false,
-                "mask section disappeared between absence check and access"
-            );
-            return ControlResponse::err(
-                "internal: mask section missing",
-                Some("this is a bug; please report".into()),
-            );
-        };
-        s
-    } else {
-        ensure_plane_or_post_section_mut(active_preset, set_path.section)
+    // `was_absent` lets the Err arm below revert a section materialised
+    // purely on behalf of a doomed Set.
+    let (section_mut, was_absent) = match set_target_section(active_preset, set_path.section) {
+        Ok(target) => target,
+        Err(response) => return response,
     };
     // Read the existing per-effect table for this effect (defaulting
     // to empty), insert the new field, then hand the merged table to
@@ -613,9 +596,11 @@ fn apply_set_command(
     };
     effect_table.insert(set_path.field.clone(), toml_value);
     let merged_entry = toml::Value::Table(effect_table);
-    let result = live_effect_params(&set_path.effect, Some(&merged_entry)).and_then(|params| {
-        chain.reconfigure_named_effect(set_path.section, &set_path.effect, params)
-    });
+    let metadata = effect_metadata(set_path.section, &set_path.effect);
+    let result = live_effect_params(&set_path.effect, Some(&merged_entry), metadata, config_base)
+        .and_then(|params| {
+            chain.reconfigure_named_effect(set_path.section, &set_path.effect, params)
+        });
     section_mut
         .per_effect
         .insert(set_path.effect.clone(), merged_entry);
@@ -653,10 +638,15 @@ fn apply_set_command(
             // its `self.config` rolls back. Replay `original_entry` (or
             // an empty table). If this second call also fails, log a
             // warn — we cannot do better without tearing the chain down.
-            let revert =
-                live_effect_params(&set_path.effect, original_entry.as_ref()).and_then(|params| {
-                    chain.reconfigure_named_effect(set_path.section, &set_path.effect, params)
-                });
+            let revert = live_effect_params(
+                &set_path.effect,
+                original_entry.as_ref(),
+                metadata,
+                config_base,
+            )
+            .and_then(|params| {
+                chain.reconfigure_named_effect(set_path.section, &set_path.effect, params)
+            });
             if let Err(revert_err) = revert {
                 warn!(
                     section = %set_path.section,
@@ -677,15 +667,70 @@ fn apply_set_command(
     }
 }
 
+/// The sub-section of `preset` a `set` writes into, and whether it was
+/// absent before the call.
+///
+/// Plane and post sections are materialised on demand. A missing mask is
+/// an error pointing at a preset with `[mask]`: the composite needs an
+/// ONNX model the control protocol cannot supply.
+fn set_target_section(
+    preset: &mut Preset,
+    section: SubchainKind,
+) -> Result<(&mut fluxframe_core::PipelineSection, bool), ControlResponse> {
+    let was_absent = section_is_absent(preset, section);
+    if section != SubchainKind::Mask {
+        return Ok((
+            ensure_plane_or_post_section_mut(preset, section),
+            was_absent,
+        ));
+    }
+    mask_section_mut(preset)
+        .map(|mask| (mask, was_absent))
+        .ok_or_else(|| {
+            ControlResponse::err(
+                "preset does not have a [mask] sub-section",
+                Some(
+                    "this preset has no segmentation; switch to a preset with [mask] to add post-process effects"
+                        .into(),
+                ),
+            )
+        })
+}
+
 /// Parameters a live effect is reconfigured with for its preset table
 /// `table`: the table without the `enabled` flag, which is not an
-/// effect parameter. An absent table yields an empty one, so the
-/// effect's serde defaults apply.
+/// effect parameter, with relative path parameters resolved against
+/// `config_base`. An absent table yields an empty one, so the effect's
+/// serde defaults apply.
 fn live_effect_params(
     effect: &str,
     table: Option<&toml::Value>,
+    metadata: Option<&fluxframe_core::EffectMetadata>,
+    config_base: &ConfigBase,
 ) -> Result<fluxframe_core::traits::RawEffectParams, fluxframe_core::EffectError> {
-    fluxframe_core::split_effect_table(effect, table).map(|(_, params)| toml::Value::Table(params))
+    let (_, mut params) = fluxframe_core::split_effect_table(effect, table)?;
+    if let Some(metadata) = metadata {
+        fluxframe_core::resolve_path_params(&mut params, metadata, config_base);
+    }
+    Ok(toml::Value::Table(params))
+}
+
+/// Metadata of effect `name` in the registry of `section`; `None` when
+/// the effect is not registered there (the chain rejects it itself).
+fn effect_metadata(
+    section: SubchainKind,
+    name: &str,
+) -> Option<&'static fluxframe_core::EffectMetadata> {
+    match section {
+        SubchainKind::Mask => fluxframe_effects::mask_effects::default_registry().metadata(name),
+        SubchainKind::Background | SubchainKind::Foreground => {
+            fluxframe_effects::plane_effects::default_registry().metadata(name)
+        }
+        #[cfg(feature = "ml")]
+        SubchainKind::Post => fluxframe_effects::post_effects::default_registry().metadata(name),
+        #[cfg(not(feature = "ml"))]
+        SubchainKind::Post => None,
+    }
 }
 
 /// Mutable handle to the `[mask]` sub-section of `preset`. Returns
@@ -762,6 +807,7 @@ fn apply_set_chain_command(
     telemetry: &fluxframe_core::EffectTelemetry,
     section: SubchainKind,
     new_names: &[String],
+    config_base: &ConfigBase,
 ) -> ControlResponse {
     let Some(composite) = chain.composite_mut() else {
         return ControlResponse::err(
@@ -800,7 +846,8 @@ fn apply_set_chain_command(
     let old_names = section_data.chain.clone();
     // Build new effects + configure them from the existing `per_effect`
     // tables (metadata defaults when an effect has none).
-    let result = build_and_configure_subchain(section, new_names, &section_data.per_effect);
+    let result =
+        build_and_configure_subchain(section, new_names, &section_data.per_effect, config_base);
     let payload = match result {
         Ok(o) => o,
         Err(e) => {
@@ -929,6 +976,7 @@ fn apply_set_chain_command(
     _telemetry: &fluxframe_core::EffectTelemetry,
     _section: SubchainKind,
     _new_names: &[String],
+    _config_base: &ConfigBase,
 ) -> ControlResponse {
     ControlResponse::err(
         "set_chain unavailable: built without ml feature",
@@ -1068,6 +1116,7 @@ fn build_and_configure_subchain(
     section: SubchainKind,
     names: &[String],
     per_effect: &std::collections::BTreeMap<String, toml::Value>,
+    config_base: &ConfigBase,
 ) -> Result<fluxframe_effects::composite::SubChainPayload, SubChainError> {
     use fluxframe_effects::composite::{Slot, SubChainPayload};
     use fluxframe_effects::{mask_effects, plane_effects, post_effects};
@@ -1114,6 +1163,7 @@ fn build_and_configure_subchain(
         names: &[String],
         per_effect: &std::collections::BTreeMap<String, toml::Value>,
         lookup_metadata: impl Fn(&str) -> Option<&'static fluxframe_core::EffectMetadata>,
+        config_base: &ConfigBase,
     ) -> Result<Vec<Slot<E>>, SubChainError>
     where
         E: ?Sized + Configure,
@@ -1131,6 +1181,7 @@ fn build_and_configure_subchain(
                     name,
                     per_effect.get(name),
                     lookup_metadata(name),
+                    config_base,
                 )
                 .map_err(configure_error)?;
                 effect
@@ -1166,10 +1217,13 @@ fn build_and_configure_subchain(
             let built = registry
                 .build_chain(names)
                 .map_err(|e| build_error(section, &e))?;
-            let slots =
-                configure_each::<dyn fluxframe_core::MaskEffect>(built, names, per_effect, |n| {
-                    registry.metadata(n)
-                })?;
+            let slots = configure_each::<dyn fluxframe_core::MaskEffect>(
+                built,
+                names,
+                per_effect,
+                |n| registry.metadata(n),
+                config_base,
+            )?;
             Ok(SubChainPayload::Mask(slots))
         }
         SubchainKind::Background | SubchainKind::Foreground => {
@@ -1177,10 +1231,13 @@ fn build_and_configure_subchain(
             let built = registry
                 .build_chain(names)
                 .map_err(|e| build_error(section, &e))?;
-            let slots =
-                configure_each::<dyn fluxframe_core::PlaneEffect>(built, names, per_effect, |n| {
-                    registry.metadata(n)
-                })?;
+            let slots = configure_each::<dyn fluxframe_core::PlaneEffect>(
+                built,
+                names,
+                per_effect,
+                |n| registry.metadata(n),
+                config_base,
+            )?;
             Ok(if section == SubchainKind::Background {
                 SubChainPayload::Background(slots)
             } else {
@@ -1192,10 +1249,13 @@ fn build_and_configure_subchain(
             let built = registry
                 .build_chain(names)
                 .map_err(|e| build_error(section, &e))?;
-            let slots =
-                configure_each::<dyn fluxframe_core::PostEffect>(built, names, per_effect, |n| {
-                    registry.metadata(n)
-                })?;
+            let slots = configure_each::<dyn fluxframe_core::PostEffect>(
+                built,
+                names,
+                per_effect,
+                |n| registry.metadata(n),
+                config_base,
+            )?;
             Ok(SubChainPayload::Post(slots))
         }
     }
@@ -1785,7 +1845,8 @@ where
     // Stage 15 idle runtime: detector spawn + state machine + cached
     // placeholder. Returns `None` (Stage 14 fallthrough) when idle
     // mode is disabled, the sink is non-V4L2, or the host is non-Linux.
-    let mut idle_runtime = build_idle_runtime(cfg, &input, &output, &running, &metrics.counters);
+    let base = &session.config_base;
+    let mut idle_runtime = build_idle_runtime(cfg, base, &input, &output, &running, &metrics);
     if supervised_acquire(cfg) && idle_runtime.is_some() {
         input_failure.arm();
     }
@@ -1881,7 +1942,11 @@ where
         .output
         .effective_dimensions(cfg.input.width, cfg.input.height);
     let placeholder: Option<Box<dyn crate::idle::Placeholder>> = if supervised_acquire(cfg) {
-        match crate::idle::build_placeholder(&cfg.idle, out_w, out_h) {
+        match crate::idle::build_placeholder(
+            &cfg.idle.resolve_paths(&session.config_base),
+            out_w,
+            out_h,
+        ) {
             Ok(p) => Some(p),
             Err(e) => {
                 warn!(error = %e, "failed to build acquire placeholder — falling back to single-attempt input acquisition");
@@ -2887,10 +2952,11 @@ struct IdleRuntime {
 /// the Stage 14 worker loop unchanged.
 fn build_idle_runtime(
     cfg: &FluxConfig,
+    config_base: &ConfigBase,
     input: &Arc<InputPipeline>,
     output: &OutputPipeline,
     running: &Arc<AtomicBool>,
-    counters: &Arc<fluxframe_core::Counters>,
+    metrics: &RuntimeMetrics,
 ) -> Option<IdleRuntime> {
     if !cfg.idle.enabled {
         return None;
@@ -2919,14 +2985,17 @@ fn build_idle_runtime(
         // the *input* format on the supervisor's pipeline. The
         // output's sink format is reached via videoconvert downstream.
         let placeholder_format = cfg.input.format;
-        let placeholder: Arc<dyn crate::idle::Placeholder> =
-            match crate::idle::build_placeholder(&cfg.idle, sink_w, sink_h) {
-                Ok(p) => p.into(),
-                Err(e) => {
-                    warn!(error = %e, "failed to build idle placeholder — idle mode disabled");
-                    return None;
-                }
-            };
+        let placeholder: Arc<dyn crate::idle::Placeholder> = match crate::idle::build_placeholder(
+            &cfg.idle.resolve_paths(config_base),
+            sink_w,
+            sink_h,
+        ) {
+            Ok(p) => p.into(),
+            Err(e) => {
+                warn!(error = %e, "failed to build idle placeholder — idle mode disabled");
+                return None;
+            }
+        };
 
         // Ask the loopback for a capture-usage subscription. `None`
         // means this sink owns no device fd (only the direct-write path
@@ -2978,7 +3047,7 @@ fn build_idle_runtime(
                 }),
             },
             detector_running,
-            Arc::clone(counters),
+            Arc::clone(&metrics.counters),
             watch,
         );
         // The detector handle moves into the runtime so its Drop
@@ -3001,7 +3070,7 @@ fn build_idle_runtime(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (input, running, counters);
+        let _ = (config_base, input, running, metrics);
         warn!(
             target: "fluxframe::idle",
             "idle mode requested but host is not Linux — idle disabled (the /proc/*/fd consumer detector is Linux-only)"
@@ -4175,6 +4244,7 @@ mod tests {
                     preset.background.as_ref(),
                     preset.foreground.as_ref(),
                     preset.post.as_ref(),
+                    &ConfigBase::default(),
                 )
                 .expect("test composite builds");
         StubEffectChain::new(vec![Box::new(composite)])
@@ -4409,6 +4479,7 @@ mod tests {
         ControlSession {
             cfg,
             config_path: None,
+            config_base: ConfigBase::default(),
             active_preset_name: preset_name.into(),
             active_preset,
         }
@@ -4512,6 +4583,7 @@ mod tests {
         let resp = apply_set_command(
             &mut chain,
             &mut preset,
+            &ConfigBase::default(),
             "background.blur.radius",
             serde_json::json!(42),
         );
@@ -4550,6 +4622,7 @@ radius = 10
         let resp = apply_set_command(
             &mut chain,
             &mut preset,
+            &ConfigBase::default(),
             "background.blur.passes",
             serde_json::json!(3),
         );
@@ -4563,6 +4636,7 @@ radius = 10
         let resp = apply_set_command(
             &mut chain,
             &mut preset,
+            &ConfigBase::default(),
             "background.blur.passes",
             serde_json::json!("many"),
         );
@@ -4577,6 +4651,7 @@ radius = 10
         let resp = apply_set_command(
             &mut chain,
             &mut preset,
+            &ConfigBase::default(),
             "background.blur.enabled",
             serde_json::json!(false),
         );
@@ -4585,6 +4660,28 @@ radius = 10
             "{resp:?}"
         );
         assert_eq!(preset, Preset::default());
+    }
+
+    /// A live `set` opens a relative image path next to the config file,
+    /// exactly as the preset build does.
+    #[cfg(feature = "image-fill")]
+    #[test]
+    fn set_resolves_relative_image_paths_against_the_config_base() {
+        let base = ConfigBase::for_config(Some(std::path::Path::new("/etc/ff/fluxframe.toml")));
+        let table = toml::Value::Table(
+            toml::from_str("enabled = false\npath = \"bg.png\"").expect("valid TOML"),
+        );
+        let params = live_effect_params(
+            "image_fill",
+            Some(&table),
+            effect_metadata(SubchainKind::Background, "image_fill"),
+            &base,
+        )
+        .expect("params resolve");
+        assert_eq!(
+            params,
+            toml::Value::Table(toml::from_str("path = \"/etc/ff/bg.png\"").expect("valid TOML"))
+        );
     }
 
     /// Preset for the `set_enabled` tests: `color_fill` without a table,
@@ -4797,9 +4894,12 @@ radius = 10
         let per_effect: std::collections::BTreeMap<String, toml::Value> =
             toml::from_str("[color_fill]\nenabled = false\n").expect("valid TOML");
         let names = ["vignette".to_string(), "color_fill".to_string()];
-        let Ok(payload) =
-            build_and_configure_subchain(SubchainKind::Background, &names, &per_effect)
-        else {
+        let Ok(payload) = build_and_configure_subchain(
+            SubchainKind::Background,
+            &names,
+            &per_effect,
+            &ConfigBase::default(),
+        ) else {
             panic!("rebuild must succeed for a flag-only table");
         };
         let fluxframe_effects::composite::SubChainPayload::Background(slots) = payload else {
@@ -4910,6 +5010,7 @@ mod default_synthesis_tests {
             SubchainKind::Background,
             &["color_fill".to_string()],
             &per_effect,
+            &ConfigBase::default(),
         );
         assert!(
             result.is_ok(),
@@ -4927,6 +5028,7 @@ mod default_synthesis_tests {
             SubchainKind::Background,
             &["image_fill".to_string()],
             &per_effect,
+            &ConfigBase::default(),
         ) else {
             panic!("image_fill should fail without an explicit path")
         };

@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 
 use fluxframe_core::error::EffectError;
+use fluxframe_core::paths::ConfigBase;
 use fluxframe_core::{EffectMetadata, PipelineSection, resolve_effect_params};
 
 use crate::composite::effect::{CompositeEffect, Slot, SubEffectAdapter};
@@ -62,7 +63,8 @@ impl<'a> CompositeBuilder<'a> {
     /// before the alpha composite), and for the foreground it means
     /// the original frame stays as the foreground. `post` is the
     /// mask-aware post-composite chain (`auto_frame`, …); `None`
-    /// means an empty chain.
+    /// means an empty chain. Relative paths in the sections (the model,
+    /// image parameters) are resolved against `base`.
     ///
     /// # Errors
     ///
@@ -75,19 +77,20 @@ impl<'a> CompositeBuilder<'a> {
         background: Option<&PipelineSection>,
         foreground: Option<&PipelineSection>,
         post: Option<&PipelineSection>,
+        base: &ConfigBase,
     ) -> Result<CompositeEffect, EffectError> {
-        let segmentation = build_segmentation(mask)?;
-        let mask_chain = build_mask_chain(self.mask, mask)?;
+        let segmentation = build_segmentation(mask, base)?;
+        let mask_chain = build_mask_chain(self.mask, mask, base)?;
         let bg_chain = match background {
-            Some(section) => build_plane_chain(self.plane, section, "background")?,
+            Some(section) => build_plane_chain(self.plane, section, "background", base)?,
             None => Vec::new(),
         };
         let fg_chain = match foreground {
-            Some(section) => build_plane_chain(self.plane, section, "foreground")?,
+            Some(section) => build_plane_chain(self.plane, section, "foreground", base)?,
             None => Vec::new(),
         };
         let post_chain = match post {
-            Some(section) => build_post_chain(self.post, section)?,
+            Some(section) => build_post_chain(self.post, section, base)?,
             None => Vec::new(),
         };
         let composite =
@@ -104,7 +107,10 @@ impl<'a> CompositeBuilder<'a> {
     }
 }
 
-fn build_segmentation(section: &PipelineSection) -> Result<SegmentationBase, EffectError> {
+fn build_segmentation(
+    section: &PipelineSection,
+    base: &ConfigBase,
+) -> Result<SegmentationBase, EffectError> {
     let Some(model) = section.model.as_ref() else {
         return Err(EffectError::InvalidConfig {
             name: "mask".to_string(),
@@ -113,7 +119,7 @@ fn build_segmentation(section: &PipelineSection) -> Result<SegmentationBase, Eff
         });
     };
     let cfg = SegmentationConfig {
-        model: model.clone(),
+        model: base.resolve(model).into_owned(),
         fallback_threshold: section
             .fallback_threshold
             .unwrap_or(DEFAULT_FALLBACK_THRESHOLD),
@@ -125,47 +131,52 @@ fn build_segmentation(section: &PipelineSection) -> Result<SegmentationBase, Eff
 fn build_mask_chain(
     registry: &MaskEffectRegistry,
     section: &PipelineSection,
+    base: &ConfigBase,
 ) -> Result<Vec<Slot<dyn fluxframe_core::plane::MaskEffect>>, EffectError> {
     reject_unknown_table_keys(&section.per_effect, &section.chain, "mask")?;
     let chain = registry.build_chain(&section.chain)?;
-    configure_chain(chain, section, |name| registry.metadata(name))
+    configure_chain(chain, section, |name| registry.metadata(name), base)
 }
 
 fn build_plane_chain(
     registry: &PlaneEffectRegistry,
     section: &PipelineSection,
     section_name: &str,
+    base: &ConfigBase,
 ) -> Result<Vec<Slot<dyn fluxframe_core::plane::PlaneEffect>>, EffectError> {
     reject_unknown_table_keys(&section.per_effect, &section.chain, section_name)?;
     let chain = registry.build_chain(&section.chain)?;
-    configure_chain(chain, section, |name| registry.metadata(name))
+    configure_chain(chain, section, |name| registry.metadata(name), base)
 }
 
 fn build_post_chain(
     registry: &PostEffectRegistry,
     section: &PipelineSection,
+    base: &ConfigBase,
 ) -> Result<Vec<Slot<dyn fluxframe_core::plane::PostEffect>>, EffectError> {
     reject_unknown_table_keys(&section.per_effect, &section.chain, "post")?;
     let chain = registry.build_chain(&section.chain)?;
-    configure_chain(chain, section, |name| registry.metadata(name))
+    configure_chain(chain, section, |name| registry.metadata(name), base)
 }
 
 /// Configure every effect of `chain` (built from `section.chain`, in
 /// the same order) from its table in `section.per_effect`, resolved by
-/// [`resolve_effect_params`] — the same resolution the live `set_chain`
-/// path uses, so a preset behaves identically at startup and after an
-/// edit. Each effect is paired with its `enabled` flag.
+/// [`resolve_effect_params`] against `base` — the same resolution the
+/// live `set_chain` path uses, so a preset behaves identically at
+/// startup and after an edit. Each effect is paired with its `enabled`
+/// flag.
 fn configure_chain<E: ?Sized + SubEffectAdapter>(
     chain: Vec<Box<E>>,
     section: &PipelineSection,
     metadata: impl Fn(&str) -> Option<&'static EffectMetadata>,
+    base: &ConfigBase,
 ) -> Result<Vec<Slot<E>>, EffectError> {
     chain
         .into_iter()
         .zip(&section.chain)
         .map(|(mut effect, name)| {
             let resolved =
-                resolve_effect_params(name, section.per_effect.get(name), metadata(name))?;
+                resolve_effect_params(name, section.per_effect.get(name), metadata(name), base)?;
             effect.configure_mut(resolved.params)?;
             Ok(Slot::new(effect, resolved.enabled))
         })
@@ -226,7 +237,7 @@ mod tests {
     #[test]
     fn build_segmentation_requires_model() {
         let section = parse("");
-        let res = build_segmentation(&section);
+        let res = build_segmentation(&section, &ConfigBase::default());
         let Err(err) = res else {
             panic!("expected error");
         };
@@ -247,7 +258,7 @@ radius = 3
 "#,
         );
         let reg = default_mask_registry();
-        let chain = build_mask_chain(&reg, &section).expect("ok");
+        let chain = build_mask_chain(&reg, &section, &ConfigBase::default()).expect("ok");
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].effect().name(), "threshold");
         assert_eq!(chain[1].effect().name(), "feather");
@@ -269,7 +280,8 @@ enabled = false
 "#,
         );
         let reg = default_plane_registry();
-        let chain = build_plane_chain(&reg, &section, "background").expect("ok");
+        let chain =
+            build_plane_chain(&reg, &section, "background", &ConfigBase::default()).expect("ok");
         assert!(chain.iter().all(|slot| !slot.is_enabled()));
     }
 
@@ -283,7 +295,8 @@ enabled = "off"
 "#,
         );
         let reg = default_plane_registry();
-        let Err(err) = build_plane_chain(&reg, &section, "background") else {
+        let Err(err) = build_plane_chain(&reg, &section, "background", &ConfigBase::default())
+        else {
             panic!("expected error");
         };
         assert!(format!("{err}").contains("must be a boolean"), "{err}");
@@ -299,7 +312,7 @@ level = 0.5
 "#,
         );
         let reg = default_mask_registry();
-        let Err(err) = build_mask_chain(&reg, &section) else {
+        let Err(err) = build_mask_chain(&reg, &section, &ConfigBase::default()) else {
             panic!("expected error");
         };
         assert!(format!("{err}").contains("threhold"));
@@ -313,7 +326,7 @@ chain = ["nope"]
 "#,
         );
         let reg = default_mask_registry();
-        let Err(err) = build_mask_chain(&reg, &section) else {
+        let Err(err) = build_mask_chain(&reg, &section, &ConfigBase::default()) else {
             panic!("expected error");
         };
         assert!(format!("{err}").contains("nope"));
@@ -329,7 +342,8 @@ rgb = [10, 20, 30]
 "#,
         );
         let reg = default_plane_registry();
-        let chain = build_plane_chain(&reg, &section, "background").expect("ok");
+        let chain =
+            build_plane_chain(&reg, &section, "background", &ConfigBase::default()).expect("ok");
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].effect().name(), "color_fill");
     }
@@ -356,10 +370,25 @@ rgb = [0, 120, 215]
         let post_reg = default_post_registry();
         let builder = CompositeBuilder::new(&mask_reg, &plane_reg, &post_reg);
         let composite = builder
-            .build(&mask, Some(&background), None, None)
+            .build(&mask, Some(&background), None, None, &ConfigBase::default())
             .expect("ok");
         // `composite.name()` is the stable identifier — confirm the
         // constructor wired through.
         assert_eq!(composite.name(), CompositeEffect::NAME);
+    }
+
+    /// A relative model path means "next to the config file", whatever
+    /// directory the daemon runs in.
+    #[test]
+    fn relative_model_path_resolves_against_the_config_base() {
+        let section = parse(r#"model = "models/m.onnx""#);
+        let base = ConfigBase::for_config(Some(std::path::Path::new("/etc/ff/fluxframe.toml")));
+        let Ok(segmentation) = build_segmentation(&section, &base) else {
+            panic!("a relative model path must build");
+        };
+        assert_eq!(
+            segmentation.model_path(),
+            std::path::Path::new("/etc/ff/models/m.onnx")
+        );
     }
 }
