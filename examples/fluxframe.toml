@@ -1,0 +1,172 @@
+# FluxFrame example configuration.
+#
+# Copy to ~/.config/fluxframe/fluxframe.toml and adjust the input mode
+# to your camera. Every key is documented in doc/user/configuration.md;
+# effects and their parameters in doc/user/presets-and-effects.md.
+#
+# Relative paths (the model below) are resolved against the daemon's
+# working directory. Either start fluxframe from ~/.config/fluxframe
+# or replace them with absolute paths.
+
+[input]
+# "auto" picks the first available camera; use a path such as
+# "/dev/video0" to pin a specific one.
+device = "auto"
+# Must be a mode the camera supports: v4l2-ctl --list-formats-ext
+# Processing cost grows with the frame area; the segmentation model
+# itself always runs at 256x256.
+width = 800
+height = 448
+fps = 30
+
+[output]
+# v4l2loopback device created with video_nr=10.
+device = "/dev/video10"
+# RGB is cheaper than YUY2 and avoids colour banding.
+format = "RGB"
+scale = 1.0
+
+[realtime]
+# 0 = automatic (2 threads).
+processing_threads = 0
+metrics_interval_secs = 30
+
+[logging]
+level = "info"
+
+# Required by fluxframe-gui.
+[control]
+enabled = true
+
+# Release the camera when no application reads the virtual camera.
+[idle]
+enabled = true
+placeholder = "color"
+placeholder_rgb = [16, 16, 16]
+teardown_secs = 5
+
+# ---------------------------------------------------------------------------
+# Presets. `fluxframe run` uses "default" unless --preset is given.
+# ---------------------------------------------------------------------------
+
+# Neutral grey background.
+[presets.default.mask]
+model = "./models/selfie_segmentation.onnx"
+chain = ["smooth_temporal", "threshold", "largest_blob", "feather"]
+
+[presets.default.mask.smooth_temporal]
+factor = 0.85
+
+[presets.default.mask.threshold]
+level = 0.8
+
+[presets.default.mask.largest_blob]
+level = 0.5
+
+[presets.default.mask.feather]
+radius = 2
+
+[presets.default.background]
+chain = ["color_fill"]
+
+[presets.default.background.color_fill]
+rgb = [128, 128, 128]
+
+# Blurred background.
+[presets.blur.mask]
+model = "./models/selfie_segmentation.onnx"
+chain = ["smooth_temporal", "threshold", "largest_blob", "feather"]
+
+[presets.blur.mask.smooth_temporal]
+factor = 0.85
+
+[presets.blur.mask.threshold]
+level = 0.8
+
+[presets.blur.mask.largest_blob]
+level = 0.5
+
+[presets.blur.mask.feather]
+radius = 4
+
+[presets.blur.background]
+chain = ["blur"]
+
+[presets.blur.background.blur]
+radius = 20
+passes = 1
+downscale = 1
+
+# Work call: blurred and vignetted room, brightened and sharpened speaker.
+[presets.work.mask]
+model = "./models/selfie_segmentation.onnx"
+chain = ["smooth_temporal", "threshold", "largest_blob", "feather"]
+
+[presets.work.mask.smooth_temporal]
+factor = 0.85
+
+[presets.work.mask.threshold]
+level = 0.8
+
+[presets.work.mask.largest_blob]
+level = 0.5
+
+[presets.work.mask.feather]
+radius = 4
+
+[presets.work.background]
+chain = ["blur", "vignette"]
+
+[presets.work.background.blur]
+radius = 20
+passes = 1
+downscale = 1
+
+[presets.work.background.vignette]
+strength = 0.3
+inner_radius = 0.5
+
+[presets.work.foreground]
+chain = ["exposure_correct", "sharpen"]
+
+[presets.work.foreground.exposure_correct]
+target_brightness = 0.55
+
+[presets.work.foreground.sharpen]
+amount = 0.3
+
+# Automatic framing around the speaker over a blurred background,
+# mirrored so that text behind you reads correctly for the audience.
+[presets.framed.mask]
+model = "./models/selfie_segmentation.onnx"
+chain = ["smooth_temporal", "threshold", "largest_blob", "feather"]
+
+[presets.framed.mask.smooth_temporal]
+factor = 0.85
+
+[presets.framed.mask.threshold]
+level = 0.8
+
+[presets.framed.mask.largest_blob]
+level = 0.5
+
+[presets.framed.mask.feather]
+radius = 3
+
+[presets.framed.background]
+chain = ["blur"]
+
+[presets.framed.background.blur]
+radius = 20
+
+[presets.framed.post]
+chain = ["auto_frame", "mirror"]
+
+[presets.framed.post.auto_frame]
+threshold = 0.5
+padding = 0.15
+smoothing = 0.95
+zoom_max = 1.3
+
+# Camera image without processing.
+[presets.raw]

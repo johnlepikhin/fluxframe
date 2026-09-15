@@ -17,8 +17,11 @@ Revert. Idle mode drops the camera + publishes a placeholder when
 no consumer is reading from `/dev/video10`.
 
 Per-stage detail: `doc/plan/000-overview.md` and `doc/plan/stage-*.md`.
-Original spec: `doc/ideas/001-mvp.md`. README.md is the operator-
-facing summary.
+Original spec: `doc/ideas/001-mvp.md`. User documentation: README.md
+(overview + quick start) and `doc/user/*.md` (installation, configuration,
+presets and effects, running, idle mode, GUI, control socket, performance,
+troubleshooting); commented sample config in `examples/fluxframe.toml`.
+Keep them in sync when changing config keys, effects, CLI or protocol.
 
 ## Workspace layout
 
@@ -34,7 +37,7 @@ Spec §7 prescribes 9 crates; the 5-crate split is a deliberate scope decision d
 
 ## Dev environment (Guix)
 
-Two supported setups (see `README.md` for the full instructions):
+Two supported setups (see `doc/user/installation.md` for the full instructions):
 
 1. **Dev shell:** `guix shell -m manifest.scm` then `cargo …`.
 2. **Persistent install:** `guix install gstreamer gst-plugins-base gst-plugins-good glib`, then extend `PKG_CONFIG_PATH` so it covers `~/.guix-profile/lib/pkgconfig` in addition to whatever `guix home` already sets.
