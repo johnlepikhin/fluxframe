@@ -327,7 +327,9 @@ mod tests {
         assert_eq!(
             next_failure_backoff(
                 Some(BASE),
-                long_enough - Duration::from_millis(1),
+                long_enough
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("reset threshold is far above 1 ms"),
                 BASE,
                 MAX
             ),
