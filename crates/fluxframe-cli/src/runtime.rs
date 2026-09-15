@@ -118,6 +118,7 @@ fn command_label(cmd: &ControlCommand) -> &'static str {
         ControlCommand::SetPreset { .. } => "set_preset",
         ControlCommand::Set { .. } => "set",
         ControlCommand::SetChain { .. } => "set_chain",
+        ControlCommand::SetEnabled { .. } => "set_enabled",
         ControlCommand::Reload => "reload",
         ControlCommand::SavePreset => "save_preset",
         ControlCommand::SavePresetAs { .. } => "save_preset_as",
@@ -142,6 +143,7 @@ fn apply_control_command(
     chain: &mut EffectChain,
     active_preset_name: &mut String,
     active_preset: &mut Preset,
+    telemetry: &fluxframe_core::EffectTelemetry,
     cmd: ControlCommand,
 ) -> ControlResponse {
     match cmd {
@@ -191,7 +193,12 @@ fn apply_control_command(
         ControlCommand::SetChain {
             section,
             chain: new_names,
-        } => apply_set_chain_command(chain, active_preset, section, &new_names),
+        } => apply_set_chain_command(chain, active_preset, telemetry, section, &new_names),
+        ControlCommand::SetEnabled {
+            section,
+            effect,
+            enabled,
+        } => apply_set_enabled_command(chain, active_preset, telemetry, section, &effect, enabled),
         ControlCommand::GetConfig { path } => {
             apply_get_config_command(active_preset, path.as_deref())
         }
@@ -490,6 +497,15 @@ fn apply_set_command(
         Ok(p) => p,
         Err(e) => return ControlResponse::err(e, None),
     };
+    if set_path.field == fluxframe_core::EFFECT_ENABLED_KEY {
+        return ControlResponse::err(
+            format!(
+                "`{}` is not an effect parameter",
+                fluxframe_core::EFFECT_ENABLED_KEY
+            ),
+            Some("use set_enabled to switch an effect on or off".into()),
+        );
+    }
     let toml_value = match crate::control::commands::json_to_toml(value) {
         Ok(v) => v,
         Err(e) => return ControlResponse::err(e, None),
@@ -541,12 +557,14 @@ fn apply_set_command(
         _ => toml::Table::new(),
     };
     effect_table.insert(set_path.field.clone(), toml_value);
-    let merged_params: fluxframe_core::traits::RawEffectParams =
-        toml::Value::Table(effect_table.clone());
+    let merged_entry = toml::Value::Table(effect_table);
+    let result = live_effect_params(&set_path.effect, Some(&merged_entry)).and_then(|params| {
+        chain.reconfigure_named_effect(set_path.section, &set_path.effect, params)
+    });
     section_mut
         .per_effect
-        .insert(set_path.effect.clone(), toml::Value::Table(effect_table));
-    match chain.reconfigure_named_effect(set_path.section, &set_path.effect, merged_params) {
+        .insert(set_path.effect.clone(), merged_entry);
+    match result {
         Ok(()) => {
             info!(
                 section = %set_path.section,
@@ -577,17 +595,14 @@ fn apply_set_command(
             }
             // Best-effort revert of the live effect: reconfigure with
             // the ORIGINAL params so an effect that already swapped
-            // its `self.config` rolls back. Build a TOML table from
-            // `original_entry` (or an empty one) and replay. If this
-            // second call also fails, log a warn — we cannot do
-            // better without tearing the chain down.
-            let revert_params: fluxframe_core::traits::RawEffectParams = match original_entry {
-                Some(toml::Value::Table(t)) => toml::Value::Table(t),
-                _ => toml::Value::Table(toml::Table::new()),
-            };
-            if let Err(revert_err) =
-                chain.reconfigure_named_effect(set_path.section, &set_path.effect, revert_params)
-            {
+            // its `self.config` rolls back. Replay `original_entry` (or
+            // an empty table). If this second call also fails, log a
+            // warn — we cannot do better without tearing the chain down.
+            let revert =
+                live_effect_params(&set_path.effect, original_entry.as_ref()).and_then(|params| {
+                    chain.reconfigure_named_effect(set_path.section, &set_path.effect, params)
+                });
+            if let Err(revert_err) = revert {
                 warn!(
                     section = %set_path.section,
                     effect = %set_path.effect,
@@ -602,15 +617,20 @@ fn apply_set_command(
             // means someone else populated it concurrently or the Set
             // partially succeeded, and we should leave it alone.
             revert_absent_section_if_empty(active_preset, set_path.section, was_absent);
-            let (reason, hint) = match &e {
-                fluxframe_core::EffectError::InvalidConfig { reason, hint, .. } => {
-                    (reason.clone(), hint.clone())
-                }
-                other => (format!("{other}"), None),
-            };
-            ControlResponse::err(reason, hint)
+            effect_error_response(&e)
         }
     }
+}
+
+/// Parameters a live effect is reconfigured with for its preset table
+/// `table`: the table without the `enabled` flag, which is not an
+/// effect parameter. An absent table yields an empty one, so the
+/// effect's serde defaults apply.
+fn live_effect_params(
+    effect: &str,
+    table: Option<&toml::Value>,
+) -> Result<fluxframe_core::traits::RawEffectParams, fluxframe_core::EffectError> {
+    fluxframe_core::split_effect_table(effect, table).map(|(_, params)| toml::Value::Table(params))
 }
 
 /// Mutable handle to the `[mask]` sub-section of `preset`. Returns
@@ -684,6 +704,7 @@ fn ensure_plane_or_post_section_mut(
 fn apply_set_chain_command(
     chain: &mut EffectChain,
     active_preset: &mut Preset,
+    telemetry: &fluxframe_core::EffectTelemetry,
     section: SubchainKind,
     new_names: &[String],
 ) -> ControlResponse {
@@ -719,9 +740,11 @@ fn apply_set_chain_command(
     } else {
         ensure_plane_or_post_section_mut(active_preset, section)
     };
-    // Build new effects + configure them. The old `per_effect` payload
-    // is reused when present; otherwise an empty TOML table feeds
-    // the effect its serde defaults.
+    // Effects that leave the chain stop reporting stage timings; their
+    // last samples are dropped once the swap succeeds.
+    let old_names = section_data.chain.clone();
+    // Build new effects + configure them from the existing `per_effect`
+    // tables (metadata defaults when an effect has none).
     let result = build_and_configure_subchain(section, new_names, &section_data.per_effect);
     let payload = match result {
         Ok(o) => o,
@@ -761,9 +784,18 @@ fn apply_set_chain_command(
             // into `per_effect`; keep them so a future Set on a mask
             // sub-section stays intact.
             section_data.per_effect.retain(|key, _| {
-                new_names.iter().any(|n| n == key) || is_reserved_per_effect_key(key)
+                new_names.iter().any(|n| n == key)
+                    || fluxframe_core::PipelineSection::is_reserved_key(key)
             });
-            info!(section = %section, chain = ?new_names, "control: replaced sub-chain");
+            for gone in old_names.iter().filter(|n| !new_names.contains(n)) {
+                telemetry.forget_stage(section.as_str(), gone);
+            }
+            info!(
+                section = %section,
+                chain = ?new_names,
+                disabled = ?composite.disabled_effects(section),
+                "control: replaced sub-chain"
+            );
             ControlResponse::ok()
         }
         Err(e) => {
@@ -774,18 +806,6 @@ fn apply_set_chain_command(
             )
         }
     }
-}
-
-/// Mirror of `composite::builder::PIPELINE_RESERVED_KEYS`: keys that
-/// are NOT effect names but may legitimately appear in `per_effect`
-/// (e.g. `model` for the mask section). Pruning logic in
-/// [`apply_set_chain_command`] keeps these even when they are not in
-/// the active chain so a future Set on a mask field is preserved.
-fn is_reserved_per_effect_key(key: &str) -> bool {
-    matches!(
-        key,
-        "chain" | "model" | "model_config" | "fallback_threshold"
-    )
 }
 
 /// Whether the given sub-section of `preset` is currently `None`.
@@ -851,6 +871,7 @@ fn revert_absent_section_if_empty(
 fn apply_set_chain_command(
     _chain: &mut EffectChain,
     _active_preset: &mut Preset,
+    _telemetry: &fluxframe_core::EffectTelemetry,
     _section: SubchainKind,
     _new_names: &[String],
 ) -> ControlResponse {
@@ -858,6 +879,118 @@ fn apply_set_chain_command(
         "set_chain unavailable: built without ml feature",
         Some("rebuild with `--features fluxframe-cli/ml` to enable composite live-reconfig".into()),
     )
+}
+
+/// Apply `set_enabled <section> <effect> <enabled>`: bypass (or run
+/// again) every chain entry named `effect`, then record the flag in the
+/// active preset so `get_config` and Save see it. The live chain is
+/// toggled first; the preset is only touched once that succeeded.
+///
+/// Canonical form in the preset: `enabled = false` in the effect table
+/// when disabled, no key when enabled — and a table left empty by
+/// removing the key is dropped, so off→on restores the original preset.
+#[cfg(feature = "ml")]
+fn apply_set_enabled_command(
+    chain: &mut EffectChain,
+    active_preset: &mut Preset,
+    telemetry: &fluxframe_core::EffectTelemetry,
+    section: SubchainKind,
+    effect: &str,
+    enabled: bool,
+) -> ControlResponse {
+    use fluxframe_core::EFFECT_ENABLED_KEY;
+
+    let section_data = match section {
+        SubchainKind::Mask => active_preset.mask.as_mut(),
+        SubchainKind::Background => active_preset.background.as_mut(),
+        SubchainKind::Foreground => active_preset.foreground.as_mut(),
+        SubchainKind::Post => active_preset.post.as_mut(),
+    };
+    let Some(section_data) = section_data else {
+        return ControlResponse::err(
+            format!("preset does not have a [{section}] sub-section"),
+            Some(format!("add effects to [{section}] before toggling them")),
+        );
+    };
+    if !section_data.chain.iter().any(|name| name == effect) {
+        return ControlResponse::err(
+            format!("no effect named '{effect}' in the '{section}' chain"),
+            Some(format!("chain: {}", section_data.chain.join(", "))),
+        );
+    }
+    if section_data
+        .per_effect
+        .get(effect)
+        .is_some_and(|entry| !entry.is_table())
+    {
+        return ControlResponse::err(
+            format!("[{section}.{effect}] is not a table"),
+            Some("fix the preset in fluxframe.toml and reload".into()),
+        );
+    }
+
+    let changed = match chain.set_effect_enabled(section, effect, enabled) {
+        Ok(changed) => changed,
+        Err(e) => {
+            tracing::debug!(
+                section = %section,
+                effect,
+                enabled,
+                error = %e,
+                "control: set_enabled rejected",
+            );
+            return effect_error_response(&e);
+        }
+    };
+
+    if enabled {
+        if let Some(toml::Value::Table(table)) = section_data.per_effect.get_mut(effect) {
+            table.remove(EFFECT_ENABLED_KEY);
+            if table.is_empty() {
+                section_data.per_effect.remove(effect);
+            }
+        }
+    } else {
+        let entry = section_data
+            .per_effect
+            .entry(effect.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(table) = entry {
+            table.insert(EFFECT_ENABLED_KEY.into(), toml::Value::Boolean(false));
+        }
+        // The stage stops running; do not keep reporting its last samples.
+        telemetry.forget_stage(section.as_str(), effect);
+    }
+    info!(section = %section, effect, enabled, changed, "control: toggled effect");
+    ControlResponse::ok()
+}
+
+/// Slim-build stub for `set_enabled`: the composite is `ml`-gated.
+#[cfg(not(feature = "ml"))]
+fn apply_set_enabled_command(
+    _chain: &mut EffectChain,
+    _active_preset: &mut Preset,
+    _telemetry: &fluxframe_core::EffectTelemetry,
+    _section: SubchainKind,
+    _effect: &str,
+    _enabled: bool,
+) -> ControlResponse {
+    ControlResponse::err(
+        "set_enabled unavailable: built without ml feature",
+        Some("rebuild with `--features fluxframe-cli/ml` to enable composite live-reconfig".into()),
+    )
+}
+
+/// Error response for an [`fluxframe_core::EffectError`]: an
+/// `InvalidConfig` keeps its reason and hint, anything else is rendered
+/// whole.
+fn effect_error_response(e: &fluxframe_core::EffectError) -> ControlResponse {
+    match e {
+        fluxframe_core::EffectError::InvalidConfig { reason, hint, .. } => {
+            ControlResponse::err(reason.clone(), hint.clone())
+        }
+        other => ControlResponse::err(format!("{other}"), None),
+    }
 }
 
 /// Sub-error type the chain-build path can surface.
@@ -881,7 +1014,7 @@ fn build_and_configure_subchain(
     names: &[String],
     per_effect: &std::collections::BTreeMap<String, toml::Value>,
 ) -> Result<fluxframe_effects::composite::SubChainPayload, SubChainError> {
-    use fluxframe_effects::composite::SubChainPayload;
+    use fluxframe_effects::composite::{Slot, SubChainPayload};
     use fluxframe_effects::{mask_effects, plane_effects, post_effects};
 
     /// Local helper: trait object with a `configure()` method, used
@@ -920,175 +1053,95 @@ fn build_and_configure_subchain(
         }
     }
 
-    /// Synthesise a default TOML config for an effect that has no
-    /// explicit `per_effect` block in the incoming preset.
-    ///
-    /// Branches:
-    /// - metadata present + every required param has a default → emit a
-    ///   populated [`toml::Table`].
-    /// - metadata present but at least one required param has no
-    ///   default → return [`EffectError::InvalidConfig`] naming the
-    ///   missing field(s) verbatim so the GUI / TUI can surface them
-    ///   to the user (instead of the cryptic serde error that would
-    ///   otherwise come out of `configure`).
-    /// - metadata absent → programming error: registering an effect
-    ///   without `pub const METADATA: EffectMetadata` is forbidden;
-    ///   return an explicit `InvalidConfig` rather than silently
-    ///   passing an empty table down to `configure` (which is the
-    ///   exact failure mode this whole helper was added to eliminate).
-    fn synthesise_default(
-        name: &str,
-        lookup_metadata: impl Fn(&str) -> Option<&'static fluxframe_core::EffectMetadata>,
-    ) -> Result<toml::Value, fluxframe_core::EffectError> {
-        match lookup_metadata(name).map(fluxframe_core::EffectMetadata::default_config) {
-            Some(Ok(table)) => Ok(toml::Value::Table(table)),
-            Some(Err(missing)) => Err(fluxframe_core::EffectError::InvalidConfig {
-                // `name` is guaranteed by `build_chain` to be a registered
-                // snake_case literal; safe to surface in error/log messages.
-                name: name.to_string(),
-                reason: format!(
-                    "missing required field(s) {}; set them via the parameter editor \
-                     (or in fluxframe.toml) before adding this effect to a chain",
-                    missing
-                        .iter()
-                        .map(|f| format!("`{f}`"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ),
-                hint: Some(format!(
-                    "set the following field(s) on `{name}` explicitly, \
-                     e.g. via the parameter editor: {}",
-                    missing
-                        .iter()
-                        .map(|f| format!("`{f}`"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                )),
-            }),
-            None => Err(fluxframe_core::EffectError::InvalidConfig {
-                // `name` is guaranteed by `build_chain` to be a registered
-                // snake_case literal; safe to surface in error/log messages.
-                name: name.to_string(),
-                reason: "effect is registered without metadata; cannot synthesise defaults".into(),
-                hint: Some(
-                    "this is a programming error — every effect must declare \
-                     `pub const METADATA: EffectMetadata`. Please file a bug."
-                        .into(),
-                ),
-            }),
-        }
-    }
-
+    /// Configure each built effect and pair it with its `enabled` flag.
     fn configure_each<E>(
-        chain: &mut [Box<E>],
+        chain: Vec<Box<E>>,
         names: &[String],
         per_effect: &std::collections::BTreeMap<String, toml::Value>,
         lookup_metadata: impl Fn(&str) -> Option<&'static fluxframe_core::EffectMetadata>,
-    ) -> Result<(), fluxframe_core::EffectError>
+    ) -> Result<Vec<Slot<E>>, SubChainError>
     where
         E: ?Sized + Configure,
     {
-        for (effect, name) in chain.iter_mut().zip(names.iter()) {
-            // No explicit per_effect block — happens when a chain
-            // entry was added via the GUI (`Command::SetChain`
-            // with just names). Synthesise a default config from
-            // the effect's metadata so we don't hand `configure`
-            // an empty table that fails for required-field
-            // structs (color_fill.rgb, image_fill.path).
-            let params = if let Some(v) = per_effect.get(name).cloned() {
-                v
-            } else {
-                tracing::debug!(effect = %name, "synthesising default config from metadata");
-                synthesise_default(name, &lookup_metadata)?
-            };
-            effect.configure_mut(params)?;
-        }
-        Ok(())
+        chain
+            .into_iter()
+            .zip(names.iter())
+            .map(|(mut effect, name)| {
+                // An effect added via the GUI (`Command::SetChain` with
+                // just names) has no table, or only an `enabled` flag;
+                // the resolver synthesises its metadata defaults so
+                // `configure` never sees an empty table for
+                // required-field structs (color_fill.rgb, image_fill.path).
+                let resolved = fluxframe_core::resolve_effect_params(
+                    name,
+                    per_effect.get(name),
+                    lookup_metadata(name),
+                )
+                .map_err(configure_error)?;
+                effect
+                    .configure_mut(resolved.params)
+                    .map_err(configure_error)?;
+                Ok(Slot::new(effect, resolved.enabled))
+            })
+            .collect()
     }
+
+    fn configure_error(e: fluxframe_core::EffectError) -> SubChainError {
+        match e {
+            fluxframe_core::EffectError::InvalidConfig { reason, hint, .. } => {
+                SubChainError { reason, hint }
+            }
+            other => SubChainError {
+                reason: format!("configure failed: {other}"),
+                hint: None,
+            },
+        }
+    }
+
+    fn build_error(section: SubchainKind, e: &fluxframe_core::EffectError) -> SubChainError {
+        SubChainError {
+            reason: format!("{section} chain build failed: {e}"),
+            hint: None,
+        }
+    }
+
     match section {
         SubchainKind::Mask => {
             let registry = mask_effects::default_registry();
-            let mut built = registry.build_chain(names).map_err(|e| SubChainError {
-                reason: format!("mask chain build failed: {e}"),
-                hint: None,
-            })?;
-            configure_each::<dyn fluxframe_core::MaskEffect>(&mut built, names, per_effect, |n| {
-                registry.metadata(n)
-            })
-            .map_err(|e| match &e {
-                fluxframe_core::EffectError::InvalidConfig { reason, hint, .. } => SubChainError {
-                    reason: reason.clone(),
-                    hint: hint.clone(),
-                },
-                _ => SubChainError {
-                    reason: format!("configure failed: {e}"),
-                    hint: None,
-                },
-            })?;
-            Ok(SubChainPayload::Mask(built))
+            let built = registry
+                .build_chain(names)
+                .map_err(|e| build_error(section, &e))?;
+            let slots =
+                configure_each::<dyn fluxframe_core::MaskEffect>(built, names, per_effect, |n| {
+                    registry.metadata(n)
+                })?;
+            Ok(SubChainPayload::Mask(slots))
         }
-        SubchainKind::Background => {
+        SubchainKind::Background | SubchainKind::Foreground => {
             let registry = plane_effects::default_registry();
-            let mut built = registry.build_chain(names).map_err(|e| SubChainError {
-                reason: format!("background chain build failed: {e}"),
-                hint: None,
-            })?;
-            configure_each::<dyn fluxframe_core::PlaneEffect>(&mut built, names, per_effect, |n| {
-                registry.metadata(n)
+            let built = registry
+                .build_chain(names)
+                .map_err(|e| build_error(section, &e))?;
+            let slots =
+                configure_each::<dyn fluxframe_core::PlaneEffect>(built, names, per_effect, |n| {
+                    registry.metadata(n)
+                })?;
+            Ok(if section == SubchainKind::Background {
+                SubChainPayload::Background(slots)
+            } else {
+                SubChainPayload::Foreground(slots)
             })
-            .map_err(|e| match &e {
-                fluxframe_core::EffectError::InvalidConfig { reason, hint, .. } => SubChainError {
-                    reason: reason.clone(),
-                    hint: hint.clone(),
-                },
-                _ => SubChainError {
-                    reason: format!("configure failed: {e}"),
-                    hint: None,
-                },
-            })?;
-            Ok(SubChainPayload::Background(built))
-        }
-        SubchainKind::Foreground => {
-            let registry = plane_effects::default_registry();
-            let mut built = registry.build_chain(names).map_err(|e| SubChainError {
-                reason: format!("foreground chain build failed: {e}"),
-                hint: None,
-            })?;
-            configure_each::<dyn fluxframe_core::PlaneEffect>(&mut built, names, per_effect, |n| {
-                registry.metadata(n)
-            })
-            .map_err(|e| match &e {
-                fluxframe_core::EffectError::InvalidConfig { reason, hint, .. } => SubChainError {
-                    reason: reason.clone(),
-                    hint: hint.clone(),
-                },
-                _ => SubChainError {
-                    reason: format!("configure failed: {e}"),
-                    hint: None,
-                },
-            })?;
-            Ok(SubChainPayload::Foreground(built))
         }
         SubchainKind::Post => {
             let registry = post_effects::default_registry();
-            let mut built = registry.build_chain(names).map_err(|e| SubChainError {
-                reason: format!("post chain build failed: {e}"),
-                hint: None,
-            })?;
-            configure_each::<dyn fluxframe_core::PostEffect>(&mut built, names, per_effect, |n| {
-                registry.metadata(n)
-            })
-            .map_err(|e| match &e {
-                fluxframe_core::EffectError::InvalidConfig { reason, hint, .. } => SubChainError {
-                    reason: reason.clone(),
-                    hint: hint.clone(),
-                },
-                _ => SubChainError {
-                    reason: format!("configure failed: {e}"),
-                    hint: None,
-                },
-            })?;
-            Ok(SubChainPayload::Post(built))
+            let built = registry
+                .build_chain(names)
+                .map_err(|e| build_error(section, &e))?;
+            let slots =
+                configure_each::<dyn fluxframe_core::PostEffect>(built, names, per_effect, |n| {
+                    registry.metadata(n)
+                })?;
+            Ok(SubChainPayload::Post(slots))
         }
     }
 }
@@ -2578,6 +2631,7 @@ fn drain_control_commands(
             chain,
             &mut state.active_preset_name,
             &mut state.active_preset,
+            &state.frame_context.telemetry,
             envelope.cmd,
         );
         tracing::debug!(
@@ -4021,6 +4075,25 @@ mod tests {
     /// Build a chain containing one `PassthroughEffect`. Sufficient
     /// for tests that exercise the dispatcher control flow without
     /// caring about per-frame processing.
+    /// Chain holding a real composite built from `preset` (its mask
+    /// model path is never opened: nothing here calls `prepare`).
+    #[cfg(feature = "ml")]
+    fn composite_chain(preset: &Preset) -> StubEffectChain {
+        let mask_reg = fluxframe_effects::mask_effects::default_registry();
+        let plane_reg = fluxframe_effects::plane_effects::default_registry();
+        let post_reg = fluxframe_effects::post_effects::default_registry();
+        let composite =
+            fluxframe_effects::composite::CompositeBuilder::new(&mask_reg, &plane_reg, &post_reg)
+                .build(
+                    preset.mask.as_ref().expect("test preset has [mask]"),
+                    preset.background.as_ref(),
+                    preset.foreground.as_ref(),
+                    preset.post.as_ref(),
+                )
+                .expect("test composite builds");
+        StubEffectChain::new(vec![Box::new(composite)])
+    }
+
     fn stub_chain() -> StubEffectChain {
         StubEffectChain::new(vec![Box::new(PassthroughEffect::new())])
     }
@@ -4067,6 +4140,7 @@ mod tests {
             &mut chain,
             &mut name,
             &mut preset,
+            &fluxframe_core::EffectTelemetry::default(),
             ControlCommand::ListPresets,
         );
         let data = ok_payload(&resp);
@@ -4074,6 +4148,24 @@ mod tests {
         let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
         assert!(names.contains(&"a"), "names: {names:?}");
         assert!(names.contains(&"b"), "names: {names:?}");
+    }
+
+    /// The GUI decodes `list_effects` into `EffectSchema`; every
+    /// shipped effect's metadata must survive that decode unchanged.
+    #[test]
+    fn apply_list_effects_payload_decodes_into_effect_schema() {
+        let resp = apply_list_effects_command();
+        let data = ok_payload(&resp);
+        for section in fluxframe_core::SubchainKind::ALL {
+            let rows = data[section.as_str()].clone();
+            let decoded: Vec<fluxframe_core::EffectSchema> = serde_json::from_value(rows.clone())
+                .unwrap_or_else(|e| panic!("section '{section}' fails to decode: {e}"));
+            assert_eq!(
+                serde_json::to_value(&decoded).expect("re-serialise"),
+                rows,
+                "section '{section}' changes shape through EffectSchema"
+            );
+        }
     }
 
     #[test]
@@ -4222,6 +4314,7 @@ mod tests {
             &mut chain,
             &mut name,
             &mut preset,
+            &fluxframe_core::EffectTelemetry::default(),
             ControlCommand::SetPreset {
                 name: "missing".into(),
             },
@@ -4261,6 +4354,292 @@ mod tests {
             before, after,
             "in-memory preset must be unchanged after revert"
         );
+    }
+
+    /// Regression: `set` on an effect whose table carries
+    /// `enabled = false` handed the flag to `configure`, which
+    /// `deny_unknown_fields` configs (blur) reject — for both the write
+    /// and its revert.
+    #[cfg(feature = "ml")]
+    #[test]
+    fn apply_set_command_on_disabled_effect_ignores_enabled_flag() {
+        let mut preset: Preset = toml::from_str(
+            r#"
+[mask]
+model = "/tmp/dummy.onnx"
+chain = ["threshold"]
+
+[background]
+chain = ["blur"]
+
+[background.blur]
+enabled = false
+radius = 10
+"#,
+        )
+        .expect("test preset parses");
+        let mut chain = composite_chain(&preset);
+
+        let resp = apply_set_command(
+            &mut chain,
+            &mut preset,
+            "background.blur.passes",
+            serde_json::json!(3),
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }), "{resp:?}");
+        let blur = &preset.background.as_ref().unwrap().per_effect["blur"];
+        assert_eq!(blur.get("enabled"), Some(&toml::Value::Boolean(false)));
+        assert_eq!(blur.get("passes"), Some(&toml::Value::Integer(3)));
+
+        // A rejected write reverts to the flagged table without error.
+        let before = preset.clone();
+        let resp = apply_set_command(
+            &mut chain,
+            &mut preset,
+            "background.blur.passes",
+            serde_json::json!("many"),
+        );
+        assert!(matches!(resp, ControlResponse::Err { .. }), "{resp:?}");
+        assert_eq!(preset, before);
+    }
+
+    #[test]
+    fn apply_set_command_rejects_enabled_field() {
+        let mut chain = stub_chain();
+        let mut preset = Preset::default();
+        let resp = apply_set_command(
+            &mut chain,
+            &mut preset,
+            "background.blur.enabled",
+            serde_json::json!(false),
+        );
+        assert!(
+            err_reason(&resp).contains("not an effect parameter"),
+            "{resp:?}"
+        );
+        assert_eq!(preset, Preset::default());
+    }
+
+    /// Preset for the `set_enabled` tests: `color_fill` without a table,
+    /// `blur` with explicit params.
+    #[cfg(feature = "ml")]
+    fn toggle_preset() -> Preset {
+        toml::from_str(
+            r#"
+[mask]
+model = "/tmp/dummy.onnx"
+chain = ["threshold"]
+
+[background]
+chain = ["color_fill", "blur"]
+
+[background.blur]
+radius = 10
+"#,
+        )
+        .expect("test preset parses")
+    }
+
+    #[cfg(feature = "ml")]
+    fn live_disabled(chain: &mut StubEffectChain, section: SubchainKind) -> Vec<String> {
+        chain
+            .composite_mut()
+            .expect("chain hosts a composite")
+            .disabled_effects(section)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[cfg(feature = "ml")]
+    fn table(text: &str) -> toml::Value {
+        toml::Value::Table(toml::from_str(text).expect("valid TOML"))
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn apply_set_enabled_command_toggles_live_chain_and_canonical_preset() {
+        let original = toggle_preset();
+        let mut preset = original.clone();
+        let mut chain = composite_chain(&preset);
+        let stages = std::sync::Arc::new(fluxframe_core::StageTimings::with_capacity(4));
+        let telemetry =
+            fluxframe_core::EffectTelemetry::default().with_stages(std::sync::Arc::clone(&stages));
+        telemetry.record_stage(
+            fluxframe_core::StageKey::new("background", "color_fill"),
+            Duration::from_micros(5),
+        );
+        let bg = SubchainKind::Background;
+        let ok =
+            |resp: ControlResponse| assert!(matches!(resp, ControlResponse::Ok { .. }), "{resp:?}");
+
+        // No table yet: disabling creates `{ enabled = false }`.
+        ok(apply_set_enabled_command(
+            &mut chain,
+            &mut preset,
+            &telemetry,
+            bg,
+            "color_fill",
+            false,
+        ));
+        assert_eq!(live_disabled(&mut chain, bg), vec!["color_fill"]);
+        let per_effect = &preset.background.as_ref().unwrap().per_effect;
+        assert_eq!(per_effect["color_fill"], table("enabled = false"));
+        assert!(stages.snapshot().is_empty(), "disabled stage is forgotten");
+
+        // Explicit params survive a round of off/on.
+        ok(apply_set_enabled_command(
+            &mut chain,
+            &mut preset,
+            &telemetry,
+            bg,
+            "blur",
+            false,
+        ));
+        let per_effect = &preset.background.as_ref().unwrap().per_effect;
+        assert_eq!(per_effect["blur"], table("enabled = false\nradius = 10"));
+        ok(apply_set_enabled_command(
+            &mut chain,
+            &mut preset,
+            &telemetry,
+            bg,
+            "blur",
+            true,
+        ));
+        let per_effect = &preset.background.as_ref().unwrap().per_effect;
+        assert_eq!(per_effect["blur"], table("radius = 10"));
+
+        // Re-enabling drops the table that only held the flag, so the
+        // preset (and the GUI's dirty marker) returns to the original.
+        ok(apply_set_enabled_command(
+            &mut chain,
+            &mut preset,
+            &telemetry,
+            bg,
+            "color_fill",
+            true,
+        ));
+        assert!(live_disabled(&mut chain, bg).is_empty());
+        assert_eq!(preset, original);
+
+        // Enabling an enabled effect without a table does not create one.
+        ok(apply_set_enabled_command(
+            &mut chain,
+            &mut preset,
+            &telemetry,
+            bg,
+            "color_fill",
+            true,
+        ));
+        assert_eq!(preset, original);
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn apply_set_enabled_command_keeps_mask_segmentation_fields() {
+        let mut preset = toggle_preset();
+        let mut chain = composite_chain(&preset);
+        let telemetry = fluxframe_core::EffectTelemetry::default();
+        let resp = apply_set_enabled_command(
+            &mut chain,
+            &mut preset,
+            &telemetry,
+            SubchainKind::Mask,
+            "threshold",
+            false,
+        );
+        assert!(matches!(resp, ControlResponse::Ok { .. }), "{resp:?}");
+        let mask = preset.mask.as_ref().unwrap();
+        assert_eq!(
+            mask.model.as_deref(),
+            Some(std::path::Path::new("/tmp/dummy.onnx"))
+        );
+        assert_eq!(mask.per_effect["threshold"], table("enabled = false"));
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn apply_set_enabled_command_rejections_leave_preset_untouched() {
+        let base = toggle_preset();
+        let telemetry = fluxframe_core::EffectTelemetry::default();
+        let mut preset = base.clone();
+        let mut chain = composite_chain(&preset);
+
+        let resp = apply_set_enabled_command(
+            &mut chain,
+            &mut preset,
+            &telemetry,
+            SubchainKind::Background,
+            "vignette",
+            false,
+        );
+        assert!(err_reason(&resp).contains("no effect named"), "{resp:?}");
+        assert_eq!(preset, base);
+
+        let resp = apply_set_enabled_command(
+            &mut chain,
+            &mut preset,
+            &telemetry,
+            SubchainKind::Post,
+            "mirror",
+            false,
+        );
+        assert!(err_reason(&resp).contains("[post]"), "{resp:?}");
+        assert_eq!(preset, base);
+
+        preset
+            .background
+            .as_mut()
+            .unwrap()
+            .per_effect
+            .insert("color_fill".into(), toml::Value::Integer(1));
+        let malformed = preset.clone();
+        let resp = apply_set_enabled_command(
+            &mut chain,
+            &mut preset,
+            &telemetry,
+            SubchainKind::Background,
+            "color_fill",
+            false,
+        );
+        assert!(err_reason(&resp).contains("not a table"), "{resp:?}");
+        assert_eq!(preset, malformed);
+        assert!(live_disabled(&mut chain, SubchainKind::Background).is_empty());
+
+        let mut maskless = Preset::default();
+        let resp = apply_set_enabled_command(
+            &mut stub_chain(),
+            &mut maskless,
+            &telemetry,
+            SubchainKind::Mask,
+            "threshold",
+            false,
+        );
+        assert!(err_reason(&resp).contains("[mask]"), "{resp:?}");
+        assert_eq!(maskless, Preset::default());
+    }
+
+    /// Regression: after `set_enabled false` an effect added without
+    /// params has a table holding only the flag; the next `set_chain`
+    /// rebuild treated that as explicit params and `color_fill` failed on
+    /// its missing `rgb`. The rebuild must synthesise defaults and keep
+    /// the effect disabled.
+    #[cfg(feature = "ml")]
+    #[test]
+    fn subchain_rebuild_synthesises_defaults_and_keeps_disabled_flag() {
+        let per_effect: std::collections::BTreeMap<String, toml::Value> =
+            toml::from_str("[color_fill]\nenabled = false\n").expect("valid TOML");
+        let names = ["vignette".to_string(), "color_fill".to_string()];
+        let Ok(payload) =
+            build_and_configure_subchain(SubchainKind::Background, &names, &per_effect)
+        else {
+            panic!("rebuild must succeed for a flag-only table");
+        };
+        let fluxframe_effects::composite::SubChainPayload::Background(slots) = payload else {
+            panic!("background payload expected");
+        };
+        assert!(slots[0].is_enabled());
+        assert!(!slots[1].is_enabled());
     }
 
     #[test]

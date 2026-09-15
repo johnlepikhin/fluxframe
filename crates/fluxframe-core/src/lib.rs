@@ -15,6 +15,7 @@ pub mod error;
 pub mod frame;
 pub mod metadata;
 pub mod metrics;
+pub mod paths;
 pub mod plane;
 pub mod protocol;
 pub mod traits;
@@ -27,7 +28,10 @@ pub use config::{
 pub use context::{FrameContext, ProcessingContext, RuntimeState};
 pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineError};
 pub use frame::{FrameBuffer, FrameMeta, PixelFormat, Timestamp, VideoFrame};
-pub use metadata::{CommitStrategy, EffectMetadata, ParamDescriptor, ParamKind, Scale};
+pub use metadata::{
+    CommitStrategy, EFFECT_ENABLED_KEY, EffectMetadata, EffectSchema, ParamDescriptor, ParamKind,
+    ParamKindSchema, ParamSchema, ResolvedEffect, Scale, resolve_effect_params, split_effect_table,
+};
 pub use metrics::{
     CONSUMER_EVENT_AGE_UNSET, CounterValues, Counters, CpuShares, EXTERNAL_OPENERS_UNSET,
     EffectTelemetry, LatencyHistogram, LatencyRing, LatencySnapshot, MetricsSnapshot,

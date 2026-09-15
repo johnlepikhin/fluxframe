@@ -29,14 +29,15 @@ use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::InferenceError;
 use fluxframe_core::frame::{FrameBuffer, FrameMeta, PixelFormat, VideoFrame};
 use fluxframe_core::metrics::{EffectTelemetry, StageKey, StageTimings};
-use fluxframe_core::plane::PlaneEffect;
+use fluxframe_core::plane::{MaskEffect, PlaneEffect, PostEffect, SubchainKind};
 use fluxframe_core::traits::{
     InferenceEngine, InferenceInput, InferenceOutput, ModelInfo, RawEffectParams, VideoEffect,
 };
 
-use fluxframe_effects::composite::{CompositeEffect, SegmentationBase, SegmentationConfig};
+use fluxframe_effects::composite::{CompositeEffect, SegmentationBase, SegmentationConfig, Slot};
 use fluxframe_effects::ml::ModelConfig;
 use fluxframe_effects::plane_effects::ColorFillEffect;
+use fluxframe_effects::{mask_effects, plane_effects, post_effects};
 
 // -----------------------------------------------------------------
 // Mock inference engine. Returns a fixed 2×2 mask regardless of input.
@@ -171,7 +172,7 @@ fn composite_alpha_composites_foreground_over_background_fill() {
     let mut bg_color = ColorFillEffect::new([200, 100, 50]);
     let params: RawEffectParams = toml::from_str("rgb = [200, 100, 50]").expect("toml ok");
     bg_color.configure(params).expect("configure ok");
-    let bg_chain: Vec<Box<dyn PlaneEffect>> = vec![Box::new(bg_color)];
+    let bg_chain: Vec<Slot<dyn PlaneEffect>> = vec![Slot::new(Box::new(bg_color), true)];
 
     let mut composite =
         CompositeEffect::new(segmentation, Vec::new(), bg_chain, Vec::new(), Vec::new());
@@ -267,4 +268,194 @@ fn composite_alpha_composites_foreground_over_background_fill() {
         !ctx.fallback_active,
         "successful inference must not flag fallback",
     );
+}
+
+// -----------------------------------------------------------------
+// Enable / disable: one test per sub-chain.
+// -----------------------------------------------------------------
+
+/// The four sub-chains of a composite under test.
+#[derive(Default)]
+struct Chains {
+    mask: Vec<Slot<dyn MaskEffect>>,
+    bg: Vec<Slot<dyn PlaneEffect>>,
+    fg: Vec<Slot<dyn PlaneEffect>>,
+    post: Vec<Slot<dyn PostEffect>>,
+}
+
+fn configured<E: ?Sized>(
+    effect: Option<Box<E>>,
+    configure: impl FnOnce(&mut E, RawEffectParams) -> Result<(), fluxframe_core::EffectError>,
+    params: &str,
+) -> Slot<E> {
+    let mut effect = effect.expect("effect is registered");
+    configure(&mut effect, toml::from_str(params).expect("toml ok")).expect("configure ok");
+    Slot::new(effect, true)
+}
+
+fn mask_fx(name: &str) -> Slot<dyn MaskEffect> {
+    configured(
+        mask_effects::default_registry().build(name),
+        MaskEffect::configure,
+        "",
+    )
+}
+
+fn fill(rgb: [u8; 3]) -> Slot<dyn PlaneEffect> {
+    configured(
+        plane_effects::default_registry().build("color_fill"),
+        PlaneEffect::configure,
+        &format!("rgb = {rgb:?}"),
+    )
+}
+
+fn post_fx(name: &str) -> Slot<dyn PostEffect> {
+    configured(
+        post_effects::default_registry().build(name),
+        PostEffect::configure,
+        "",
+    )
+}
+
+/// Prepared composite over the mock segmentation.
+fn prepared(sidecar: &ModelSidecar, chains: Chains) -> CompositeEffect {
+    let segmentation = SegmentationBase::new(SegmentationConfig {
+        model: sidecar.model_path().to_path_buf(),
+        model_config: None,
+        fallback_threshold: 3,
+    })
+    .with_inference_factory(Box::new(mock_factory));
+    let mut composite =
+        CompositeEffect::new(segmentation, chains.mask, chains.bg, chains.fg, chains.post);
+    composite
+        .prepare(&ProcessingContext {
+            width: 2,
+            height: 2,
+            format: PixelFormat::Rgb,
+            fps: 30,
+            counters: None,
+        })
+        .expect("prepare ok");
+    composite
+}
+
+/// Run one distinctive 2×2 frame through `composite`; returns its bytes.
+fn run_frame(composite: &mut CompositeEffect) -> Vec<u8> {
+    let data = vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
+    let mut frame = VideoFrame::new_packed(
+        FrameBuffer::Owned(data),
+        2,
+        2,
+        PixelFormat::Rgb,
+        FrameMeta::default(),
+    )
+    .expect("frame ok");
+    composite
+        .process(&mut frame, &mut FrameContext::default())
+        .expect("process ok");
+    frame.data.as_slice().to_vec()
+}
+
+/// Build the composite twice — with and without the effect under test —
+/// and check that disabling the effect reproduces the "without" output,
+/// that the effect was visible in the first place, and that re-enabling
+/// brings it back.
+fn assert_toggle(section: SubchainKind, name: &str, with: fn() -> Chains, without: fn() -> Chains) {
+    let sidecar = ModelSidecar::new();
+    let reference = run_frame(&mut prepared(&sidecar, without()));
+    let mut composite = prepared(&sidecar, with());
+
+    let on = run_frame(&mut composite);
+    assert_ne!(on, reference, "{section}.{name} must change the frame");
+
+    assert_eq!(
+        composite.set_effect_enabled(section, name, false).ok(),
+        Some(true)
+    );
+    assert_eq!(
+        run_frame(&mut composite),
+        reference,
+        "disabled {section}.{name} must be bypassed"
+    );
+
+    assert_eq!(
+        composite.set_effect_enabled(section, name, true).ok(),
+        Some(true)
+    );
+    assert_eq!(run_frame(&mut composite), on, "re-enabled {section}.{name}");
+}
+
+#[test]
+fn disabled_mask_effect_is_bypassed() {
+    // `invert` alone is invisible (bg and fg are both the frame), so a
+    // background fill makes the mask observable.
+    assert_toggle(
+        SubchainKind::Mask,
+        "invert",
+        || Chains {
+            mask: vec![mask_fx("invert")],
+            bg: vec![fill([1, 2, 3])],
+            ..Chains::default()
+        },
+        || Chains {
+            bg: vec![fill([1, 2, 3])],
+            ..Chains::default()
+        },
+    );
+}
+
+#[test]
+fn disabled_background_effect_is_bypassed() {
+    assert_toggle(
+        SubchainKind::Background,
+        "color_fill",
+        || Chains {
+            bg: vec![fill([1, 2, 3])],
+            ..Chains::default()
+        },
+        Chains::default,
+    );
+}
+
+#[test]
+fn disabled_foreground_effect_is_bypassed() {
+    assert_toggle(
+        SubchainKind::Foreground,
+        "color_fill",
+        || Chains {
+            fg: vec![fill([1, 2, 3])],
+            ..Chains::default()
+        },
+        Chains::default,
+    );
+}
+
+#[test]
+fn disabled_post_effect_is_bypassed() {
+    assert_toggle(
+        SubchainKind::Post,
+        "mirror",
+        || Chains {
+            post: vec![post_fx("mirror")],
+            ..Chains::default()
+        },
+        Chains::default,
+    );
+}
+
+#[test]
+fn every_duplicate_of_a_disabled_name_is_bypassed() {
+    let sidecar = ModelSidecar::new();
+    let reference = run_frame(&mut prepared(&sidecar, Chains::default()));
+    let mut composite = prepared(
+        &sidecar,
+        Chains {
+            bg: vec![fill([1, 2, 3]), fill([4, 5, 6])],
+            ..Chains::default()
+        },
+    );
+    composite
+        .set_effect_enabled(SubchainKind::Background, "color_fill", false)
+        .expect("toggle ok");
+    assert_eq!(run_frame(&mut composite), reference);
 }

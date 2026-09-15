@@ -7,7 +7,7 @@
 //! surface minimal and avoids glib executor pitfalls. Latency is not
 //! a concern here (commands are infrequent and per-request).
 
-mod wire;
+pub(crate) mod wire;
 pub mod worker;
 
 pub use worker::{IpcWorker, WorkerInput, WorkerOutput};

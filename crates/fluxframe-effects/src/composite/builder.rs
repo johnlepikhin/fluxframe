@@ -14,10 +14,10 @@
 
 use std::collections::BTreeMap;
 
-use fluxframe_core::PipelineSection;
 use fluxframe_core::error::EffectError;
+use fluxframe_core::{EffectMetadata, PipelineSection, resolve_effect_params};
 
-use crate::composite::effect::CompositeEffect;
+use crate::composite::effect::{CompositeEffect, Slot, SubEffectAdapter};
 use crate::composite::segmentation::{SegmentationBase, SegmentationConfig};
 use crate::mask_effects::MaskEffectRegistry;
 use crate::plane_effects::PlaneEffectRegistry;
@@ -90,20 +90,19 @@ impl<'a> CompositeBuilder<'a> {
             Some(section) => build_post_chain(self.post, section)?,
             None => Vec::new(),
         };
-        Ok(CompositeEffect::new(
-            segmentation,
-            mask_chain,
-            bg_chain,
-            fg_chain,
-            post_chain,
-        ))
+        let composite =
+            CompositeEffect::new(segmentation, mask_chain, bg_chain, fg_chain, post_chain);
+        // A disabled effect is otherwise invisible in the logs; name it
+        // once per build (startup, preset switch, reload).
+        for section in fluxframe_core::SubchainKind::ALL {
+            let disabled = composite.disabled_effects(section);
+            if !disabled.is_empty() {
+                tracing::info!(section = %section, ?disabled, "composite: effects disabled by preset");
+            }
+        }
+        Ok(composite)
     }
 }
-
-/// Reserved keys in `[mask]` (and `[background]`/`[foreground]`) that
-/// are NOT effect names. The composite builder must never look them
-/// up in `per_effect`.
-const PIPELINE_RESERVED_KEYS: &[&str] = &["chain", "model", "model_config", "fallback_threshold"];
 
 fn build_segmentation(section: &PipelineSection) -> Result<SegmentationBase, EffectError> {
     let Some(model) = section.model.as_ref() else {
@@ -127,52 +126,51 @@ fn build_segmentation(section: &PipelineSection) -> Result<SegmentationBase, Eff
 fn build_mask_chain(
     registry: &MaskEffectRegistry,
     section: &PipelineSection,
-) -> Result<Vec<Box<dyn fluxframe_core::plane::MaskEffect>>, EffectError> {
+) -> Result<Vec<Slot<dyn fluxframe_core::plane::MaskEffect>>, EffectError> {
     reject_unknown_table_keys(&section.per_effect, &section.chain, "mask")?;
-    let mut chain = registry.build_chain(&section.chain)?;
-    for (effect, name) in chain.iter_mut().zip(section.chain.iter()) {
-        if let Some(params) = section.per_effect.get(name).cloned() {
-            effect.configure(params)?;
-        } else {
-            // No sub-table for this effect — call configure with an
-            // empty table so the implementation's serde defaults kick in.
-            effect.configure(toml::Value::Table(toml::map::Map::new()))?;
-        }
-    }
-    Ok(chain)
+    let chain = registry.build_chain(&section.chain)?;
+    configure_chain(chain, section, |name| registry.metadata(name))
 }
 
 fn build_plane_chain(
     registry: &PlaneEffectRegistry,
     section: &PipelineSection,
     section_name: &str,
-) -> Result<Vec<Box<dyn fluxframe_core::plane::PlaneEffect>>, EffectError> {
+) -> Result<Vec<Slot<dyn fluxframe_core::plane::PlaneEffect>>, EffectError> {
     reject_unknown_table_keys(&section.per_effect, &section.chain, section_name)?;
-    let mut chain = registry.build_chain(&section.chain)?;
-    for (effect, name) in chain.iter_mut().zip(section.chain.iter()) {
-        if let Some(params) = section.per_effect.get(name).cloned() {
-            effect.configure(params)?;
-        } else {
-            effect.configure(toml::Value::Table(toml::map::Map::new()))?;
-        }
-    }
-    Ok(chain)
+    let chain = registry.build_chain(&section.chain)?;
+    configure_chain(chain, section, |name| registry.metadata(name))
 }
 
 fn build_post_chain(
     registry: &PostEffectRegistry,
     section: &PipelineSection,
-) -> Result<Vec<Box<dyn fluxframe_core::plane::PostEffect>>, EffectError> {
+) -> Result<Vec<Slot<dyn fluxframe_core::plane::PostEffect>>, EffectError> {
     reject_unknown_table_keys(&section.per_effect, &section.chain, "post")?;
-    let mut chain = registry.build_chain(&section.chain)?;
-    for (effect, name) in chain.iter_mut().zip(section.chain.iter()) {
-        if let Some(params) = section.per_effect.get(name).cloned() {
-            effect.configure(params)?;
-        } else {
-            effect.configure(toml::Value::Table(toml::map::Map::new()))?;
-        }
-    }
-    Ok(chain)
+    let chain = registry.build_chain(&section.chain)?;
+    configure_chain(chain, section, |name| registry.metadata(name))
+}
+
+/// Configure every effect of `chain` (built from `section.chain`, in
+/// the same order) from its table in `section.per_effect`, resolved by
+/// [`resolve_effect_params`] — the same resolution the live `set_chain`
+/// path uses, so a preset behaves identically at startup and after an
+/// edit. Each effect is paired with its `enabled` flag.
+fn configure_chain<E: ?Sized + SubEffectAdapter>(
+    chain: Vec<Box<E>>,
+    section: &PipelineSection,
+    metadata: impl Fn(&str) -> Option<&'static EffectMetadata>,
+) -> Result<Vec<Slot<E>>, EffectError> {
+    chain
+        .into_iter()
+        .zip(&section.chain)
+        .map(|(mut effect, name)| {
+            let resolved =
+                resolve_effect_params(name, section.per_effect.get(name), metadata(name))?;
+            effect.configure_mut(resolved.params)?;
+            Ok(Slot::new(effect, resolved.enabled))
+        })
+        .collect()
 }
 
 /// Every key in `per_effect` must either be in `chain` or be one of
@@ -185,7 +183,7 @@ fn reject_unknown_table_keys(
     section_name: &str,
 ) -> Result<(), EffectError> {
     for key in per_effect.keys() {
-        if PIPELINE_RESERVED_KEYS.contains(&key.as_str()) {
+        if PipelineSection::is_reserved_key(key) {
             continue;
         }
         if !chain.iter().any(|n| n == key) {
@@ -254,8 +252,44 @@ radius = 3
         let reg = default_mask_registry();
         let chain = build_mask_chain(&reg, &section).expect("ok");
         assert_eq!(chain.len(), 2);
-        assert_eq!(chain[0].name(), "threshold");
-        assert_eq!(chain[1].name(), "feather");
+        assert_eq!(chain[0].effect().name(), "threshold");
+        assert_eq!(chain[1].effect().name(), "feather");
+        assert!(chain.iter().all(Slot::is_enabled));
+    }
+
+    #[test]
+    fn enabled_flag_is_read_and_stripped_before_configure() {
+        // `blur` denies unknown fields, so a leaked `enabled` would fail
+        // configure; `color_fill` has only the flag and gets defaults.
+        let section = parse(
+            r#"
+chain = ["blur", "color_fill"]
+[blur]
+enabled = false
+radius = 8
+[color_fill]
+enabled = false
+"#,
+        );
+        let reg = default_plane_registry();
+        let chain = build_plane_chain(&reg, &section, "background").expect("ok");
+        assert!(chain.iter().all(|slot| !slot.is_enabled()));
+    }
+
+    #[test]
+    fn non_bool_enabled_flag_is_rejected() {
+        let section = parse(
+            r#"
+chain = ["blur"]
+[blur]
+enabled = "off"
+"#,
+        );
+        let reg = default_plane_registry();
+        let Err(err) = build_plane_chain(&reg, &section, "background") else {
+            panic!("expected error");
+        };
+        assert!(format!("{err}").contains("must be a boolean"), "{err}");
     }
 
     #[test]
@@ -300,7 +334,7 @@ rgb = [10, 20, 30]
         let reg = default_plane_registry();
         let chain = build_plane_chain(&reg, &section, "background").expect("ok");
         assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].name(), "color_fill");
+        assert_eq!(chain[0].effect().name(), "color_fill");
     }
 
     #[test]

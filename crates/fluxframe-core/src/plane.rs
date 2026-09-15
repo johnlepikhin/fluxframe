@@ -32,7 +32,9 @@ use crate::traits::RawEffectParams;
 /// Serde format is `snake_case` to match the wire format used by the
 /// control socket and the TOML preset sub-tables (`mask` / `background`
 /// / `foreground` / `post`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum SubchainKind {
     /// Mask post-processing chain (`MaskEffect`).
@@ -46,6 +48,11 @@ pub enum SubchainKind {
 }
 
 impl SubchainKind {
+    /// Every sub-chain in pipeline order (mask → background →
+    /// foreground → post). Iterate this instead of hard-coding the
+    /// section names so a new variant is picked up everywhere.
+    pub const ALL: [Self; 4] = [Self::Mask, Self::Background, Self::Foreground, Self::Post];
+
     /// Stable identifier matching the wire / TOML form.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -185,6 +192,12 @@ pub trait MaskEffect: Send {
     /// Stable identifier used by the registry and config (`snake_case`).
     fn name(&self) -> &'static str;
 
+    /// Drop temporal state accumulated across frames (previous masks,
+    /// smoothed trackers). The composite calls it when a disabled effect
+    /// is re-enabled, so the first frame after the gap does not blend
+    /// with stale history. Default is a no-op for stateless effects.
+    fn reset_state(&mut self) {}
+
     /// Apply user-supplied configuration. May be a no-op for stateless
     /// effects (`invert`).
     ///
@@ -254,6 +267,10 @@ pub trait MaskEffect: Send {
 pub trait PlaneEffect: Send {
     /// Stable identifier used by the registry and config (`snake_case`).
     fn name(&self) -> &'static str;
+
+    /// Drop temporal state accumulated across frames. Same contract as
+    /// [`MaskEffect::reset_state`].
+    fn reset_state(&mut self) {}
 
     /// Apply user-supplied configuration.
     ///
@@ -326,6 +343,10 @@ pub trait PlaneEffect: Send {
 pub trait PostEffect: Send {
     /// Stable identifier used by the registry and config (`snake_case`).
     fn name(&self) -> &'static str;
+
+    /// Drop temporal state accumulated across frames. Same contract as
+    /// [`MaskEffect::reset_state`].
+    fn reset_state(&mut self) {}
 
     /// Apply user-supplied configuration.
     ///

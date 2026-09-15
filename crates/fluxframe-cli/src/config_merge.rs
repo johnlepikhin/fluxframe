@@ -62,15 +62,8 @@ const XDG_CONFIG_SUBPATH: &[&str] = &["fluxframe", "fluxframe.toml"];
 /// access happens here, so the same answer is safe to use for both
 /// "where would I read from?" and "where would I write to?".
 fn default_xdg_path() -> PathBuf {
-    let base = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
-        PathBuf::from(xdg)
-    } else {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-        let mut p = PathBuf::from(home);
-        p.push(".config");
-        p
-    };
-    let mut p = base;
+    let mut p =
+        fluxframe_core::paths::config_home().unwrap_or_else(|| PathBuf::from(".").join(".config"));
     for component in XDG_CONFIG_SUBPATH {
         p.push(component);
     }

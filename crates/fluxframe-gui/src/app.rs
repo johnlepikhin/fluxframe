@@ -1,215 +1,140 @@
 //! Root relm4 [`Component`] gluing the IPC worker to the libadwaita
 //! window.
 //!
-//! Owns the application state (`AppState`), reacts to `WorkerOutput`
-//! messages, and forwards user intent (preset switching, reload,
-//! preview) back to the worker.
+//! Owns the application state (`AppState`), maps component events and
+//! worker output into daemon requests, and applies the UI effects that
+//! [`crate::reply::apply_reply`] derives from each reply.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command as ProcessCommand;
+use std::rc::Rc;
 
 use adw::prelude::*;
+use fluxframe_core::SubchainKind;
 use fluxframe_core::protocol::Command;
 use gtk::glib;
 use relm4::prelude::{Component, ComponentParts, ComponentSender};
 use relm4::{Sender, WorkerController};
 
-use crate::components::{chain_page, preset_bar, preview, status_page};
+use crate::components::chain_page::{self, ChainEvent};
+use crate::components::param_row::ParamChange;
+use crate::components::{Emit, dialogs, preset_bar, preview, status_page};
 use crate::debounce::Debouncer;
 use crate::ipc::{IpcWorker, WorkerInput, WorkerOutput};
-use crate::state::{AppState, ConnectionStatus};
+use crate::reply::{self, NoticeKind, PendingKind, PendingRequests, ReplyEffects};
+use crate::shortcuts::{ActionEvent, Enablement, WindowActions};
+use crate::state::{AppState, ChainEdit, ConfigSync, ConnectionStatus, PresetSwitch};
 
-/// Dwell time for daemon-error toasts. 5 seconds is long enough for
-/// the operator to read but short enough to avoid stacking when a
-/// slider drags through several rejection cases.
-const TOAST_TIMEOUT_SECS: u32 = 5;
+/// Dwell time for error toasts. Long enough to read, short enough to
+/// avoid stacking when a slider drags through several rejections.
+const ERROR_TOAST_TIMEOUT_SECS: u32 = 5;
 
-// TODO(stage-15): pull `[output].device` from the daemon's `GetConfig`
-// round-trip instead of hardcoding /dev/video10. Same path used by both
-// the embedded preview and the detached gst-launch viewer.
+/// Dwell time for confirmation toasts (successful Save / Save as).
+const CONFIRMATION_TOAST_TIMEOUT_SECS: u32 = 2;
+
+// TODO: take the device from the daemon's `[output].device`
+// (`get_config`) instead of hardcoding it.
 const DEFAULT_PREVIEW_DEVICE: &str = "/dev/video10";
 
-/// Messages the AppModel handles internally.
+/// Smallest window size the layout is designed for (GNOME HIG mobile
+/// minimum).
+const MIN_WINDOW_WIDTH: i32 = 360;
+/// See [`MIN_WINDOW_WIDTH`].
+const MIN_WINDOW_HEIGHT: i32 = 294;
+
+/// Below this width the header bar sheds the Revert button (the main
+/// menu still offers it).
+const NARROW_BREAKPOINT: &str = "max-width: 550sp";
+
+/// Startup parameters of the root component.
+#[derive(Debug)]
+pub struct AppInit {
+    /// Daemon control socket.
+    pub socket_path: PathBuf,
+    /// Whether `gstreamer::init()` succeeded; the preview stays inert
+    /// otherwise.
+    pub gst_ready: bool,
+}
+
+/// Messages the AppModel handles.
 #[derive(Debug)]
 pub enum AppMsg {
-    /// IPC worker reply. Wrapped so the AppModel can pattern-match
-    /// without depending on the worker's `Output` type directly.
+    /// IPC worker output.
     Ipc(WorkerOutput),
-    /// User clicked the preset DropDown — switch to `name`.
-    /// If dirty, shows a confirmation dialog first.
-    SetPreset(String),
-    /// Confirmed by user (or no dirty state) — actually send SetPreset to daemon.
+    /// User picked a preset in the drop-down or via `Ctrl+<digit>`.
+    PresetPicked(String),
+    /// The operator confirmed discarding edits to switch to the preset.
     SetPresetConfirmed(String),
-    /// Keyboard shortcut `Ctrl+<digit>` — switch to the preset at the
-    /// 1-indexed slot, or no-op if the slot is empty.
-    SetPresetByIndex {
-        /// 1-indexed slot in the loaded preset list. `NonZeroUsize`
-        /// rules out the `slot - 1` underflow at the type level.
-        slot: std::num::NonZeroUsize,
-    },
-    /// User clicked the Reload button.
-    Reload,
-    /// User clicked "Open preview" — spawn an external viewer.
-    OpenPreview,
+    /// Chain page event.
+    Chain(ChainEvent),
+    /// Window action event.
+    Action(ActionEvent),
+    /// The operator confirmed the "Save As" dialog with a non-empty name.
+    SaveAs(String),
+    /// The operator confirmed discarding edits on Revert.
+    RevertConfirmed,
+    /// The operator confirmed discarding edits on Reload.
+    ReloadConfirmed,
     /// User clicked Retry on the disconnected status page.
     Retry,
-    /// A parameter widget produced a new value — dispatch as
-    /// `Command::Set { path, value }` to the daemon.
-    SetParam {
-        /// Dot-path `<section>.<effect>.<field>`.
-        path: String,
-        /// New value as a JSON `Value`.
-        value: serde_json::Value,
-    },
-    /// User added an effect to a section's chain (via the section's
-    /// add MenuButton). The new effect appends to the end.
-    AddEffect {
-        /// Sub-chain identifier as the typed [`fluxframe_core::SubchainKind`]
-        /// enum (no longer accepts arbitrary strings).
-        section: fluxframe_core::SubchainKind,
-        /// Effect registry name to append.
-        effect: String,
-    },
-    /// User removed an effect (✕ button on the chain item).
-    RemoveEffect {
-        /// Sub-chain identifier as the typed [`fluxframe_core::SubchainKind`]
-        /// enum (no longer accepts arbitrary strings).
-        section: fluxframe_core::SubchainKind,
-        /// Position in the chain (0-indexed) to remove.
-        index: usize,
-    },
-    /// User moved an effect one slot toward the chain head (`↑` button).
-    /// No-op at index 0.
-    MoveEffectUp {
-        /// Sub-chain identifier as the typed [`fluxframe_core::SubchainKind`]
-        /// enum (no longer accepts arbitrary strings).
-        section: fluxframe_core::SubchainKind,
-        /// Position to move (0-indexed); must be > 0.
-        index: usize,
-    },
-    /// User moved an effect one slot toward the chain tail (`↓` button).
-    /// No-op at the last index.
-    MoveEffectDown {
-        /// Sub-chain identifier as the typed [`fluxframe_core::SubchainKind`]
-        /// enum (no longer accepts arbitrary strings).
-        section: fluxframe_core::SubchainKind,
-        /// Position to move (0-indexed).
-        index: usize,
-    },
-    /// User clicked Save — persist the current preset back into the
-    /// daemon's TOML config file.
-    Save,
-    /// User clicked "Save as…" — open the name-prompt dialog.
-    SaveAsPrompt,
-    /// User confirmed the "Save as…" dialog with a non-empty name.
-    SaveAs(String),
-    /// User clicked Revert — refetch the active preset from the
-    /// daemon, discarding any in-memory edits since the last sync.
-    /// Shows a confirmation dialog first.
-    Revert,
-    /// Confirmed by user — actually send Revert to daemon.
-    RevertConfirmed,
-}
-
-/// Record of an in-flight `Command::Set` correlated by request tag.
-///
-/// `new` is the value the widget produced and the daemon is being
-/// asked to apply; `previous` is the last-known-good fallback. Today
-/// rollback is implemented by leaving `active_config` untouched on
-/// `Err` and rebuilding the chain page — the widget re-reads
-/// `active_config`. `previous` is kept on the struct so a future
-/// targeted-widget rollback path (without a full rebuild) does not
-/// need to re-derive it from the cache.
-#[derive(Debug, Clone)]
-struct PendingSet {
-    path: String,
-    new: serde_json::Value,
-    #[allow(
-        dead_code,
-        reason = "reserved for future per-widget rollback (rebuild-from-active_config covers it today)"
-    )]
-    previous: serde_json::Value,
-}
-
-/// Classification of an in-flight request, used by `on_reply` to
-/// dispatch on the reply payload without inspecting `data` shape
-/// heuristics.
-#[derive(Debug, Clone)]
-enum PendingKind {
-    /// A `Command::Set` issued by a widget change.
-    SetParam(PendingSet),
-    /// A `Command::GetConfig { path: None }` issued after Connected,
-    /// Reload, or Revert — the `Ok` payload is the full preset tree.
-    GetConfig,
-    /// Like [`GetConfig`](Self::GetConfig), but emitted as the
-    /// follow-up to a Revert — on `Ok` the AppModel re-syncs the
-    /// baseline so the dirty marker clears.
-    GetConfigForRevert,
-    /// A `Command::CurrentPreset` issued after SetPreset or Reload —
-    /// the `Ok` payload is a JSON string with the active preset name.
-    CurrentPreset,
-    /// A `Command::SavePreset` issued by the Save button — on `Ok`,
-    /// baseline is re-synced from `active_config` so the dirty marker
-    /// clears without another `GetConfig` round-trip.
-    Save,
-    /// A `Command::SavePresetAs` issued by the Save-as dialog — on
-    /// `Ok`, the new preset name is added to the dropdown and the
-    /// baseline is re-synced.
-    SaveAs {
-        /// New preset name; needed by the Ok handler to update the
-        /// presets list and switch the dropdown.
-        new_name: String,
-    },
-    /// Anything else we send (Reload, SetPreset, SetChain, …). Tracked
-    /// for completeness so unknown-tag warnings stay meaningful.
-    Other,
 }
 
 /// Root component.
 pub struct AppModel {
     state: AppState,
-    /// IPC worker handle. `take()`-replaced on Retry so a fresh
-    /// connection can be opened without restarting the GUI.
+    /// IPC worker handle. Replaced on Retry so a fresh connection can
+    /// be opened without restarting the GUI.
     worker: Option<WorkerController<IpcWorker>>,
-    /// Cloned input sender — needed by widget callbacks that have to
-    /// re-enter the model after `update()` has returned. relm4
-    /// `Sender` is `Clone`, unlike the `ComponentSender` itself.
+    /// In-flight requests awaiting a reply.
+    pending: PendingRequests,
+    /// Cloned input sender for callbacks that re-enter the model after
+    /// `update()` has returned.
     input_sender: Sender<AppMsg>,
-    /// Monotonic request counter used to correlate worker replies.
-    next_tag: u64,
-    /// Widgets that need to live longer than `view!` — the preset
-    /// bar's children are mutated in `update_view`.
+    /// Event sink handed to every chain page build.
+    chain_emit: Emit<ChainEvent>,
+    /// Header bar widgets updated from the model.
     preset_bar: preset_bar::PresetBar,
-    /// Body container — we swap between a `StatusPage` (disconnected)
-    /// and the chain editor (connected).
+    /// State-dependent window actions (Save, Revert, Reload, …).
+    actions: WindowActions,
+    /// Body container — we swap between a `StatusPage` (connecting /
+    /// disconnected) and the chain editor (connected).
     body_container: gtk::Box,
-    /// Embedded live preview pane at the top of the window. Owns the
-    /// preview GStreamer pipeline; dropping it tears the pipeline
-    /// down. Kept as a field purely so its `Drop` runs at window
-    /// close — the widget itself is already parented into `outer`.
-    /// Underscore-prefixed so the compiler doesn't flag the
-    /// never-read field.
+    /// Chain page currently shown in `body_container`, if any. Kept
+    /// to carry its view state across rebuilds; `None` while another
+    /// page (status / connecting) occupies the body.
+    chain_page: Option<chain_page::ChainPage>,
+    /// Embedded live preview pane. Owns the preview GStreamer
+    /// pipeline; kept as a field purely so its `Drop` tears the
+    /// pipeline down at window close.
     _preview: preview::Preview,
-    /// Per-parameter debounce queue shared by all `param_row`
-    /// instances on the chain page.
+    /// Per-parameter debounce queue shared by all param rows.
     debouncer: Debouncer,
-    /// Toast overlay wrapping the window body. Used to surface daemon
-    /// `Err` replies (e.g. parameter validation failures) without
-    /// blocking the editor.
+    /// Toast overlay wrapping the window body.
     toast_overlay: adw::ToastOverlay,
-    /// Last-good values for each `<section>.<effect>.<field>` path.
-    /// Updated when a `Set` succeeds; used to roll back the widget on
-    /// failure. Keyed by the same dot-path the daemon accepts.
-    last_known_good: HashMap<String, serde_json::Value>,
-    /// In-flight requests indexed by their wire `tag`. Replies look up
-    /// their pending kind here to decide how to interpret the payload
-    /// (vs. fragile `data` shape heuristics).
-    pending: HashMap<u64, PendingKind>,
+}
+
+/// Emitter forwarding a component's events into the AppModel as `wrap(event)`.
+fn forward<E: 'static>(sender: &Sender<AppMsg>, wrap: impl Fn(E) -> AppMsg + 'static) -> Emit<E> {
+    let sender = sender.clone();
+    Rc::new(move |event| {
+        let _ = sender.send(wrap(event));
+    })
+}
+
+/// Emitter sending a fixed message (cloned per call) into the AppModel.
+fn forward_unit(sender: &Sender<AppMsg>, msg: fn() -> AppMsg) -> Emit<()> {
+    forward(sender, move |()| msg())
+}
+
+/// Spawn an IPC worker for `socket_path` whose output lands in the
+/// AppModel.
+fn spawn_worker(socket_path: PathBuf, sender: &Sender<AppMsg>) -> WorkerController<IpcWorker> {
+    IpcWorker::builder()
+        .detach_worker(socket_path)
+        .forward(sender, AppMsg::Ipc)
 }
 
 impl Component for AppModel {
-    type Init = PathBuf;
+    type Init = AppInit;
     type Input = AppMsg;
     type Output = ();
     type CommandOutput = ();
@@ -217,59 +142,46 @@ impl Component for AppModel {
     type Widgets = ();
 
     fn init_root() -> Self::Root {
-        // Only sizing + maximisation here; the close-request handler is
-        // wired in `init()` once the `gtk::Paned` widget exists so we
-        // can persist its split position alongside the window geometry.
-        let geometry = crate::persistence::load();
-        let window = adw::ApplicationWindow::builder()
+        // Geometry is applied in `init()`, which also needs it for the
+        // `gtk::Paned` split; the window is presented only afterwards.
+        adw::ApplicationWindow::builder()
             .title("FluxFrame")
-            .default_width(geometry.width)
-            .default_height(geometry.height)
-            .build();
-        if geometry.maximized {
-            window.maximize();
-        }
-        window
+            .width_request(MIN_WINDOW_WIDTH)
+            .height_request(MIN_WINDOW_HEIGHT)
+            .build()
     }
 
     fn init(
-        socket_path: Self::Init,
+        AppInit {
+            socket_path,
+            gst_ready,
+        }: Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        // Spawn the IPC worker.
-        let worker = IpcWorker::builder()
-            .detach_worker(socket_path.clone())
-            .forward(sender.input_sender(), AppMsg::Ipc);
+        let geometry = crate::persistence::load();
+        root.set_default_size(geometry.width, geometry.height);
+        if geometry.maximized {
+            root.maximize();
+        }
 
-        // Build the header bar with closures that re-enter via the
-        // input sender.
-        let bar_sender = sender.input_sender().clone();
-        let reload_sender = sender.input_sender().clone();
-        let preview_sender = sender.input_sender().clone();
-        let save_sender = sender.input_sender().clone();
-        let save_as_sender = sender.input_sender().clone();
-        let revert_sender = sender.input_sender().clone();
-        let bar = preset_bar::build(preset_bar::PresetBarCallbacks {
-            on_preset_change: Box::new(move |name| {
-                let _ = bar_sender.send(AppMsg::SetPreset(name));
-            }),
-            on_reload: Box::new(move || {
-                let _ = reload_sender.send(AppMsg::Reload);
-            }),
-            on_preview: Box::new(move || {
-                let _ = preview_sender.send(AppMsg::OpenPreview);
-            }),
-            on_save: Box::new(move || {
-                let _ = save_sender.send(AppMsg::Save);
-            }),
-            on_save_as: Box::new(move || {
-                let _ = save_as_sender.send(AppMsg::SaveAsPrompt);
-            }),
-            on_revert: Box::new(move || {
-                let _ = revert_sender.send(AppMsg::Revert);
-            }),
-        });
+        let input_sender = sender.input_sender().clone();
+
+        let worker = spawn_worker(socket_path.clone(), &input_sender);
+
+        let actions = crate::shortcuts::install(
+            &relm4::main_adw_application(),
+            &root,
+            &forward(&input_sender, AppMsg::Action),
+        );
+        let bar = preset_bar::build(forward(&input_sender, AppMsg::PresetPicked));
+
+        let narrow = adw::Breakpoint::new(
+            adw::BreakpointCondition::parse(NARROW_BREAKPOINT)
+                .expect("static breakpoint condition parses"),
+        );
+        narrow.add_setter(&bar.revert, "visible", Some(&false.to_value()));
+        root.add_breakpoint(narrow);
 
         let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
         body.set_hexpand(true);
@@ -277,9 +189,9 @@ impl Component for AppModel {
 
         // Initial body — a Connecting status. Replaced on
         // `Connected` / `Disconnected`.
-        body.append(&connecting_page("Talking to the FluxFrame daemon."));
+        body.append(&status_page::connecting("Talking to the FluxFrame daemon."));
 
-        let preview = preview::build(std::path::Path::new(DEFAULT_PREVIEW_DEVICE));
+        let preview = preview::build(std::path::Path::new(DEFAULT_PREVIEW_DEVICE), gst_ready);
 
         // `gtk::Paned` owns the split between preview (top) and the
         // chain editor (bottom). The Paned takes the responsibility
@@ -294,7 +206,6 @@ impl Component for AppModel {
         // size proportionally on resize; `shrink_*_child = false`
         // stops the user from collapsing either half to zero by
         // dragging the handle to an extreme.
-        let geometry = crate::persistence::load();
         let paned = gtk::Paned::builder()
             .orientation(gtk::Orientation::Vertical)
             .vexpand(true)
@@ -308,14 +219,9 @@ impl Component for AppModel {
             .position(geometry.resolved_preview_split())
             .build();
 
-        let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        outer.append(&bar.root);
-        outer.append(&paned);
-
         // Persist window geometry + Paned split on close. `close-request`
         // fires before teardown so the window and paned are still
-        // queryable. `paned` is captured by move into the closure;
-        // the closure outlives `init()` because GTK holds the signal.
+        // queryable.
         let paned_for_close = paned.clone();
         root.connect_close_request(move |w| {
             let state = crate::persistence::WindowState {
@@ -328,199 +234,208 @@ impl Component for AppModel {
             glib::Propagation::Proceed
         });
 
-        // Wrap the whole window body in a ToastOverlay so daemon
-        // errors can fly over the chain page without disturbing the
-        // layout. The overlay child has to be set before the window
-        // content is attached.
+        // Toasts fly over the editor without disturbing the layout.
         let toast_overlay = adw::ToastOverlay::new();
-        toast_overlay.set_child(Some(&outer));
-        root.set_content(Some(&toast_overlay));
+        toast_overlay.set_child(Some(&paned));
 
-        // Global keyboard shortcuts (Ctrl+R reload, Ctrl+Q quit,
-        // Ctrl+1..9 preset switch).
-        crate::shortcuts::install(&root, sender.input_sender());
+        let toolbar_view = adw::ToolbarView::new();
+        toolbar_view.add_top_bar(&bar.root);
+        toolbar_view.set_content(Some(&toast_overlay));
+        root.set_content(Some(&toolbar_view));
 
-        let state = AppState::new(socket_path);
-        let input_sender = sender.input_sender().clone();
         let model = Self {
-            state,
+            state: AppState::new(socket_path),
             worker: Some(worker),
+            pending: PendingRequests::default(),
+            chain_emit: forward(&input_sender, AppMsg::Chain),
             input_sender,
-            next_tag: 0,
             preset_bar: bar,
+            actions,
             body_container: body,
+            chain_page: None,
             _preview: preview,
             debouncer: Debouncer::new(),
             toast_overlay,
-            last_known_good: HashMap::new(),
-            pending: HashMap::new(),
         };
+        model.refresh_header();
         ComponentParts { model, widgets: () }
     }
 
     fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>, _root: &Self::Root) {
         match msg {
             AppMsg::Ipc(out) => self.on_ipc(out),
-            AppMsg::SetPreset(name) => {
-                if self.state.is_dirty() {
-                    let name_for_confirm = name.clone();
-                    self.confirm_discard_changes(
-                        "Switch preset?",
-                        "You have unsaved changes in the current preset. Switching will discard them.",
-                        move |sender| {
-                            let _ = sender.send(AppMsg::SetPresetConfirmed(name_for_confirm.clone()));
-                        },
-                    );
-                    // Revert the dropdown selection since the user hasn't confirmed yet
-                    preset_bar::set_presets(
-                        &self.preset_bar,
-                        &self.state.presets,
-                        self.state.active_preset.as_deref(),
-                    );
-                } else {
-                    self.send_kind(Command::SetPreset { name }, PendingKind::Other);
-                }
-            }
-            AppMsg::SetPresetConfirmed(name) => {
-                self.send_kind(Command::SetPreset { name }, PendingKind::Other);
-            }
-            AppMsg::SetPresetByIndex { slot } => {
-                // 1-indexed slot → list position (slot - 1). `NonZeroUsize`
-                // makes the subtraction safe at the type level.
-                let Some(name) = self.state.presets.get(slot.get() - 1).cloned() else {
-                    tracing::debug!(slot = slot.get(), "no preset at slot");
-                    return;
-                };
-                let _ = self.input_sender.send(AppMsg::SetPreset(name));
-            }
-            AppMsg::Reload => {
-                self.send_kind(Command::Reload, PendingKind::Other);
-                // After a successful reload the cached active_preset
-                // / config may have drifted; refetch the state.
-                self.send_kind(Command::CurrentPreset, PendingKind::CurrentPreset);
-                self.send_kind(Command::GetConfig { path: None }, PendingKind::GetConfig);
-            }
-            AppMsg::OpenPreview => open_preview(),
-            AppMsg::Retry => self.retry(),
-            AppMsg::SetParam { path, value } => {
-                self.send_set_param(path, value);
-            }
-            AppMsg::AddEffect { section, effect } => {
-                self.mutate_chain(section, |chain| chain.push(effect));
-            }
-            AppMsg::RemoveEffect { section, index } => {
-                self.mutate_chain(section, |chain| {
-                    if index < chain.len() {
-                        chain.remove(index);
-                    }
-                });
-            }
-            AppMsg::MoveEffectUp { section, index } => {
-                if index == 0 {
-                    return;
-                }
-                self.mutate_chain(section, |chain| {
-                    if index < chain.len() {
-                        chain.swap(index - 1, index);
-                    }
-                });
-            }
-            AppMsg::MoveEffectDown { section, index } => {
-                self.mutate_chain(section, |chain| {
-                    if index + 1 < chain.len() {
-                        chain.swap(index, index + 1);
-                    }
-                });
-            }
-            AppMsg::Save => {
-                self.send_kind(Command::SavePreset, PendingKind::Save);
-            }
-            AppMsg::SaveAsPrompt => {
-                self.open_save_as_dialog();
-            }
+            AppMsg::PresetPicked(name) => self.on_preset_picked(name),
+            AppMsg::SetPresetConfirmed(name) => self.switch_preset(name),
+            AppMsg::Chain(ChainEvent::Edit { section, edit }) => self.edit_chain(section, edit),
+            AppMsg::Chain(ChainEvent::Param(change)) => self.send_set_param(change),
+            AppMsg::Chain(ChainEvent::SetEnabled {
+                section,
+                effect,
+                enabled,
+            }) => self.send_kind(
+                Command::SetEnabled {
+                    section,
+                    effect: effect.clone(),
+                    enabled,
+                },
+                PendingKind::SetEnabled {
+                    section,
+                    effect,
+                    enabled,
+                },
+            ),
+            AppMsg::Action(action) => self.on_action(action),
             AppMsg::SaveAs(name) => {
                 self.send_kind(
                     Command::SavePresetAs { name: name.clone() },
                     PendingKind::SaveAs { new_name: name },
                 );
             }
-            AppMsg::Revert => {
-                self.confirm_discard_changes(
-                    "Discard unsaved changes?",
-                    "This will reload the preset from the daemon, discarding all unsaved edits.",
-                    |sender| {
-                        let _ = sender.send(AppMsg::RevertConfirmed);
-                    },
-                );
-            }
-            AppMsg::RevertConfirmed => {
-                self.send_kind(
-                    Command::GetConfig { path: None },
-                    PendingKind::GetConfigForRevert,
-                );
-            }
+            AppMsg::RevertConfirmed => self.revert(),
+            AppMsg::ReloadConfirmed => self.reload(),
+            AppMsg::Retry => self.retry(),
         }
     }
 }
 
 impl AppModel {
-    fn next_tag(&mut self) -> u64 {
-        let tag = self.next_tag;
-        self.next_tag = self.next_tag.wrapping_add(1);
-        tag
+    fn on_action(&mut self, action: ActionEvent) {
+        match action {
+            ActionEvent::Save => self.send_kind(Command::SavePreset, PendingKind::Save),
+            ActionEvent::SaveAs => {
+                dialogs::save_as(
+                    &self.preset_bar.root,
+                    forward(&self.input_sender, AppMsg::SaveAs),
+                );
+            }
+            ActionEvent::Revert => dialogs::confirm_discard(
+                &self.preset_bar.root,
+                "Discard Changes?",
+                "This will restore the preset as last saved, discarding all unsaved edits.",
+                "Discard",
+                forward_unit(&self.input_sender, || AppMsg::RevertConfirmed),
+            ),
+            ActionEvent::Reload => {
+                if self.state.is_dirty() {
+                    dialogs::confirm_discard(
+                        &self.preset_bar.root,
+                        "Reload Configuration?",
+                        "You have unsaved changes in the current preset. Reloading the configuration file will discard them.",
+                        "Discard and Reload",
+                        forward_unit(&self.input_sender, || AppMsg::ReloadConfirmed),
+                    );
+                } else {
+                    self.reload();
+                }
+            }
+            ActionEvent::About => dialogs::about(&self.preset_bar.root, &self.debug_info()),
+            ActionEvent::PresetSlot(slot) => {
+                // 1-indexed slot → list position; `NonZeroUsize` makes
+                // the subtraction safe.
+                if let Some(name) = self.state.presets.get(slot.get() - 1).cloned() {
+                    self.on_preset_picked(name);
+                } else {
+                    tracing::debug!(slot = slot.get(), "no preset at slot");
+                }
+            }
+        }
     }
 
-    /// Send a command to the worker and register its `tag` with a
-    /// classification used by `on_reply` to dispatch on the reply.
+    fn on_preset_picked(&mut self, name: String) {
+        match self.state.preset_switch(&name) {
+            PresetSwitch::AlreadyActive => {}
+            PresetSwitch::Proceed => self.switch_preset(name),
+            PresetSwitch::NeedsConfirmation => {
+                // Keep the drop-down on the active preset until the
+                // operator confirms.
+                self.refresh_presets();
+                let target = name;
+                dialogs::confirm_discard(
+                    &self.preset_bar.root,
+                    "Switch Preset?",
+                    "You have unsaved changes in the current preset. Switching will discard them.",
+                    "Discard and Switch",
+                    forward(&self.input_sender, move |()| {
+                        AppMsg::SetPresetConfirmed(target.clone())
+                    }),
+                );
+            }
+        }
+    }
+
+    /// Send a command to the worker, registering its reply kind.
     fn send_kind(&mut self, command: Command, kind: PendingKind) {
-        if self.worker.is_none() {
+        let Some(worker) = self.worker.as_ref() else {
             tracing::warn!("send_kind dropped — worker not connected");
             return;
-        }
-        let tag = self.next_tag();
-        // Worker presence re-checked just above; safe to unwrap is justified.
-        let worker = self.worker.as_ref().expect("worker presence checked above");
-        self.pending.insert(tag, kind);
+        };
+        let tag = self.pending.register(kind);
         let _ = worker.sender().send(WorkerInput::Send { tag, command });
     }
 
-    /// Apply `mutate` to the chain array for `section`, dispatch a
-    /// `Command::SetChain` with the result, then refetch the active
-    /// config so widgets pick up the new chain shape (and any defaulting
-    /// the daemon applied).
-    fn mutate_chain(
-        &mut self,
-        section: fluxframe_core::SubchainKind,
-        mutate: impl FnOnce(&mut Vec<String>),
-    ) {
-        let chain_str = section.as_str();
-        let mut chain = self.state.chain_for(chain_str);
-        mutate(&mut chain);
-        self.send_kind(Command::SetChain { section, chain }, PendingKind::Other);
-        // Refetch the active config so widgets pick up the new chain
-        // shape (and any defaulting the daemon applied).
-        self.send_kind(Command::GetConfig { path: None }, PendingKind::GetConfig);
+    /// Activate preset `name` on the daemon. The resulting state is
+    /// refetched once the daemon accepts the switch.
+    fn switch_preset(&mut self, name: String) {
+        // Pending debounced sends belong to the preset being left.
+        self.debouncer.cancel_all();
+        self.send_kind(Command::SetPreset { name }, PendingKind::SetPreset);
     }
 
-    /// Dispatch a parameter change as a `Command::Set` while capturing
-    /// the prior value so the widget can be rolled back if the daemon
-    /// rejects it.
-    fn send_set_param(&mut self, path: String, value: serde_json::Value) {
-        // Previous value preference order: the last-known-good cache
-        // (only populated on accepted Sets) → the current active_config
-        // entry → `Null`.
-        let previous = self
-            .last_known_good
-            .get(&path)
-            .cloned()
-            .or_else(|| read_config_value(&self.state.active_config, &path))
-            .unwrap_or(serde_json::Value::Null);
-        let kind = PendingKind::SetParam(PendingSet {
-            path: path.clone(),
-            new: value.clone(),
-            previous,
-        });
-        self.send_kind(Command::Set { path, value }, kind);
+    /// Drop unsaved edits by re-activating the active preset: the
+    /// daemon rebuilds it from its persisted copy.
+    fn revert(&mut self) {
+        let Some(name) = self.state.active_preset.clone() else {
+            tracing::warn!("revert requested without an active preset");
+            return;
+        };
+        // Pending debounced sends would re-apply discarded edits.
+        self.debouncer.cancel_all();
+        self.send_kind(Command::SetPreset { name }, PendingKind::Revert);
+    }
+
+    /// Re-read the daemon's config file; follow-up refetches are
+    /// issued once it succeeds.
+    fn reload(&mut self) {
+        self.debouncer.cancel_all();
+        self.send_kind(Command::Reload, PendingKind::Reload);
+    }
+
+    /// Refetch the active preset name and config as a clean baseline.
+    fn refetch_active(&mut self) {
+        self.send_kind(Command::CurrentPreset, PendingKind::CurrentPreset);
+        self.send_kind(
+            Command::GetConfig { path: None },
+            PendingKind::GetConfig(ConfigSync::ResyncBaseline),
+        );
+    }
+
+    /// Apply `edit` to the chain of `section`, dispatch the result as a
+    /// `Command::SetChain`, then refetch the config so widgets pick up
+    /// the new chain shape (and any defaulting the daemon applied).
+    fn edit_chain(&mut self, section: SubchainKind, edit: ChainEdit) {
+        let mut chain = self.state.chain_for(section);
+        if !edit.apply(&mut chain) {
+            return;
+        }
+        // Pending debounced sends target rows the new chain may not have.
+        self.debouncer.cancel_all();
+        self.send_kind(Command::SetChain { section, chain }, PendingKind::Other);
+        // The daemon answers with its in-memory preset, which still
+        // carries any unsaved edits — so the baseline must stay put.
+        self.send_kind(
+            Command::GetConfig { path: None },
+            PendingKind::GetConfig(ConfigSync::KeepBaseline),
+        );
+    }
+
+    /// Dispatch a parameter change as a `Command::Set`.
+    fn send_set_param(&mut self, change: ParamChange) {
+        let ParamChange { path, value } = change;
+        let command = Command::Set {
+            path: path.to_string(),
+            value: value.clone(),
+        };
+        self.send_kind(command, PendingKind::SetParam { path, value });
     }
 
     fn on_ipc(&mut self, out: WorkerOutput) {
@@ -529,410 +444,183 @@ impl AppModel {
                 tracing::info!(presets = initial.presets.len(), "daemon handshake complete");
                 self.state.status = ConnectionStatus::Connected;
                 self.state.presets = initial.presets;
-                self.state.active_preset = Some(initial.active_preset.clone());
+                self.state.active_preset = Some(initial.active_preset);
                 self.state.inventory = initial.inventory;
-                // Synchronise both pointers — handshake is the clean
-                // baseline, so dirty starts at false.
-                self.state.baseline_config = initial.active_config.clone();
-                self.state.active_config = initial.active_config;
+                // Handshake is the clean baseline, so dirty starts at false.
+                self.state
+                    .apply_config_snapshot(initial.active_config, ConfigSync::ResyncBaseline);
                 self.state.config_path = initial.config_path;
-
-                preset_bar::set_presets(
-                    &self.preset_bar,
-                    &self.state.presets,
-                    self.state.active_preset.as_deref(),
-                );
-                if let Some(active) = self.state.active_preset.as_deref() {
-                    preset_bar::set_active_preset(&self.preset_bar, active);
-                }
-                self.refresh_dirty_indicator();
+                self.refresh_presets();
+                self.refresh_header();
                 self.rebuild_chain_page();
             }
             WorkerOutput::Disconnected { reason } => {
                 tracing::warn!(reason = %reason, "daemon disconnected");
-                self.state.status = ConnectionStatus::Disconnected(reason.clone());
-                self.replace_body_with_status_page(&reason);
+                self.state.status = ConnectionStatus::Disconnected;
+                // Replies to these requests will never arrive.
+                self.pending.clear();
+                self.debouncer.cancel_all();
+                self.refresh_header();
+                let page = status_page::build(
+                    &self.state.socket_path,
+                    &reason,
+                    forward_unit(&self.input_sender, || AppMsg::Retry),
+                );
+                self.set_body(&page);
             }
-            WorkerOutput::Reply { tag, response } => self.on_reply(tag, response),
-        }
-    }
-
-    fn on_reply(&mut self, tag: u64, response: fluxframe_core::protocol::Response) {
-        let kind = self.pending.remove(&tag);
-        match response {
-            fluxframe_core::protocol::Response::Ok { data } => {
-                tracing::debug!(tag, ?data, "reply ok");
-                match kind {
-                    Some(PendingKind::SetParam(set)) => {
-                        // Daemon accepted the write. Mirror it into
-                        // active_config so subsequent rebuilds reflect
-                        // the new value, and remember the value as the
-                        // rollback target for future Sets on this path.
-                        set_config_value(&mut self.state.active_config, &set.path, set.new.clone());
-                        self.last_known_good.insert(set.path, set.new);
-                        // Any successful Set creates a delta against
-                        // the daemon's persisted baseline.
-                        self.refresh_dirty_indicator();
-                    }
-                    Some(PendingKind::CurrentPreset) => {
-                        if let Some(name) = data.as_str() {
-                            self.state.active_preset = Some(name.to_string());
-                            preset_bar::set_active_preset(&self.preset_bar, name);
-                            self.refresh_dirty_indicator();
-                        }
-                    }
-                    Some(PendingKind::GetConfig) => {
-                        // Full preset tree — refresh and rebuild. A
-                        // GetConfig that follows SetPreset / Reload
-                        // pulls a fresh daemon snapshot, so the
-                        // baseline tracks active_config and the
-                        // dirty marker clears.
-                        self.state.active_config = data.clone();
-                        self.state.baseline_config = data;
-                        self.refresh_dirty_indicator();
-                        self.rebuild_chain_page();
-                    }
-                    Some(PendingKind::GetConfigForRevert) => {
-                        // Revert pulls the canonical state, then
-                        // discards the in-memory edits.
-                        self.state.active_config = data.clone();
-                        self.state.baseline_config = data;
-                        self.last_known_good.clear();
-                        self.refresh_dirty_indicator();
-                        self.rebuild_chain_page();
-                    }
-                    Some(PendingKind::Save) => {
-                        // Daemon persisted the active preset; the
-                        // current in-memory state IS the new
-                        // baseline.
-                        self.state.baseline_config = self.state.active_config.clone();
-                        self.refresh_dirty_indicator();
-                    }
-                    Some(PendingKind::SaveAs { new_name }) => {
-                        // Daemon created the new preset block in
-                        // TOML; mirror in the local preset list so
-                        // the dropdown picks it up immediately. The
-                        // active preset is unchanged (Save-as does
-                        // NOT switch), so dirty stays as it was.
-                        if !self.state.presets.iter().any(|p| p == &new_name) {
-                            self.state.presets.push(new_name);
-                            preset_bar::set_presets(
-                                &self.preset_bar,
-                                &self.state.presets,
-                                self.state.active_preset.as_deref(),
-                            );
-                        }
-                    }
-                    Some(PendingKind::Other) | None => {
-                        // Reload / SetPreset / SetChain or an
-                        // untracked tag — nothing further to do; the
-                        // follow-up CurrentPreset/GetConfig will
-                        // refresh the UI.
-                    }
-                }
-            }
-            fluxframe_core::protocol::Response::Err { error, hint } => {
-                tracing::warn!(tag, error = %error, hint = ?hint, "reply err");
-                match kind {
-                    Some(PendingKind::SetParam(_set)) => {
-                        // Daemon rejected the write. Surface the error
-                        // via a toast and rebuild the chain page so
-                        // every widget snaps back to active_config
-                        // (which still holds the previous value because
-                        // we only commit on Ok above).
-                        self.show_error_toast(&error, hint.as_deref());
-                        self.rebuild_chain_page();
-                    }
-                    Some(
-                        PendingKind::Other
-                        | PendingKind::Save
-                        | PendingKind::SaveAs { .. }
-                        | PendingKind::GetConfigForRevert,
-                    ) => {
-                        // Reload / SetPreset / SetChain / Save /
-                        // SaveAs / Revert: no widget rollback, but
-                        // the user still deserves to know the daemon
-                        // refused the request (e.g. "no writable
-                        // config path" on Save under
-                        // --no-default-config, or "preset already
-                        // exists" on SaveAs).
-                        self.show_error_toast(&error, hint.as_deref());
-                    }
-                    Some(PendingKind::CurrentPreset | PendingKind::GetConfig) | None => {
-                        // Internal refetches and unknown tags
-                        // — log only, the operator will see the warn.
-                    }
-                }
-            }
-            // `Response` is `#[non_exhaustive]`; tolerate future
-            // variants without panicking the UI thread.
-            _ => {
-                tracing::warn!(tag, "unrecognised Response variant");
+            WorkerOutput::Reply { tag, response } => {
+                let kind = self.pending.take(tag);
+                let effects = reply::apply_reply(&mut self.state, kind, response);
+                self.apply_effects(effects);
             }
         }
     }
 
-    /// Push the AppState's dirty flag + writable config path into the
-    /// preset bar so the Save / Save as / Revert buttons and the
-    /// title-bar marker stay in sync with the in-memory delta.
-    fn refresh_dirty_indicator(&self) {
-        preset_bar::set_dirty_state(
-            &self.preset_bar,
-            self.state.is_dirty(),
+    /// Perform the UI work a reply requires.
+    fn apply_effects(&mut self, effects: ReplyEffects) {
+        let ReplyEffects {
+            rebuild_chain,
+            reset_param,
+            sync_toggle,
+            refetch_config_quiet,
+            presets_changed,
+            refetch_active,
+            refetch_presets,
+            notice,
+        } = effects;
+        if refetch_presets {
+            self.send_kind(Command::ListPresets, PendingKind::ListPresets);
+        }
+        if refetch_config_quiet {
+            self.send_kind(
+                Command::GetConfig { path: None },
+                PendingKind::GetConfigQuiet,
+            );
+        }
+        if refetch_active {
+            self.refetch_active();
+        }
+        if presets_changed {
+            self.refresh_presets();
+        }
+        self.refresh_header();
+        if rebuild_chain {
+            self.rebuild_chain_page();
+        }
+        if let (Some(path), Some(page)) = (reset_param, self.chain_page.as_ref()) {
+            page.reset_param(&path, self.state.config_field(&path));
+        }
+        if let (Some((section, effect)), Some(page)) = (sync_toggle, self.chain_page.as_ref()) {
+            page.set_toggle(
+                section,
+                &effect,
+                self.state.effect_enabled(section, &effect),
+            );
+        }
+        if let Some(notice) = notice {
+            let timeout = match notice.kind {
+                NoticeKind::Error => ERROR_TOAST_TIMEOUT_SECS,
+                NoticeKind::Confirmation => CONFIRMATION_TOAST_TIMEOUT_SECS,
+            };
+            let toast = adw::Toast::builder()
+                .title(&notice.message)
+                .timeout(timeout)
+                .build();
+            self.toast_overlay.add_toast(toast);
+        }
+    }
+
+    /// Re-populate the preset drop-down from the state.
+    fn refresh_presets(&self) {
+        self.preset_bar
+            .set_presets(&self.state.presets, self.state.active_preset.as_deref());
+    }
+
+    /// Push connection state, dirty flag and writable config path into
+    /// the header bar and the window actions.
+    fn refresh_header(&self) {
+        let connected = self.state.is_connected();
+        let dirty = self.state.is_dirty();
+        self.preset_bar.set_state(
+            connected,
+            dirty,
             self.state.config_path.as_deref(),
             self.state.active_preset.as_deref(),
         );
+        self.actions.apply(Enablement::compute(
+            connected,
+            dirty,
+            self.state.config_path.is_some(),
+        ));
     }
 
-    /// Show a confirmation dialog when the user attempts a destructive action
-    /// (e.g., switching presets or reverting when there are unsaved changes).
-    /// On "discard", calls the provided closure to send the confirmed message.
-    /// On "cancel", does nothing.
-    fn confirm_discard_changes<F: Fn(&Sender<AppMsg>) + 'static>(
-        &self,
-        heading: &str,
-        body: &str,
-        on_discard: F,
-    ) {
-        let dialog = adw::AlertDialog::new(Some(heading), Some(body));
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("discard", "Discard");
-        dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-
-        let sender = self.input_sender.clone();
-        dialog.connect_response(None, move |_dlg, response| {
-            if response == "discard" {
-                on_discard(&sender);
-            }
-        });
-
-        dialog.present(Some(&self.preset_bar.root));
-    }
-
-    /// Show a small modal asking the operator for a new preset name.
-    /// On OK with a non-empty trimmed name, sends [`AppMsg::SaveAs`]
-    /// back into the AppModel. On Cancel or empty input, no-op.
-    ///
-    /// Uses [`adw::AlertDialog`] (the GTK 4.10+ replacement for
-    /// [`gtk::Dialog`]) so the dialog stays inside the application
-    /// window as a transient overlay rather than spawning a separate
-    /// OS-level window.
-    fn open_save_as_dialog(&self) {
-        let entry = gtk::Entry::builder()
-            .placeholder_text("Preset name")
-            .activates_default(true)
-            .build();
-
-        let dialog = adw::AlertDialog::new(
-            Some("Save preset as…"),
-            Some("Choose a name for the new preset."),
-        );
-        dialog.add_response("cancel", "Cancel");
-        dialog.add_response("save", "Save");
-        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
-        dialog.set_default_response(Some("save"));
-        dialog.set_close_response("cancel");
-        dialog.set_extra_child(Some(&entry));
-
-        // `activates_default = true` on the entry combined with
-        // `set_default_response("save")` on the dialog makes Enter
-        // commit the dialog without a separate signal handler.
-
-        let entry_for_response = entry.clone();
-        let sender = self.input_sender.clone();
-        dialog.connect_response(None, move |_dlg, response| {
-            if response == "save" {
-                let name = entry_for_response.text().to_string().trim().to_string();
-                if !name.is_empty() {
-                    let _ = sender.send(AppMsg::SaveAs(name));
-                }
-            }
-        });
-
-        // `AlertDialog::present` walks up the widget tree to find
-        // the toplevel; passing the headerbar (already parented into
-        // the application window) is enough to anchor the dialog
-        // transient over the right window — no need to plumb the
-        // root reference through AppModel.
-        dialog.present(Some(&self.preset_bar.root));
-    }
-
-    /// Surface a daemon error as a 5-second `AdwToast` overlay banner.
-    ///
-    /// Used by [`Self::on_reply`] for any [`PendingKind`] variant whose
-    /// Err reply deserves operator attention. Internally builds a single
-    /// formatted line via [`format_toast_error`] so error and hint share
-    /// a consistent shape across rejection sources.
-    fn show_error_toast(&self, error: &str, hint: Option<&str>) {
-        let message = format_toast_error(error, hint);
-        let toast = adw::Toast::builder()
-            .title(&message)
-            .timeout(TOAST_TIMEOUT_SECS)
-            .build();
-        self.toast_overlay.add_toast(toast);
+    /// Daemon session details for the About dialog.
+    fn debug_info(&self) -> String {
+        let features = &self.state.inventory.build_features;
+        let config_path = self
+            .state
+            .config_path
+            .as_deref()
+            .map_or_else(|| "(none)".to_string(), |p| p.display().to_string());
+        format!(
+            "Socket: {}\nConnection: {:?}\nActive preset: {}\nConfig path: {config_path}\nDaemon build features: {}\n",
+            self.state.socket_path.display(),
+            self.state.status,
+            self.state.active_preset.as_deref().unwrap_or("(none)"),
+            if features.is_empty() {
+                "(none)".to_string()
+            } else {
+                features.join(", ")
+            },
+        )
     }
 
     /// Drop the current body content and re-render the chain editor
-    /// from the active state. Called after Connected, SetPreset, and
-    /// any successful refetch.
-    fn rebuild_chain_page(&self) {
+    /// from the active state, preserving expanded rows, scroll and
+    /// focus.
+    fn rebuild_chain_page(&mut self) {
         tracing::debug!(
-            sections = chain_page::SECTION_COUNT,
             preset = self.state.active_preset.as_deref().unwrap_or("(none)"),
             "rebuilt chain page"
         );
-        clear_children(&self.body_container);
-        // `chain_page::build` already returns a `ScrolledWindow` with
-        // the right policy/expand flags — no need to wrap again.
-        let page = chain_page::build(&self.state, &self.debouncer, &self.input_sender);
-        self.body_container.append(&page);
+        // Pending debounced sends target widgets of the old page.
+        self.debouncer.cancel_all();
+        let view_state = self
+            .chain_page
+            .as_ref()
+            .map(chain_page::ChainPage::view_state);
+        let page = chain_page::build(&self.state, &self.debouncer, &self.chain_emit);
+        self.set_body(&page.root);
+        if let Some(view_state) = &view_state {
+            page.restore(view_state);
+        }
+        self.chain_page = Some(page);
     }
 
-    fn replace_body_with_status_page(&self, reason: &str) {
-        clear_children(&self.body_container);
-        let socket = self.state.socket_path.clone();
-        let retry_sender = self.input_sender.clone();
-        let page = status_page::build(&socket, reason, move || {
-            let _ = retry_sender.send(AppMsg::Retry);
-        });
-        self.body_container.append(&page);
+    /// Replace the body content with `widget`, forgetting the chain
+    /// page (callers showing a chain page set it again).
+    fn set_body(&mut self, widget: &impl IsA<gtk::Widget>) {
+        self.chain_page = None;
+        while let Some(child) = self.body_container.first_child() {
+            self.body_container.remove(&child);
+        }
+        self.body_container.append(widget);
     }
 
     fn retry(&mut self) {
         tracing::info!("retry: re-creating IPC worker");
         // Drop the old worker (its background thread tears down) and
-        // create a fresh one.
+        // create a fresh one; replies owed by the old one are gone.
         self.worker = None;
-        let socket_path = self.state.socket_path.clone();
-        let worker = IpcWorker::builder()
-            .detach_worker(socket_path)
-            .forward(&self.input_sender, AppMsg::Ipc);
-        self.worker = Some(worker);
+        self.pending.clear();
+        self.worker = Some(spawn_worker(
+            self.state.socket_path.clone(),
+            &self.input_sender,
+        ));
         self.state.status = ConnectionStatus::Connecting;
-        clear_children(&self.body_container);
-        self.body_container
-            .append(&connecting_page("Re-establishing the daemon socket."));
-    }
-}
-
-/// Remove every child from a `gtk::Box`. relm4 has no built-in
-/// "replace contents" for raw widgets.
-fn clear_children(container: &gtk::Box) {
-    while let Some(child) = container.first_child() {
-        container.remove(&child);
-    }
-}
-
-/// Build a "Connecting…" status page with the supplied description.
-/// Icon and title are constant; only the description differs between
-/// the initial wait and the post-Retry wait.
-fn connecting_page(description: &str) -> adw::StatusPage {
-    adw::StatusPage::builder()
-        .icon_name("content-loading-symbolic")
-        .title("Connecting…")
-        .description(description)
-        .hexpand(true)
-        .vexpand(true)
-        .build()
-}
-
-/// Read the leaf value at `path` (`<section>.<effect>.<field>`) out of
-/// the active config tree. Returns `None` if any segment is missing.
-///
-/// Mirrors the layout the daemon's `Set` command writes back: the path
-/// is rewritten to `<section>.per_effect.<effect>.<field>` for the
-/// lookup, because per-effect fields live under `per_effect`.
-fn read_config_value(config: &serde_json::Value, path: &str) -> Option<serde_json::Value> {
-    let mut parts = path.splitn(3, '.');
-    let section = parts.next()?;
-    let effect = parts.next()?;
-    let field = parts.next()?;
-    config
-        .get(section)?
-        .get("per_effect")?
-        .get(effect)?
-        .get(field)
-        .cloned()
-}
-
-/// Write `value` at `<section>.per_effect.<effect>.<field>` inside the
-/// active config tree, creating intermediate objects as needed. Used
-/// to keep the cached config in sync when a `Set` is accepted by the
-/// daemon so subsequent `rebuild_chain_page` calls render the new
-/// value without a full `GetConfig` round-trip.
-fn set_config_value(config: &mut serde_json::Value, path: &str, value: serde_json::Value) {
-    let mut parts = path.splitn(3, '.');
-    let (Some(section), Some(effect), Some(field)) = (parts.next(), parts.next(), parts.next())
-    else {
-        tracing::warn!(path, "set_config_value: malformed dot-path, skipped");
-        return;
-    };
-    if !config.is_object() {
-        *config = serde_json::Value::Object(serde_json::Map::new());
-    }
-    let root = config
-        .as_object_mut()
-        .expect("config coerced to object just above");
-    let section_obj = root
-        .entry(section.to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    if !section_obj.is_object() {
-        *section_obj = serde_json::Value::Object(serde_json::Map::new());
-    }
-    let section_map = section_obj
-        .as_object_mut()
-        .expect("section coerced to object just above");
-    let per_effect = section_map
-        .entry("per_effect".to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    if !per_effect.is_object() {
-        *per_effect = serde_json::Value::Object(serde_json::Map::new());
-    }
-    let per_effect_map = per_effect
-        .as_object_mut()
-        .expect("per_effect coerced to object just above");
-    let effect_obj = per_effect_map
-        .entry(effect.to_string())
-        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-    if !effect_obj.is_object() {
-        *effect_obj = serde_json::Value::Object(serde_json::Map::new());
-    }
-    let effect_map = effect_obj
-        .as_object_mut()
-        .expect("effect coerced to object just above");
-    effect_map.insert(field.to_string(), value);
-}
-
-/// Compose a one-line toast title from the daemon's error reason and
-/// optional hint. Kept short — toasts wrap awkwardly past one line.
-fn format_toast_error(error: &str, hint: Option<&str>) -> String {
-    match hint {
-        Some(h) if !h.is_empty() => format!("{error} — {h}"),
-        _ => error.to_string(),
-    }
-}
-
-/// Spawn `gst-launch-1.0` on `/dev/video10` to show the daemon's
-/// live output. Detached — closing the GUI does not kill the viewer
-/// (use case: open preview once, keep tuning).
-///
-/// Failures are logged but not surfaced to the user via a dialog
-/// because the operation is best-effort.
-fn open_preview() {
-    let mut cmd = ProcessCommand::new("gst-launch-1.0");
-    let device_arg = format!("device={DEFAULT_PREVIEW_DEVICE}");
-    cmd.args([
-        "v4l2src",
-        device_arg.as_str(),
-        "!",
-        "videoconvert",
-        "!",
-        "autovideosink",
-    ]);
-    match cmd.spawn() {
-        Ok(child) => tracing::info!(pid = child.id(), "spawned gst-launch preview"),
-        Err(e) => tracing::warn!(error = %e, "failed to spawn gst-launch"),
+        self.refresh_header();
+        self.set_body(&status_page::connecting(
+            "Re-establishing the daemon socket.",
+        ));
     }
 }

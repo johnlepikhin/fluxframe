@@ -307,8 +307,8 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<(), FluxError> {
 }
 
 /// Drop `per_effect` entries that do not correspond to any chain
-/// member (and are not one of the reserved keys `model` /
-/// `model_config` / `fallback_threshold`). Operates on a clone so
+/// member (and are not one of
+/// [`fluxframe_core::config::PIPELINE_RESERVED_KEYS`]). Operates on a clone so
 /// the caller's in-memory state is untouched — the runtime owns
 /// in-memory consistency via the `SetChain` handler; persistence
 /// just enforces it at the on-disk boundary.
@@ -325,10 +325,7 @@ fn normalise_preset(preset: &Preset) -> Preset {
     {
         slot.per_effect.retain(|key, _| {
             slot.chain.iter().any(|n| n == key)
-                || matches!(
-                    key.as_str(),
-                    "model" | "model_config" | "fallback_threshold"
-                )
+                || fluxframe_core::PipelineSection::is_reserved_key(key)
         });
     }
     out
@@ -440,6 +437,31 @@ strength = 0.3
             .unwrap();
         assert_eq!(
             blur_cfg.get("radius").and_then(toml::Value::as_integer),
+            Some(40)
+        );
+    }
+
+    #[test]
+    fn disabled_flag_round_trips_through_save() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("cfg.toml");
+        let mut preset = sample_preset();
+        preset
+            .background
+            .as_mut()
+            .and_then(|bg| bg.per_effect.get_mut("blur"))
+            .and_then(toml::Value::as_table_mut)
+            .expect("sample preset has [background.blur]")
+            .insert("enabled".into(), toml::Value::Boolean(false));
+        save_preset(&path, "demo", &preset).unwrap();
+        let cfg = fluxframe_core::FluxConfig::from_toml_str(&fs::read_to_string(&path).unwrap())
+            .expect("re-parse saved file");
+        let blur = cfg.presets["demo"].background.as_ref().unwrap().per_effect["blur"]
+            .as_table()
+            .expect("blur table");
+        assert_eq!(blur.get("enabled"), Some(&toml::Value::Boolean(false)));
+        assert_eq!(
+            blur.get("radius").and_then(toml::Value::as_integer),
             Some(40)
         );
     }

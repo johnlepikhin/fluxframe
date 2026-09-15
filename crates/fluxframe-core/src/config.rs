@@ -629,6 +629,26 @@ pub struct PipelineSection {
     pub per_effect: BTreeMap<String, toml::Value>,
 }
 
+/// Section-level keys of a [`PipelineSection`] that are control fields,
+/// not effect names. They can reach [`PipelineSection::per_effect`]
+/// (e.g. when a section is assembled by hand), so every consumer that
+/// walks `per_effect` as "effect name → params" must skip them.
+///
+/// These live one level above effect tables: a key such as `enabled`
+/// inside `[background.blur]` is an effect-table key and never collides
+/// with this list.
+pub const PIPELINE_RESERVED_KEYS: &[&str] =
+    &["chain", "model", "model_config", "fallback_threshold"];
+
+impl PipelineSection {
+    /// Whether `key` is one of [`PIPELINE_RESERVED_KEYS`] rather than an
+    /// effect name.
+    #[must_use]
+    pub fn is_reserved_key(key: &str) -> bool {
+        PIPELINE_RESERVED_KEYS.contains(&key)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Section: presets (named composite pipelines)
 // ---------------------------------------------------------------------------

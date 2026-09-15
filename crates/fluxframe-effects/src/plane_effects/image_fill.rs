@@ -164,6 +164,34 @@ fn prepare_err(reason: impl Into<String>) -> EffectError {
     }
 }
 
+/// Reject a `path` that cannot be opened as a regular file.
+///
+/// Runs in `configure`, so a bad live `set` fails as a command error
+/// instead of on the next frame — where a failed lazy reload stops the
+/// pipeline — and a disabled effect cannot hold a broken path until it
+/// is re-enabled. Only opens the file; decoding stays in `prepare` /
+/// `process`.
+fn check_image_path(path: &Path) -> Result<(), EffectError> {
+    let invalid = |reason: String| EffectError::InvalidConfig {
+        name: ImageFillEffect::NAME.to_string(),
+        reason,
+        hint: Some("point `path` at an existing, readable PNG or JPEG file".into()),
+    };
+    let file = std::fs::File::open(path)
+        .map_err(|e| invalid(format!("cannot open `path` {}: {e}", path.display())))?;
+    let is_file = file
+        .metadata()
+        .map_err(|e| invalid(format!("cannot stat `path` {}: {e}", path.display())))?
+        .is_file();
+    if !is_file {
+        return Err(invalid(format!(
+            "`path` {} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Load, decode and resize the image at `path` into a `width × height`
 /// RGB buffer according to the fit mode.  Returns the resulting buffer
 /// of length `width * height * 3`.
@@ -220,6 +248,7 @@ impl PlaneEffect for ImageFillEffect {
         let cfg: ImageFillConfig = params
             .try_into()
             .map_err(|e: toml::de::Error| super::invalid_config(Self::NAME, e.to_string()))?;
+        check_image_path(&cfg.path)?;
         self.config = Some(cfg);
         Ok(())
     }
@@ -338,27 +367,57 @@ mod tests {
 
     #[test]
     fn configure_parses_minimal_toml() {
+        let bg = make_png(2, 2, [0, 0, 0]);
         let mut effect = ImageFillEffect::new();
-        let params = parse(r#"path = "/tmp/bg.png""#);
+        let params = parse(&format!("path = {:?}", bg.path()));
         effect.configure(params).expect("configure");
         let cfg = effect.config.as_ref().unwrap();
-        assert_eq!(cfg.path, std::path::Path::new("/tmp/bg.png"));
+        assert_eq!(cfg.path, bg.path());
         assert_eq!(cfg.fit, FitMode::Cover);
         assert_eq!(cfg.letterbox_rgb, [0, 0, 0]);
     }
 
     #[test]
     fn configure_parses_all_fit_modes() {
+        let bg = make_png(2, 2, [0, 0, 0]);
         for fit_str in ["cover", "stretch", "contain"] {
             let mut effect = ImageFillEffect::new();
             let params = parse(&format!(
                 r#"
-path = "/tmp/bg.png"
+path = {:?}
 fit = "{fit_str}"
-"#
+"#,
+                bg.path()
             ));
             effect.configure(params).expect("configure");
         }
+    }
+
+    /// Regression: a missing file used to pass `configure` and only
+    /// fail on the next frame's lazy reload, stopping the pipeline.
+    #[test]
+    fn configure_rejects_missing_file() {
+        let mut effect = ImageFillEffect::new();
+        let err = effect
+            .configure(parse(r#"path = "/nonexistent/bg.png""#))
+            .expect_err("missing file must be rejected at configure time");
+        match err {
+            EffectError::InvalidConfig { reason, .. } => {
+                assert!(reason.contains("cannot open"), "reason: {reason}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(effect.config.is_none(), "rejected config must not be kept");
+    }
+
+    #[test]
+    fn configure_rejects_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut effect = ImageFillEffect::new();
+        let err = effect
+            .configure(parse(&format!("path = {:?}", dir.path())))
+            .expect_err("directory must be rejected");
+        assert!(format!("{err}").contains("not a regular file"), "{err}");
     }
 
     #[test]
@@ -380,10 +439,14 @@ fit = "weird"
 
     #[test]
     fn prepare_fails_when_file_missing() {
+        // The file exists at configure time and disappears before
+        // prepare (e.g. deleted between a live `set` and a reload).
+        let bg = make_png(2, 2, [0, 0, 0]);
         let mut effect = ImageFillEffect::new();
         effect
-            .configure(parse(r#"path = "/nonexistent/bg.png""#))
+            .configure(parse(&format!("path = {:?}", bg.path())))
             .unwrap();
+        drop(bg);
         let err = effect
             .prepare(&ctx(4, 4))
             .expect_err("missing file must surface PrepareFailed");
@@ -490,8 +553,11 @@ fit = "cover"
 
     #[test]
     fn process_fails_before_prepare() {
+        let bg = make_png(2, 2, [0, 0, 0]);
         let mut effect = ImageFillEffect::new();
-        effect.configure(parse(r#"path = "/tmp/bg.png""#)).unwrap();
+        effect
+            .configure(parse(&format!("path = {:?}", bg.path())))
+            .unwrap();
         // Skip prepare — process should refuse rather than panic.
         let mut data = vec![0u8; 4 * 4 * 3];
         let mut plane = FramePlane::new(&mut data, 4, 4);

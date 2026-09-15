@@ -7,18 +7,13 @@
 #![warn(missing_docs)]
 
 mod app;
+mod components;
 mod debounce;
 mod ipc;
 mod persistence;
+mod reply;
 mod shortcuts;
 mod state;
-mod components {
-    pub mod chain_page;
-    pub mod param_row;
-    pub mod preset_bar;
-    pub mod preview;
-    pub mod status_page;
-}
 
 use std::path::PathBuf;
 
@@ -52,19 +47,27 @@ fn main() {
         .init();
 
     // GStreamer is used by the embedded preview pane (see
-    // crates/fluxframe-gui/src/components/preview.rs). gst_init is
-    // idempotent; calling it once here guarantees the pipeline-
-    // construction sites can assume "GStreamer is up". Failure is
-    // logged but does not abort — the preview will be inert and the
-    // rest of the GUI keeps working.
-    if let Err(e) = gstreamer::init() {
-        tracing::warn!(error = %e, "gstreamer::init failed; embedded preview will be inert");
-    }
+    // crates/fluxframe-gui/src/components/preview/). Failure is logged
+    // but does not abort: the outcome is handed to the preview, which
+    // then stays an inert placeholder without touching any gst API,
+    // and the rest of the GUI keeps working.
+    let gst_ready = match gstreamer::init() {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "gstreamer::init failed; embedded preview will be inert");
+            false
+        }
+    };
 
     let args = Args::parse();
     let socket_path = args.socket.unwrap_or_else(default_socket_path);
     tracing::info!(path = %socket_path.display(), "starting fluxframe-gui");
 
-    let app = RelmApp::new("io.fluxframe.gui");
-    app.run::<AppModel>(socket_path);
+    // clap already consumed argv; without `with_args` relm4 forwards
+    // the process arguments to GApplication, which rejects `--socket`.
+    let app = RelmApp::new("io.fluxframe.gui").with_args(Vec::new());
+    app.run::<AppModel>(app::AppInit {
+        socket_path,
+        gst_ready,
+    });
 }

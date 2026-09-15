@@ -946,6 +946,30 @@ impl StageTimings {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+
+    /// Forget the ring of stage `scope/name`, if any. Called when a
+    /// stage stops running (an effect is disabled or removed from its
+    /// chain) so the summary does not keep reporting its last samples
+    /// as if they were current. Takes plain strings because the caller
+    /// usually holds a runtime effect name, not a `'static` key.
+    pub fn remove(&self, scope: &str, name: &str) {
+        let mut table = self.table.lock();
+        let Some(pos) = table
+            .entries
+            .iter()
+            .position(|(key, _)| key.scope == scope && key.name == name)
+        else {
+            return;
+        };
+        let (key, _) = table.entries.remove(pos);
+        table.index.remove(&key);
+        // Entries after `pos` shifted left by one.
+        for idx in table.index.values_mut() {
+            if *idx > pos {
+                *idx -= 1;
+            }
+        }
+    }
 }
 
 /// Render stage snapshots as one compact `key=p50/p95` list (µs),
@@ -1127,6 +1151,15 @@ impl EffectTelemetry {
     pub fn record_stage(&self, key: StageKey, d: Duration) {
         if let Some(t) = &self.stages {
             t.record(key, d);
+        }
+    }
+
+    /// Drop the samples of stage `scope/name` because it stopped
+    /// running; see [`StageTimings::remove`].  No-op without a stage
+    /// table.
+    pub fn forget_stage(&self, scope: &str, name: &str) {
+        if let Some(t) = &self.stages {
+            t.remove(scope, name);
         }
     }
 }
@@ -1800,6 +1833,32 @@ mod tests {
         t.record(K_A, Duration::from_micros(7));
         t.record(K_A, Duration::from_micros(9));
         assert_eq!(t.snapshot()[0].latency.len(), 1);
+    }
+
+    #[test]
+    fn stage_timings_remove_forgets_one_stage_and_keeps_index_consistent() {
+        const K_C: StageKey = StageKey::new("post", "mirror");
+        let t = StageTimings::with_capacity(8);
+        t.record(K_A, Duration::from_micros(1));
+        t.record(K_B, Duration::from_micros(2));
+        t.record(K_C, Duration::from_micros(3));
+
+        t.remove("background", "blur");
+        t.remove("background", "absent");
+        let keys: Vec<StageKey> = t.snapshot().iter().map(|s| s.key).collect();
+        assert_eq!(keys, vec![K_A, K_C]);
+
+        // The shifted entry still receives its own samples.
+        t.record(K_C, Duration::from_micros(9));
+        let snap = t.snapshot();
+        assert_eq!(snap[1].key, K_C);
+        assert_eq!(snap[1].latency.len(), 2);
+
+        // A removed stage that runs again starts from scratch.
+        t.record(K_B, Duration::from_micros(4));
+        let snap = t.snapshot();
+        assert_eq!(snap[2].key, K_B);
+        assert_eq!(snap[2].latency.len(), 1);
     }
 
     #[test]

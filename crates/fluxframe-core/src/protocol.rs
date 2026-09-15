@@ -27,6 +27,7 @@ use crate::SubchainKind;
 /// {"cmd":"set_preset","name":"blur"}
 /// {"cmd":"set","path":"background.blur.radius","value":40}
 /// {"cmd":"set_chain","section":"background","chain":["blur","vignette"]}
+/// {"cmd":"set_enabled","section":"background","effect":"blur","enabled":false}
 /// ```
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[non_exhaustive]
@@ -81,6 +82,19 @@ pub enum Command {
         /// New chain (effect names in order).
         chain: Vec<String>,
     },
+    /// Switch an effect of a sub-chain on or off without removing it or
+    /// its parameters. A disabled effect stays built and prepared but is
+    /// skipped per frame; the flag is stored as `enabled = false` in the
+    /// effect's table and persists on Save. Applies to every chain entry
+    /// with that name.
+    SetEnabled {
+        /// One of `mask|background|foreground|post`.
+        section: SubchainKind,
+        /// Effect name as listed in the section's chain.
+        effect: String,
+        /// `false` bypasses the effect, `true` runs it again.
+        enabled: bool,
+    },
     /// Re-read the TOML config from disk and reapply the current
     /// preset against the freshly-parsed config. Equivalent to
     /// "edit the file then `set_preset <currently active>`".
@@ -93,8 +107,7 @@ pub enum Command {
     SavePreset,
     /// Persist the currently-active preset under a new name, creating
     /// a fresh `[presets.NAME]` block in the TOML config file. Does
-    /// not switch the active preset; the GUI emits a follow-up
-    /// [`Command::SetPreset`] when "save and switch" is requested.
+    /// not switch the active preset.
     SavePresetAs {
         /// New preset name. Identifier vocabulary: ASCII letters,
         /// digits, underscores, dashes; non-empty.
@@ -169,7 +182,7 @@ impl Response {
 }
 
 /// A parsed `<section>.<effect>.<field>` path.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SetPath {
     /// Sub-chain identifier parsed from the first dot-component.
     pub section: SubchainKind,
@@ -177,6 +190,13 @@ pub struct SetPath {
     pub effect: String,
     /// Field name on the effect's config struct.
     pub field: String,
+}
+
+/// Renders the wire form accepted by [`parse_set_path`].
+impl std::fmt::Display for SetPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.section, self.effect, self.field)
+    }
 }
 
 /// Parse the dot-syntax expected by the `set` command.
@@ -286,6 +306,38 @@ mod tests {
     }
 
     #[test]
+    fn set_enabled_round_trips() {
+        let wire = r#"{"cmd":"set_enabled","section":"post","effect":"mirror","enabled":false}"#;
+        let cmd: Command = serde_json::from_str(wire).expect("parses");
+        assert_eq!(
+            cmd,
+            Command::SetEnabled {
+                section: SubchainKind::Post,
+                effect: "mirror".into(),
+                enabled: false,
+            }
+        );
+        let back: Command = serde_json::from_str(&serde_json::to_string(&cmd).expect("serialises"))
+            .expect("re-parses");
+        assert_eq!(back, cmd);
+    }
+
+    #[test]
+    fn set_enabled_rejects_unknown_section_missing_flag_and_extra_fields() {
+        for wire in [
+            r#"{"cmd":"set_enabled","section":"bogus","effect":"blur","enabled":false}"#,
+            r#"{"cmd":"set_enabled","section":"background","effect":"blur"}"#,
+            r#"{"cmd":"set_enabled","section":"background","effect":"blur","enabled":"no"}"#,
+            r#"{"cmd":"set_enabled","section":"background","effect":"blur","enabled":true,"x":1}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Command>(wire).is_err(),
+                "must be rejected: {wire}"
+            );
+        }
+    }
+
+    #[test]
     fn set_chain_rejects_unknown_section() {
         let res: Result<Command, _> =
             serde_json::from_str(r#"{"cmd":"set_chain","section":"bogus","chain":["blur"]}"#);
@@ -343,6 +395,13 @@ mod tests {
         assert_eq!(p.section, SubchainKind::Background);
         assert_eq!(p.effect, "blur");
         assert_eq!(p.field, "radius");
+    }
+
+    #[test]
+    fn set_path_display_round_trips_through_parse() {
+        let p = parse_set_path("post.auto_frame.smoothing").expect("ok");
+        assert_eq!(p.to_string(), "post.auto_frame.smoothing");
+        assert_eq!(parse_set_path(&p.to_string()).expect("ok"), p);
     }
 
     #[test]

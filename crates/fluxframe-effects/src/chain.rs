@@ -165,6 +165,53 @@ impl EffectChain {
         })
     }
 
+    /// Enable or disable a sub-effect of the chain's composite; see
+    /// [`crate::composite::CompositeEffect::set_effect_enabled`].
+    /// Returns whether any flag changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EffectError::ProcessFailed`] when the chain hosts no
+    /// composite effect, or [`EffectError::InvalidConfig`] when no
+    /// effect matches `name`.
+    #[cfg(feature = "ml")]
+    pub fn set_effect_enabled(
+        &mut self,
+        section: SubchainKind,
+        name: &str,
+        enabled: bool,
+    ) -> Result<bool, EffectError> {
+        if let Some(composite) = self.composite_mut() {
+            return composite.set_effect_enabled(section, name, enabled);
+        }
+        Err(EffectError::ProcessFailed {
+            name: "chain".to_string(),
+            reason: format!("chain has no composite effect — cannot toggle {section}.{name}"),
+        })
+    }
+
+    /// Slim-build stub: without the `ml` feature there is no composite
+    /// to toggle effects in.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`EffectError::ProcessFailed`].
+    #[cfg(not(feature = "ml"))]
+    pub fn set_effect_enabled(
+        &mut self,
+        section: SubchainKind,
+        name: &str,
+        _enabled: bool,
+    ) -> Result<bool, EffectError> {
+        Err(EffectError::ProcessFailed {
+            name: "chain".to_string(),
+            reason: format!(
+                "chain has no composite effect — cannot toggle {section}.{name} \
+                 (built without `ml` feature)"
+            ),
+        })
+    }
+
     /// Slim-build stub: without the `ml` feature there is no
     /// composite, so live reconfiguration is unsupported.
     ///

@@ -107,6 +107,12 @@ impl MaskEffect for SmoothTemporalMaskEffect {
         Self::NAME
     }
 
+    fn reset_state(&mut self) {
+        // The next `process` re-seeds from the current mask instead of
+        // blending it with a mask from before the effect was disabled.
+        self.prev.clear();
+    }
+
     fn configure(&mut self, params: RawEffectParams) -> Result<(), EffectError> {
         let cfg: SmoothTemporalConfig = params
             .try_into()
@@ -173,6 +179,25 @@ mod tests {
         effect.process(&mut plane, &mut ctx).expect("ok");
         assert_eq!(data, vec![0.5, 0.5, 0.5, 0.5]);
         assert_eq!(effect.prev, vec![0.5, 0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn reset_state_reseeds_from_the_next_mask() {
+        let mut effect = SmoothTemporalMaskEffect::new();
+        let mut ctx = FrameContext::default();
+        let mut old = vec![1.0, 1.0];
+        effect
+            .process(&mut MaskPlane::new(&mut old, 2, 1), &mut ctx)
+            .expect("seed");
+        effect.reset_state();
+        assert!(effect.prev.is_empty());
+
+        // Without the reset this frame would blend towards the old 1.0s.
+        let mut fresh = vec![0.0, 0.0];
+        effect
+            .process(&mut MaskPlane::new(&mut fresh, 2, 1), &mut ctx)
+            .expect("reseed");
+        assert_eq!(fresh, vec![0.0, 0.0]);
     }
 
     #[test]

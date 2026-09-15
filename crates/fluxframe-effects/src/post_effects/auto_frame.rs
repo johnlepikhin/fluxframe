@@ -341,6 +341,12 @@ impl PostEffect for AutoFrameEffect {
         Self::NAME
     }
 
+    fn reset_state(&mut self) {
+        // Start tracking from the current subject box instead of gliding
+        // from where the subject was before the effect was disabled.
+        self.state = None;
+    }
+
     fn configure(&mut self, params: RawEffectParams) -> Result<(), EffectError> {
         let cfg: AutoFrameConfig = params
             .try_into()

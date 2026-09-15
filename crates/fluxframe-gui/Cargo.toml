@@ -12,11 +12,12 @@ description = "GTK4/libadwaita GUI client for the FluxFrame control socket."
 fluxframe-core = { workspace = true }
 # GTK stack — keep these out of workspace.dependencies because the
 # `package = "..."` rename does not play well with workspace
-# inheritance. Version + features must match the daemon-shared
-# workspace pin (kept in sync by hand).
+# inheritance. relm4's `gnome_48` implies gtk `v4_18` + adw `v1_7`;
+# adw `v1_8` is required on top for `AdwShortcutsDialog`, so the
+# runtime minimum is libadwaita 1.8.
 relm4 = { version = "0.10", default-features = false, features = ["macros", "libadwaita", "gnome_48"] }
 gtk = { package = "gtk4", version = "0.10", features = ["v4_18"] }
-adw = { package = "libadwaita", version = "0.8", features = ["v1_6", "gtk_v4_18"] }
+adw = { package = "libadwaita", version = "0.8", features = ["v1_8", "gtk_v4_18"] }
 # Embedded preview pulls RGBA samples through `appsink` from a local
 # `v4l2src device=/dev/video10` pipeline and paints them into a
 # `gtk::Picture` via `gdk::MemoryTexture`. Pinned to the same minor
@@ -24,7 +25,6 @@ adw = { package = "libadwaita", version = "0.8", features = ["v1_6", "gtk_v4_18"
 gstreamer = { workspace = true }
 gstreamer-app = { workspace = true }
 gstreamer-video = { workspace = true }
-glib = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -37,6 +37,10 @@ tracing-subscriber = { workspace = true }
 # / `fluxframe-cli`; not promoted to workspace.dependencies until a
 # third consumer appears.
 tempfile = "3"
+# Test fixtures parse real preset TOML into `fluxframe_core::Preset`
+# and serialise it the way the daemon's `get_config` does, so the GUI
+# never tests against a hand-written JSON shape.
+toml = { workspace = true }
 
 [[bin]]
 name = "fluxframe-gui"

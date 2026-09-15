@@ -56,12 +56,12 @@ fn process_err(reason: impl Into<String>) -> EffectError {
 /// mistaken TOML cannot silently produce a half-configured composite.
 pub struct CompositeEffect {
     segmentation: SegmentationBase,
-    mask_chain: Vec<Box<dyn MaskEffect>>,
-    bg_chain: Vec<Box<dyn PlaneEffect>>,
-    fg_chain: Vec<Box<dyn PlaneEffect>>,
+    mask_chain: Vec<Slot<dyn MaskEffect>>,
+    bg_chain: Vec<Slot<dyn PlaneEffect>>,
+    fg_chain: Vec<Slot<dyn PlaneEffect>>,
     /// Post-composite mask-aware chain. Each effect sees the already-
     /// blended frame plus a read-only view of the upscaled mask.
-    post_chain: Vec<Box<dyn PostEffect>>,
+    post_chain: Vec<Slot<dyn PostEffect>>,
     /// Mask at frame resolution after the implicit bilinear upscale.
     mask_full: Vec<f32>,
     /// Frame-sized scratch holding the background plane through the
@@ -85,13 +85,43 @@ pub struct CompositeEffect {
 /// in atomically (the old chain is dropped on the swap-out vector).
 pub enum SubChainPayload {
     /// Replacement mask post-processing chain.
-    Mask(Vec<Box<dyn MaskEffect>>),
+    Mask(Vec<Slot<dyn MaskEffect>>),
     /// Replacement background plane chain.
-    Background(Vec<Box<dyn PlaneEffect>>),
+    Background(Vec<Slot<dyn PlaneEffect>>),
     /// Replacement foreground plane chain.
-    Foreground(Vec<Box<dyn PlaneEffect>>),
+    Foreground(Vec<Slot<dyn PlaneEffect>>),
     /// Replacement post-composite chain.
-    Post(Vec<Box<dyn PostEffect>>),
+    Post(Vec<Slot<dyn PostEffect>>),
+}
+
+/// A configured sub-effect together with its enable flag.
+///
+/// The flag lives next to the effect, so a sub-chain swap
+/// ([`CompositeEffect::replace_subchain`]) replaces effects and flags in
+/// one step and the two can never drift apart.
+pub struct Slot<E: ?Sized> {
+    effect: Box<E>,
+    enabled: bool,
+}
+
+impl<E: ?Sized> Slot<E> {
+    /// Pair a configured `effect` with its initial enable flag.
+    #[must_use]
+    pub fn new(effect: Box<E>, enabled: bool) -> Self {
+        Self { effect, enabled }
+    }
+
+    /// The wrapped effect.
+    #[must_use]
+    pub fn effect(&self) -> &E {
+        &self.effect
+    }
+
+    /// Whether the effect runs per frame.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
 }
 
 impl CompositeEffect {
@@ -102,10 +132,10 @@ impl CompositeEffect {
     #[must_use]
     pub fn new(
         segmentation: SegmentationBase,
-        mask_chain: Vec<Box<dyn MaskEffect>>,
-        bg_chain: Vec<Box<dyn PlaneEffect>>,
-        fg_chain: Vec<Box<dyn PlaneEffect>>,
-        post_chain: Vec<Box<dyn PostEffect>>,
+        mask_chain: Vec<Slot<dyn MaskEffect>>,
+        bg_chain: Vec<Slot<dyn PlaneEffect>>,
+        fg_chain: Vec<Slot<dyn PlaneEffect>>,
+        post_chain: Vec<Slot<dyn PostEffect>>,
     ) -> Self {
         Self {
             segmentation,
@@ -176,14 +206,57 @@ impl CompositeEffect {
             SubChainPayload::Post(v) => replace_chain(&mut self.post_chain, v, ctx.as_ref()),
         }
     }
+
+    /// Enable or disable every effect named `name` in `section`.
+    ///
+    /// A disabled effect keeps its configuration and prepared resources
+    /// but is skipped per frame. Re-enabling resets its temporal state
+    /// first ([`MaskEffect::reset_state`]), so it does not resume from
+    /// stale history. Returns whether any flag actually changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EffectError::InvalidConfig`] when the sub-chain has no
+    /// effect named `name`.
+    pub fn set_effect_enabled(
+        &mut self,
+        section: SubchainKind,
+        name: &str,
+        enabled: bool,
+    ) -> Result<bool, EffectError> {
+        match section {
+            SubchainKind::Mask => set_enabled_in(&mut self.mask_chain, name, enabled, section),
+            SubchainKind::Background => set_enabled_in(&mut self.bg_chain, name, enabled, section),
+            SubchainKind::Foreground => set_enabled_in(&mut self.fg_chain, name, enabled, section),
+            SubchainKind::Post => set_enabled_in(&mut self.post_chain, name, enabled, section),
+        }
+    }
+
+    /// Names of the disabled effects of `section`, in chain order.
+    #[must_use]
+    pub fn disabled_effects(&self, section: SubchainKind) -> Vec<&str> {
+        fn disabled<E: ?Sized + SubEffectAdapter>(chain: &[Slot<E>]) -> Vec<&str> {
+            chain
+                .iter()
+                .filter(|slot| !slot.enabled)
+                .map(|slot| slot.effect.name_str())
+                .collect()
+        }
+        match section {
+            SubchainKind::Mask => disabled(&self.mask_chain),
+            SubchainKind::Background => disabled(&self.bg_chain),
+            SubchainKind::Foreground => disabled(&self.fg_chain),
+            SubchainKind::Post => disabled(&self.post_chain),
+        }
+    }
 }
 
 /// Internal sub-chain swap helper. Generic over the four sub-effect
 /// traits via [`SubEffectAdapter`] so the same body serves
 /// mask/bg/fg/post.
 fn replace_chain<E: ?Sized + SubEffectAdapter>(
-    target: &mut Vec<Box<E>>,
-    mut new_chain: Vec<Box<E>>,
+    target: &mut Vec<Slot<E>>,
+    mut new_chain: Vec<Slot<E>>,
     ctx: Option<&ProcessingContext>,
 ) -> Result<(), EffectError> {
     let Some(ctx) = ctx else {
@@ -193,8 +266,9 @@ fn replace_chain<E: ?Sized + SubEffectAdapter>(
         });
     };
     // Prepare new effects first; on failure the old chain stays.
-    for effect in &mut new_chain {
-        effect.prepare_mut(ctx)?;
+    // Disabled effects are prepared too, so enabling one later is instant.
+    for slot in &mut new_chain {
+        slot.effect.prepare_mut(ctx)?;
     }
     // Drop old chain (each effect's Drop releases its resources).
     target.clear();
@@ -218,6 +292,8 @@ pub(crate) trait SubEffectAdapter {
     fn configure_mut(&mut self, params: RawEffectParams) -> Result<(), EffectError>;
     /// Run `prepare()` against the negotiated context.
     fn prepare_mut(&mut self, ctx: &ProcessingContext) -> Result<(), EffectError>;
+    /// Drop temporal state. Routes to the effect's `reset_state()`.
+    fn reset_state_mut(&mut self);
 }
 
 impl SubEffectAdapter for dyn MaskEffect {
@@ -229,6 +305,9 @@ impl SubEffectAdapter for dyn MaskEffect {
     }
     fn prepare_mut(&mut self, ctx: &ProcessingContext) -> Result<(), EffectError> {
         self.prepare(ctx)
+    }
+    fn reset_state_mut(&mut self) {
+        self.reset_state();
     }
 }
 
@@ -242,6 +321,9 @@ impl SubEffectAdapter for dyn PlaneEffect {
     fn prepare_mut(&mut self, ctx: &ProcessingContext) -> Result<(), EffectError> {
         self.prepare(ctx)
     }
+    fn reset_state_mut(&mut self) {
+        self.reset_state();
+    }
 }
 
 impl SubEffectAdapter for dyn PostEffect {
@@ -253,6 +335,9 @@ impl SubEffectAdapter for dyn PostEffect {
     }
     fn prepare_mut(&mut self, ctx: &ProcessingContext) -> Result<(), EffectError> {
         self.prepare(ctx)
+    }
+    fn reset_state_mut(&mut self) {
+        self.reset_state();
     }
 }
 
@@ -277,17 +362,18 @@ impl VideoEffect for CompositeEffect {
         }
 
         self.segmentation.prepare(context)?;
-        for effect in &mut self.mask_chain {
-            effect.prepare(context)?;
+        // Disabled effects are prepared too, so enabling one is instant.
+        for slot in &mut self.mask_chain {
+            slot.effect.prepare(context)?;
         }
-        for effect in &mut self.bg_chain {
-            effect.prepare(context)?;
+        for slot in &mut self.bg_chain {
+            slot.effect.prepare(context)?;
         }
-        for effect in &mut self.fg_chain {
-            effect.prepare(context)?;
+        for slot in &mut self.fg_chain {
+            slot.effect.prepare(context)?;
         }
-        for effect in &mut self.post_chain {
-            effect.prepare(context)?;
+        for slot in &mut self.post_chain {
+            slot.effect.prepare(context)?;
         }
 
         self.frame_w = context.width;
@@ -334,7 +420,8 @@ impl VideoEffect for CompositeEffect {
         // 2. Mask chain at model resolution.
         timed(ctx, StageKey::new(SCOPE, "mask_chain"), |ctx| {
             let mut mask_plane = MaskPlane::new(self.segmentation.mask_mut(), mask_w, mask_h);
-            for effect in &mut self.mask_chain {
+            for slot in self.mask_chain.iter_mut().filter(|slot| slot.enabled) {
+                let effect = &mut slot.effect;
                 timed(
                     ctx,
                     StageKey::new(SubchainKind::Mask.as_str(), effect.name()),
@@ -376,7 +463,8 @@ impl VideoEffect for CompositeEffect {
         // 6. Background chain runs on the snapshot.
         timed(ctx, StageKey::new(SCOPE, "bg_chain"), |ctx| {
             let mut background = FramePlane::new(&mut self.bg_plane, self.frame_w, self.frame_h);
-            for effect in &mut self.bg_chain {
+            for slot in self.bg_chain.iter_mut().filter(|slot| slot.enabled) {
+                let effect = &mut slot.effect;
                 timed(
                     ctx,
                     StageKey::new(SubchainKind::Background.as_str(), effect.name()),
@@ -389,7 +477,8 @@ impl VideoEffect for CompositeEffect {
         // 7. Foreground chain runs in place on `frame.data`.
         timed(ctx, StageKey::new(SCOPE, "fg_chain"), |ctx| {
             let mut foreground = FramePlane::new(frame_bytes, self.frame_w, self.frame_h);
-            for effect in &mut self.fg_chain {
+            for slot in self.fg_chain.iter_mut().filter(|slot| slot.enabled) {
+                let effect = &mut slot.effect;
                 timed(
                     ctx,
                     StageKey::new(SubchainKind::Foreground.as_str(), effect.name()),
@@ -412,7 +501,8 @@ impl VideoEffect for CompositeEffect {
         timed(ctx, StageKey::new(SCOPE, "post_chain"), |ctx| {
             let mut composed = FramePlane::new(frame_bytes, self.frame_w, self.frame_h);
             let mask_plane = MaskPlane::new(&mut self.mask_full, self.frame_w, self.frame_h);
-            for effect in &mut self.post_chain {
+            for slot in self.post_chain.iter_mut().filter(|slot| slot.enabled) {
+                let effect = &mut slot.effect;
                 timed(
                     ctx,
                     StageKey::new(SubchainKind::Post.as_str(), effect.name()),
@@ -455,22 +545,116 @@ fn reconfigure_in<'a, E, I>(
     section: SubchainKind,
 ) -> Result<(), EffectError>
 where
-    I: Iterator<Item = &'a mut Box<E>>,
+    I: Iterator<Item = &'a mut Slot<E>>,
     E: 'a + ?Sized + SubEffectAdapter,
 {
-    for effect in iter {
-        if effect.name_str() == name {
-            return effect.configure_mut(params);
+    for slot in iter {
+        if slot.effect.name_str() == name {
+            return slot.effect.configure_mut(params);
         }
     }
-    Err(EffectError::InvalidConfig {
+    Err(no_such_effect(name, section))
+}
+
+/// Set the flag of every slot named `name`; see
+/// [`CompositeEffect::set_effect_enabled`].
+fn set_enabled_in<E: ?Sized + SubEffectAdapter>(
+    chain: &mut [Slot<E>],
+    name: &str,
+    enabled: bool,
+    section: SubchainKind,
+) -> Result<bool, EffectError> {
+    let mut found = false;
+    let mut changed = false;
+    for slot in chain
+        .iter_mut()
+        .filter(|slot| slot.effect.name_str() == name)
+    {
+        found = true;
+        if slot.enabled != enabled {
+            if enabled {
+                slot.effect.reset_state_mut();
+            }
+            slot.enabled = enabled;
+            changed = true;
+        }
+    }
+    if found {
+        Ok(changed)
+    } else {
+        Err(no_such_effect(name, section))
+    }
+}
+
+fn no_such_effect(name: &str, section: SubchainKind) -> EffectError {
+    EffectError::InvalidConfig {
         name: CompositeEffect::NAME.to_string(),
         reason: format!("no effect named '{name}' in the '{section}' sub-chain"),
         hint: None,
-    })
+    }
 }
 
 // End-to-end test for `CompositeEffect::process` lives in
 // `tests/composite_e2e.rs` (added in Stage 9.6 once the builder is
 // in place — it needs the sidecar TOML loader or a test-only
 // shortcut into `SegmentationBase`).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::composite::segmentation::SegmentationConfig;
+
+    /// Composite whose background chain holds `names`, all enabled.
+    /// Never prepared: flag handling needs no model.
+    fn composite_with_background(names: &[&str]) -> CompositeEffect {
+        let registry = crate::plane_effects::default_registry();
+        let bg = names
+            .iter()
+            .map(|name| Slot::new(registry.build(name).expect("registered"), true))
+            .collect();
+        let segmentation = SegmentationBase::new(SegmentationConfig {
+            model: "/tmp/unused.onnx".into(),
+            model_config: None,
+            fallback_threshold: 3,
+        });
+        CompositeEffect::new(segmentation, Vec::new(), bg, Vec::new(), Vec::new())
+    }
+
+    #[test]
+    fn set_effect_enabled_toggles_every_slot_with_the_name() {
+        let mut c = composite_with_background(&["color_fill", "vignette", "color_fill"]);
+        let bg = SubchainKind::Background;
+
+        assert_eq!(
+            c.set_effect_enabled(bg, "color_fill", false).ok(),
+            Some(true)
+        );
+        assert_eq!(c.disabled_effects(bg), vec!["color_fill", "color_fill"]);
+        assert_eq!(
+            c.set_effect_enabled(bg, "color_fill", false).ok(),
+            Some(false),
+            "repeating the same flag changes nothing"
+        );
+
+        assert_eq!(
+            c.set_effect_enabled(bg, "color_fill", true).ok(),
+            Some(true)
+        );
+        assert!(c.disabled_effects(bg).is_empty());
+    }
+
+    #[test]
+    fn set_effect_enabled_rejects_unknown_name_or_wrong_section() {
+        let mut c = composite_with_background(&["color_fill"]);
+        for (section, name) in [
+            (SubchainKind::Background, "blur"),
+            (SubchainKind::Foreground, "color_fill"),
+        ] {
+            let err = c
+                .set_effect_enabled(section, name, false)
+                .expect_err("no such effect");
+            assert!(format!("{err}").contains("no effect named"), "{err}");
+        }
+        assert!(c.disabled_effects(SubchainKind::Background).is_empty());
+    }
+}

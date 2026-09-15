@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Minimum window dimensions enforced on load. Below this gtk would
-/// refuse to map or display a 1×1 dot.
-const MIN_WIDTH: i32 = 200;
+/// Minimum window dimensions enforced on load. 360 px is the narrowest
+/// width the chain page's param rows lay out in.
+const MIN_WIDTH: i32 = 360;
 const MIN_HEIGHT: i32 = 150;
 /// Upper guard against a hand-edited gui.json with absurd values.
 /// 8192 covers any reasonable desktop resolution while leaving plenty
@@ -89,18 +89,16 @@ fn sanitize(mut state: WindowState) -> WindowState {
     state
 }
 
-// Linux-only by construction: XDG_CONFIG_HOME / $HOME/.config.
-// The project targets Linux only (see CLAUDE.md); a future Windows
-// port should consult dirs::config_dir() instead.
+// Linux-only by construction: XDG_CONFIG_HOME / $HOME/.config
+// (the daemon itself depends on V4L2); a future Windows port should
+// consult dirs::config_dir() instead.
 /// Resolve the on-disk path for the persisted state.
 ///
-/// Honours `$XDG_CONFIG_HOME` when set; falls back to
+/// Honours a non-empty `$XDG_CONFIG_HOME`; falls back to
 /// `$HOME/.config`. The `fluxframe` subdirectory is created on first
 /// save.
 fn config_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    let base = fluxframe_core::paths::config_home()?;
     Some(config_path_in(&base))
 }
 

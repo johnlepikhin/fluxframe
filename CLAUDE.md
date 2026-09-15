@@ -9,7 +9,7 @@ End-to-end: V4L2 capture (or `videotestsrc`) → composite (mask + bg
 + fg sub-chains) → optional `[post]` chain → v4l2loopback /
 autovideosink / fakesink / pipewiresink. ONNX Runtime + OpenVINO
 inference backends, `wgpu` blur seam, named presets, UNIX control
-socket with live `set` / `set_chain` / `set_preset` / `reload` and
+socket with live `set` / `set_chain` / `set_enabled` / `set_preset` / `reload` and
 write-back `save_preset` / `save_preset_as` / `config_path`.
 `fluxframe-gui` (GTK4 / libadwaita) is the slider-style editor with
 embedded preview pane, dirty marker and explicit Save / Save as /
