@@ -61,6 +61,7 @@ The value of `ok` is the string `"true"` or `"false"`, not a JSON boolean.
 | `{"cmd":"get_config","path":"background.blur"}` | A part of the active preset, addressed by a dot-separated path.                                                     |
 | `{"cmd":"list_effects"}`                        | All available effects by group, with their parameters, types, defaults and ranges, and the daemon's build features. |
 | `{"cmd":"config_path"}`                         | `{"path":"..."}`: the file that saves write to, or `null` if there is none.                                         |
+| `{"cmd":"daemon_info"}`                         | `{"output":{"kind":"v4l2","device":"/dev/video10"}}`: where the daemon publishes video. `kind` is `v4l2` (with `device`), `pipewire` (with `node`), `auto` or `fakesink`. |
 
 ### Changing the active preset
 
@@ -119,7 +120,7 @@ restart the daemon.
 The socket stays available for the whole life of the daemon, including while it
 waits for a camera that is busy or unplugged. During such a wait there is no
 running pipeline: `list_presets`, `current_preset`, `get_config`,
-`list_effects` and `config_path` are answered as usual, and every other command
+`list_effects`, `config_path` and `daemon_info` are answered as usual, and every other command
 fails with `pipeline is not running (waiting for the camera)`. Retry it once
 the camera is back. Unsaved changes made before the camera was lost are kept and
 applied to the pipeline when it restarts.

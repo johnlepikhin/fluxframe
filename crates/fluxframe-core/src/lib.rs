@@ -40,7 +40,9 @@ pub use metrics::{
     emit_metrics_line, format_stage_summary,
 };
 pub use plane::{FramePlane, MaskEffect, MaskPlane, PlaneEffect, PostEffect, SubchainKind};
-pub use protocol::{Command, Response, SetPath, default_socket_path, parse_set_path};
+pub use protocol::{
+    Command, DaemonInfo, OutputInfo, Response, SetPath, default_socket_path, parse_set_path,
+};
 pub use traits::{
     InferenceEngine, InferenceInput, InferenceOutput, ModelInfo, RawEffectParams, VideoEffect,
     VideoSink, VideoSource,

@@ -144,6 +144,7 @@ fn command_label(cmd: &ControlCommand) -> &'static str {
         ControlCommand::SavePreset => "save_preset",
         ControlCommand::SavePresetAs { .. } => "save_preset_as",
         ControlCommand::ConfigPath => "config_path",
+        ControlCommand::DaemonInfo => "daemon_info",
         // `ControlCommand` is `#[non_exhaustive]` for forward-compat
         // with future wire variants. Tag unknowns explicitly so log
         // queries surface "we received something we cannot label yet".
@@ -174,6 +175,7 @@ fn apply_read_only_command(
         }
         ControlCommand::ListEffects => apply_list_effects_command(),
         ControlCommand::ConfigPath => apply_config_path_command(session.config_path.as_deref()),
+        ControlCommand::DaemonInfo => apply_daemon_info_command(&session.cfg),
         _ => return None,
     };
     Some(response)
@@ -382,6 +384,26 @@ fn apply_config_path_command(config_path: Option<&std::path::Path>) -> ControlRe
     match config_path {
         Some(p) => ControlResponse::ok_with(serde_json::json!({ "path": p })),
         None => ControlResponse::ok_with(serde_json::Value::Null),
+    }
+}
+
+/// Apply `daemon_info`: where the processed video is published, so a
+/// client (the GUI preview) does not have to guess the device.
+fn apply_daemon_info_command(cfg: &FluxConfig) -> ControlResponse {
+    use fluxframe_core::{DaemonInfo, OutputInfo};
+
+    let output = match classify_output(cfg) {
+        OutputSpec::V4l2(device) => OutputInfo::V4l2 { device },
+        OutputSpec::Pipewire(node) => OutputInfo::Pipewire { node },
+        OutputSpec::Auto => OutputInfo::Auto,
+        OutputSpec::Fake => OutputInfo::Fakesink,
+        OutputSpec::Unsupported(device) => {
+            return ControlResponse::err(format!("output '{device}' is not supported"), None);
+        }
+    };
+    match serde_json::to_value(DaemonInfo { output }) {
+        Ok(data) => ControlResponse::ok_with(data),
+        Err(e) => ControlResponse::err(format!("serialise failed: {e}"), None),
     }
 }
 
@@ -4520,6 +4542,7 @@ mod tests {
             ControlCommand::ListEffects,
             ControlCommand::GetConfig { path: None },
             ControlCommand::ConfigPath,
+            ControlCommand::DaemonInfo,
         ] {
             let resp = apply_offline_command(&session, &cmd);
             assert!(
@@ -4544,6 +4567,18 @@ mod tests {
                 "{cmd:?} must be refused without a pipeline"
             );
         }
+    }
+
+    #[test]
+    fn daemon_info_reports_the_configured_output() {
+        let mut cfg = base_cfg();
+        cfg.output.device = "pipewire:studio".into();
+        let session = test_session(cfg, "default");
+        let resp = apply_offline_command(&session, &ControlCommand::DaemonInfo);
+        assert_eq!(
+            ok_payload(&resp),
+            &serde_json::json!({"output": {"kind": "pipewire", "node": "studio"}})
+        );
     }
 
     /// While the daemon waits for a camera no worker loop drains the

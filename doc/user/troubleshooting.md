@@ -131,7 +131,8 @@ The reason is shown under the socket path:
  - "permission denied": the daemon runs as a different user. The socket is
    accessible only to its owner.
 
-The GUI does not reconnect by itself. Press Retry after fixing the cause.
+The GUI keeps retrying at growing intervals; press Retry Now to connect
+immediately after fixing the cause.
 
 ## Save is unavailable in the GUI
 

@@ -29,8 +29,14 @@ fluxframe-gui --socket /path/to/fluxframe.sock
 If the daemon is not reachable, the window shows "Daemon Unreachable" with the
 socket path and the reason: the daemon is not running, the socket file does not
 exist (usually `[control] enabled` is not set), or permission is denied (the
-daemon runs as a different user). Start or fix the daemon and press Retry. The
-GUI does not reconnect automatically.
+daemon runs as a different user). The GUI keeps trying to connect, first after
+one second and then at growing intervals up to every 30 seconds; Retry Now
+connects immediately. The same happens when a connected daemon stops or
+restarts.
+
+After a reconnect, unsaved edits the daemon still holds stay marked as unsaved.
+If they are gone, for example because the daemon was restarted and read its
+configuration file again, a notification says so.
 
 ## Window
 
@@ -61,8 +67,10 @@ count as a reader, so it does not keep the daemon out of idle mode. While the
 window is visible, however, the preview is a reader like any other application,
 and the camera stays on.
 
-The preview always reads `/dev/video10`, regardless of the daemon's
-`output.device`.
+The preview reads the v4l2loopback device the daemon writes to, as the daemon
+reports it. When the daemon publishes to PipeWire, a window or `fakesink`, there
+is no device to read, and the preview explains that instead. With a daemon older
+than the GUI, the preview assumes `/dev/video10`.
 
 ### Chain editor
 

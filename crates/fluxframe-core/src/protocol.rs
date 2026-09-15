@@ -119,6 +119,9 @@ pub enum Command {
     /// resolvable config file. The GUI calls this once at handshake
     /// time to decide whether to expose the Save button.
     ConfigPath,
+    /// Describe the daemon beyond the active preset: currently where it
+    /// publishes the processed video. Returns a [`DaemonInfo`].
+    DaemonInfo,
 }
 
 /// Response body returned for each command.
@@ -179,6 +182,37 @@ impl Response {
             hint,
         }
     }
+}
+
+/// Payload of [`Command::DaemonInfo`].
+///
+/// Clients must ignore fields they do not know, so the daemon can grow
+/// this without breaking older GUIs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonInfo {
+    /// Where the processed video is published.
+    pub output: OutputInfo,
+}
+
+/// Output sink reported by [`Command::DaemonInfo`], tagged by `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutputInfo {
+    /// A v4l2loopback (or other writable V4L2) device.
+    V4l2 {
+        /// Device node, e.g. `/dev/video10`.
+        device: PathBuf,
+    },
+    /// A PipeWire stream.
+    Pipewire {
+        /// Node name, when one is configured.
+        node: Option<String>,
+    },
+    /// A local window (`autovideosink`).
+    Auto,
+    /// Frames are discarded (`fakesink`).
+    Fakesink,
 }
 
 /// A parsed `<section>.<effect>.<field>` path.
@@ -365,6 +399,27 @@ mod tests {
             Command::GetConfig {
                 path: Some("background.blur".into())
             }
+        );
+    }
+
+    #[test]
+    fn daemon_info_parses_and_its_payload_round_trips() {
+        let cmd: Command = serde_json::from_str(r#"{"cmd":"daemon_info"}"#).expect("parses");
+        assert_eq!(cmd, Command::DaemonInfo);
+
+        let info = DaemonInfo {
+            output: OutputInfo::V4l2 {
+                device: PathBuf::from("/dev/video10"),
+            },
+        };
+        let wire = serde_json::to_value(&info).expect("serialises");
+        assert_eq!(
+            wire,
+            serde_json::json!({"output": {"kind": "v4l2", "device": "/dev/video10"}})
+        );
+        assert_eq!(
+            serde_json::from_value::<DaemonInfo>(wire).expect("parses back"),
+            info
         );
     }
 

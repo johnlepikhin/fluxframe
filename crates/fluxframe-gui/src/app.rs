@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
 use adw::prelude::*;
 use fluxframe_core::SubchainKind;
@@ -22,7 +23,7 @@ use crate::debounce::Debouncer;
 use crate::ipc::{IpcWorker, WorkerInput, WorkerOutput};
 use crate::reply::{self, NoticeKind, PendingKind, PendingRequests, ReplyEffects};
 use crate::shortcuts::{ActionEvent, Enablement, WindowActions};
-use crate::state::{AppState, ChainEdit, ConfigSync, ConnectionStatus, PresetSwitch};
+use crate::state::{AppState, ChainEdit, ConfigSync, ConnectionStatus, LostSession, PresetSwitch};
 
 /// Dwell time for error toasts. Long enough to read, short enough to
 /// avoid stacking when a slider drags through several rejections.
@@ -31,9 +32,9 @@ const ERROR_TOAST_TIMEOUT_SECS: u32 = 5;
 /// Dwell time for confirmation toasts (successful Save / Save as).
 const CONFIRMATION_TOAST_TIMEOUT_SECS: u32 = 2;
 
-// TODO: take the device from the daemon's `[output].device`
-// (`get_config`) instead of hardcoding it.
-const DEFAULT_PREVIEW_DEVICE: &str = "/dev/video10";
+/// Toast shown when a reconnect finds the operator's unsaved edits gone.
+const RECONNECT_EDITS_LOST: &str =
+    "Reconnected. Unsaved changes are gone: the daemon no longer has them.";
 
 /// Smallest window size the layout is designed for (GNOME HIG mobile
 /// minimum).
@@ -74,8 +75,11 @@ pub enum AppMsg {
     RevertConfirmed,
     /// The operator confirmed discarding edits on Reload.
     ReloadConfirmed,
-    /// User clicked Retry on the disconnected status page.
+    /// User clicked "Retry Now" on the disconnected status page.
     Retry,
+    /// A scheduled reconnect attempt is due. Carries the generation it
+    /// was scheduled under; a stale one is ignored.
+    ReconnectTick(u64),
 }
 
 /// Root component.
@@ -102,10 +106,24 @@ pub struct AppModel {
     /// to carry its view state across rebuilds; `None` while another
     /// page (status / connecting) occupies the body.
     chain_page: Option<chain_page::ChainPage>,
-    /// Embedded live preview pane. Owns the preview GStreamer
-    /// pipeline; kept as a field purely so its `Drop` tears the
-    /// pipeline down at window close.
-    _preview: preview::Preview,
+    /// Embedded live preview pane. Owns the preview GStreamer pipeline;
+    /// replacing it (or dropping the model) tears that pipeline down.
+    preview: preview::Preview,
+    /// What `preview` shows; the pane is rebuilt only when this changes.
+    preview_target: preview::PreviewTarget,
+    /// Split holding the preview (start child) and the body.
+    paned: gtk::Paned,
+    /// Whether `gstreamer::init()` succeeded, for preview rebuilds.
+    gst_ready: bool,
+    /// Consecutive failed connection attempts; drives the backoff.
+    reconnect_attempt: u32,
+    /// Generation of the pending reconnect tick. Bumping it cancels a
+    /// scheduled tick without removing its (possibly already fired)
+    /// glib source.
+    reconnect_generation: u64,
+    /// The session shown before the link dropped, compared against the
+    /// next handshake to tell whether unsaved edits survived.
+    lost_session: Option<LostSession>,
     /// Per-parameter debounce queue shared by all param rows.
     debouncer: Debouncer,
     /// Toast overlay wrapping the window body.
@@ -191,7 +209,9 @@ impl Component for AppModel {
         // `Connected` / `Disconnected`.
         body.append(&status_page::connecting("Talking to the FluxFrame daemon."));
 
-        let preview = preview::build(std::path::Path::new(DEFAULT_PREVIEW_DEVICE), gst_ready);
+        // The daemon's output is unknown until the handshake reports it.
+        let preview_target = preview::PreviewTarget::Unavailable(preview::WAITING_FOR_DAEMON);
+        let preview = preview::build(&preview_target, gst_ready);
 
         // `gtk::Paned` owns the split between preview (top) and the
         // chain editor (bottom). The Paned takes the responsibility
@@ -253,7 +273,13 @@ impl Component for AppModel {
             actions,
             body_container: body,
             chain_page: None,
-            _preview: preview,
+            preview,
+            preview_target,
+            paned,
+            gst_ready,
+            reconnect_attempt: 0,
+            reconnect_generation: 0,
+            lost_session: None,
             debouncer: Debouncer::new(),
             toast_overlay,
         };
@@ -293,7 +319,14 @@ impl Component for AppModel {
             }
             AppMsg::RevertConfirmed => self.revert(),
             AppMsg::ReloadConfirmed => self.reload(),
-            AppMsg::Retry => self.retry(),
+            AppMsg::Retry => self.reconnect(),
+            AppMsg::ReconnectTick(generation) => {
+                if generation == self.reconnect_generation
+                    && self.state.status == ConnectionStatus::Disconnected
+                {
+                    self.reconnect();
+                }
+            }
         }
     }
 }
@@ -441,29 +474,48 @@ impl AppModel {
     fn on_ipc(&mut self, out: WorkerOutput) {
         match out {
             WorkerOutput::Connected(initial) => {
+                let initial = *initial;
                 tracing::info!(presets = initial.presets.len(), "daemon handshake complete");
                 self.state.status = ConnectionStatus::Connected;
+                self.reconnect_attempt = 0;
+                self.reconnect_generation += 1;
                 self.state.presets = initial.presets;
-                self.state.active_preset = Some(initial.active_preset);
                 self.state.inventory = initial.inventory;
-                // Handshake is the clean baseline, so dirty starts at false.
-                self.state
-                    .apply_config_snapshot(initial.active_config, ConfigSync::ResyncBaseline);
                 self.state.config_path = initial.config_path;
+                self.state.output = initial.output;
+                let edits_lost = self.state.apply_handshake(
+                    initial.active_preset,
+                    initial.active_config,
+                    self.lost_session.take().as_ref(),
+                );
+                self.show_preview(preview::target_for(self.state.output.as_ref()));
                 self.refresh_presets();
                 self.refresh_header();
                 self.rebuild_chain_page();
+                if edits_lost {
+                    self.show_notice(&reply::Notice {
+                        kind: NoticeKind::Error,
+                        message: RECONNECT_EDITS_LOST.to_string(),
+                    });
+                }
             }
             WorkerOutput::Disconnected { reason } => {
                 tracing::warn!(reason = %reason, "daemon disconnected");
+                // Remember what the operator saw only when a live session
+                // drops; a failed reconnect attempt must not overwrite it.
+                if self.state.is_connected() {
+                    self.lost_session = Some(self.state.lost_session());
+                }
                 self.state.status = ConnectionStatus::Disconnected;
                 // Replies to these requests will never arrive.
                 self.pending.clear();
                 self.debouncer.cancel_all();
                 self.refresh_header();
+                let retry_in = self.schedule_reconnect();
                 let page = status_page::build(
                     &self.state.socket_path,
                     &reason,
+                    retry_in,
                     forward_unit(&self.input_sender, || AppMsg::Retry),
                 );
                 self.set_body(&page);
@@ -518,16 +570,21 @@ impl AppModel {
             );
         }
         if let Some(notice) = notice {
-            let timeout = match notice.kind {
-                NoticeKind::Error => ERROR_TOAST_TIMEOUT_SECS,
-                NoticeKind::Confirmation => CONFIRMATION_TOAST_TIMEOUT_SECS,
-            };
-            let toast = adw::Toast::builder()
-                .title(&notice.message)
-                .timeout(timeout)
-                .build();
-            self.toast_overlay.add_toast(toast);
+            self.show_notice(&notice);
         }
+    }
+
+    /// Show `notice` as a toast over the window body.
+    fn show_notice(&self, notice: &reply::Notice) {
+        let timeout = match notice.kind {
+            NoticeKind::Error => ERROR_TOAST_TIMEOUT_SECS,
+            NoticeKind::Confirmation => CONFIRMATION_TOAST_TIMEOUT_SECS,
+        };
+        let toast = adw::Toast::builder()
+            .title(&notice.message)
+            .timeout(timeout)
+            .build();
+        self.toast_overlay.add_toast(toast);
     }
 
     /// Re-populate the preset drop-down from the state.
@@ -607,8 +664,43 @@ impl AppModel {
         self.body_container.append(widget);
     }
 
-    fn retry(&mut self) {
-        tracing::info!("retry: re-creating IPC worker");
+    /// Swap the preview pane when the daemon's output calls for a
+    /// different one.
+    fn show_preview(&mut self, target: preview::PreviewTarget) {
+        if target == self.preview_target {
+            return;
+        }
+        let preview = preview::build(&target, self.gst_ready);
+        self.paned.set_start_child(Some(&preview.root));
+        // Replacing the field drops the old pane and stops its pipeline.
+        self.preview = preview;
+        self.preview_target = target;
+    }
+
+    /// Schedule the next automatic reconnect with backoff; returns its
+    /// delay for the status page.
+    fn schedule_reconnect(&mut self) -> Duration {
+        let delay = crate::reconnect::delay(self.reconnect_attempt);
+        self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
+        self.reconnect_generation += 1;
+        let generation = self.reconnect_generation;
+        let sender = self.input_sender.clone();
+        // The source is never removed: a newer generation turns this
+        // tick into a no-op instead, because removing a source that has
+        // already fired panics.
+        let _ = glib::timeout_add_local_once(delay, move || {
+            let _ = sender.send(AppMsg::ReconnectTick(generation));
+        });
+        delay
+    }
+
+    /// Connect again right away, superseding any scheduled attempt.
+    fn reconnect(&mut self) {
+        tracing::info!(
+            attempt = self.reconnect_attempt,
+            "reconnecting: re-creating IPC worker"
+        );
+        self.reconnect_generation += 1;
         // Drop the old worker (its background thread tears down) and
         // create a fresh one; replies owed by the old one are gone.
         self.worker = None;

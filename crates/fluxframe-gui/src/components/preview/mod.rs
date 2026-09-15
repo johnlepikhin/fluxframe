@@ -1,4 +1,4 @@
-//! Embedded live preview of `/dev/video10`.
+//! Embedded live preview of the daemon's v4l2loopback output.
 //!
 //! The widget is a bare `gtk::Picture` that gets letterboxed inside
 //! whatever parent slot owns it (today: the start child of a
@@ -22,8 +22,8 @@
 //! polling + retry timers and bus watch installed) only while `root`
 //! is mapped and its window is not suspended (minimised / hidden).
 //! Otherwise the timers are removed, the pipeline goes to `Null` and
-//! the placeholder is shown — so the preview does not hold
-//! `/dev/video10` open as a reader and the daemon can drop to idle.
+//! the placeholder is shown — so the preview does not hold the device
+//! open as a reader and the daemon can drop to idle.
 //!
 //! Failure modes (no v4l2loopback module, daemon down, device missing)
 //! are handled by showing an `adw::StatusPage` placeholder and
@@ -42,18 +42,19 @@
 //! version matching their parent crate — bus watches use
 //! `gstreamer::glib`, GTK timers and signals use `gtk::glib`.
 //!
-//! Hardcoded to `/dev/video10` for now (see `DEFAULT_PREVIEW_DEVICE`
-//! in app.rs).
+//! Which device to read — or why there is none — comes from the
+//! daemon's `daemon_info` answer; see [`target_for`].
 
 mod pipeline;
 
 use std::cell::{Cell, RefCell};
-use std::path::Path;
+use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use fluxframe_core::OutputInfo;
 use gstreamer::prelude::{ElementExt, ElementExtManual};
 use gtk::glib;
 use gtk::prelude::*;
@@ -158,16 +159,54 @@ impl Drop for Preview {
     }
 }
 
-/// Build the preview pane. The returned [`Preview`] owns its pipeline
-/// and must be kept alive for as long as the widget should display;
-/// dropping it tears the pipeline down.
+/// Device the preview assumes for a daemon too old to report its output.
+pub const LEGACY_DEVICE: &str = "/dev/video10";
+
+/// Placeholder text shown before the daemon has reported its output.
+pub const WAITING_FOR_DAEMON: &str = "Waiting for the daemon to report its output.";
+
+/// What the preview pane shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewTarget {
+    /// Stream this v4l2loopback device.
+    Device(PathBuf),
+    /// Nothing to stream; show this explanation instead.
+    Unavailable(&'static str),
+}
+
+/// Preview target for the daemon output reported by `daemon_info`
+/// (`None`: a daemon too old to report it, assumed to write to
+/// [`LEGACY_DEVICE`]).
+#[must_use]
+pub fn target_for(output: Option<&OutputInfo>) -> PreviewTarget {
+    match output {
+        None => PreviewTarget::Device(PathBuf::from(LEGACY_DEVICE)),
+        Some(OutputInfo::V4l2 { device }) => PreviewTarget::Device(device.clone()),
+        Some(OutputInfo::Pipewire { .. }) => PreviewTarget::Unavailable(
+            "The daemon publishes to PipeWire; the preview can only read a v4l2loopback device.",
+        ),
+        Some(OutputInfo::Auto) => {
+            PreviewTarget::Unavailable("The daemon shows its output in its own window.")
+        }
+        Some(OutputInfo::Fakesink) => {
+            PreviewTarget::Unavailable("The daemon discards its output (fakesink).")
+        }
+        Some(_) => {
+            PreviewTarget::Unavailable("The preview cannot read this kind of daemon output.")
+        }
+    }
+}
+
+/// Build the preview pane for `target`. The returned [`Preview`] owns
+/// its pipeline and must be kept alive for as long as the widget should
+/// display; dropping it tears the pipeline down.
 ///
 /// `gst_ready` reports whether `gstreamer::init()` succeeded; when it
-/// is `false` the preview is an inert placeholder and no GStreamer API
-/// is called. The pipeline itself is only started once `root` is
-/// mapped.
+/// is `false`, or when `target` is [`PreviewTarget::Unavailable`], the
+/// preview is an inert placeholder and no GStreamer API is called. The
+/// pipeline itself is only started once `root` is mapped.
 #[must_use]
-pub fn build(device_path: &Path, gst_ready: bool) -> Preview {
+pub fn build(target: &PreviewTarget, gst_ready: bool) -> Preview {
     // The Picture does NOT constrain its own size — the parent
     // (`gtk::Paned`) owns the allocation. `content_fit = Contain`
     // letterboxes the texture inside whatever the Paned hands us;
@@ -183,10 +222,6 @@ pub fn build(device_path: &Path, gst_ready: bool) -> Preview {
     let placeholder = adw::StatusPage::builder()
         .icon_name("camera-disabled-symbolic")
         .title("No Preview Signal")
-        .description(format!(
-            "Waiting for frames from {}.",
-            device_path.display()
-        ))
         .vexpand(true)
         .hexpand(true)
         .build();
@@ -207,6 +242,14 @@ pub fn build(device_path: &Path, gst_ready: bool) -> Preview {
     if !gst_ready {
         return inert("Preview is unavailable: GStreamer failed to initialise.");
     }
+    let device_path = match target {
+        PreviewTarget::Device(path) => path.as_path(),
+        PreviewTarget::Unavailable(reason) => return inert(reason),
+    };
+    placeholder.set_description(Some(&format!(
+        "Waiting for frames from {}.",
+        device_path.display()
+    )));
 
     let mailbox: Mailbox = Mailbox::default();
     let Some(pipeline) = pipeline::build_pipeline(device_path, Arc::clone(&mailbox)) else {
@@ -446,7 +489,40 @@ fn install_retry_timer(pipeline: &gstreamer::Pipeline, flags: Arc<RestartFlags>)
 
 #[cfg(test)]
 mod tests {
-    use super::should_be_active;
+    use super::{LEGACY_DEVICE, OutputInfo, PathBuf, PreviewTarget, should_be_active, target_for};
+
+    #[test]
+    fn preview_reads_the_device_the_daemon_reports() {
+        let output = OutputInfo::V4l2 {
+            device: PathBuf::from("/dev/video11"),
+        };
+        assert_eq!(
+            target_for(Some(&output)),
+            PreviewTarget::Device(PathBuf::from("/dev/video11"))
+        );
+    }
+
+    #[test]
+    fn preview_assumes_the_legacy_device_for_an_older_daemon() {
+        assert_eq!(
+            target_for(None),
+            PreviewTarget::Device(PathBuf::from(LEGACY_DEVICE))
+        );
+    }
+
+    #[test]
+    fn preview_is_unavailable_for_outputs_without_a_device() {
+        for output in [
+            OutputInfo::Pipewire { node: None },
+            OutputInfo::Auto,
+            OutputInfo::Fakesink,
+        ] {
+            assert!(
+                matches!(target_for(Some(&output)), PreviewTarget::Unavailable(_)),
+                "{output:?} has no device to read"
+            );
+        }
+    }
 
     #[test]
     fn active_only_when_mapped_and_not_suspended() {

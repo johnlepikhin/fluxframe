@@ -3,25 +3,25 @@
 //! The worker holds an open [`UnixStream`] to the daemon. Each
 //! [`WorkerInput::Send`] writes the command as a JSON line and reads
 //! the response back; the result returns via [`WorkerOutput::Reply`].
-//! The Stage-14 handshake (`list_effects` + `list_presets` +
-//! `current_preset` + `get_config` + `config_path`) runs once on the
+//! The handshake (`list_effects` + `list_presets` + `current_preset` +
+//! `get_config` + `config_path` + `daemon_info`) runs once on the
 //! worker thread right after init (via a self-sent
 //! [`WorkerInput::Connect`] — relm4 runs `Worker::init` on the
 //! caller's, i.e. the GTK main, thread, so `init` itself must not
 //! block) and the result is delivered as a single
-//! [`WorkerOutput::Connected`] message so
-//! the AppModel does not have to weave five reply tags.
+//! [`WorkerOutput::Connected`] message so the AppModel does not have to
+//! weave one reply tag per step.
 //!
 //! Failures at any IPC step transition the worker into a "disconnected"
 //! state and surface as [`WorkerOutput::Disconnected`]; the AppModel
-//! is expected to recreate the worker on user-driven retry.
+//! recreates the worker to reconnect.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use fluxframe_core::protocol::{Command, Response};
+use fluxframe_core::protocol::{Command, DaemonInfo, OutputInfo, Response};
 use relm4::Worker;
 use relm4::prelude::ComponentSender;
 
@@ -49,7 +49,7 @@ pub enum WorkerInput {
 /// Messages the worker emits back to the AppModel.
 #[derive(Debug)]
 pub enum WorkerOutput {
-    /// Connection established and the five startup queries completed.
+    /// Connection established and the startup queries completed.
     Connected(Box<InitialState>),
     /// Reply to a `WorkerInput::Send`. `tag` echoes the request.
     Reply {
@@ -88,6 +88,9 @@ pub struct InitialState {
     /// the GUI's Save button tooltip and used to grey the button out
     /// when `None`.
     pub config_path: Option<PathBuf>,
+    /// Where the daemon publishes video, per `daemon_info`; `None` when
+    /// the daemon is too old to answer it.
+    pub output: Option<OutputInfo>,
 }
 
 /// Read timeout applied to the socket so a wedged daemon does not
@@ -281,9 +284,9 @@ impl IpcWorker {
     }
 }
 
-/// Run the Stage-14 startup handshake: `list_effects` →
-/// `list_presets` → `current_preset` → `get_config(None)` →
-/// `config_path` (optional).
+/// Run the startup handshake: `list_effects` → `list_presets` →
+/// `current_preset` → `get_config(None)` → `config_path` (optional) →
+/// `daemon_info` (optional).
 ///
 /// Pulled out as a free function so tests drive it over a
 /// `UnixStream::pair` without spinning up the relm4 runtime.
@@ -319,13 +322,37 @@ fn handshake(stream: &mut BufferedStream) -> Result<InitialState, String> {
         Ok(_) => None,
         Err(reason) => return Err(format!("config_path failed: {reason}")),
     };
+    // Optional as well: a daemon without `daemon_info` leaves the
+    // preview on its historical default device.
+    let output = match stream.round_trip(&Command::DaemonInfo) {
+        Ok(Response::Ok { data }) => parse_output(data),
+        Ok(Response::Err { error, .. }) => {
+            tracing::debug!(error, "daemon_info refused; assuming an older daemon");
+            None
+        }
+        Ok(_) => None,
+        Err(reason) => return Err(format!("daemon_info failed: {reason}")),
+    };
     Ok(InitialState {
         inventory,
         presets,
         active_preset,
         active_config,
         config_path,
+        output,
     })
+}
+
+/// Decode the `DaemonInfo` payload into its output; an unexpected shape
+/// is treated as "not reported" with a debug-level breadcrumb.
+fn parse_output(data: serde_json::Value) -> Option<OutputInfo> {
+    match serde_json::from_value::<DaemonInfo>(data) {
+        Ok(info) => Some(info.output),
+        Err(e) => {
+            tracing::debug!(error = %e, "daemon_info: unexpected payload; treating as unreported");
+            None
+        }
+    }
 }
 
 /// Decode the `ConfigPath` payload: `{"path":"…"}` → `Some(path)`,
@@ -446,8 +473,12 @@ mod tests {
         })
     }
 
-    /// Full five-step script; `config_path_reply` is the last answer.
-    fn handshake_script(config_path_reply: Response) -> Vec<(Command, Response)> {
+    /// Full handshake script with the given answers to the two optional
+    /// steps.
+    fn handshake_script(
+        config_path_reply: Response,
+        daemon_info_reply: Response,
+    ) -> Vec<(Command, Response)> {
         vec![
             (Command::ListEffects, Response::ok_with(inventory_payload())),
             (
@@ -463,7 +494,12 @@ mod tests {
                 Response::ok_with(serde_json::json!({"marker": 42})),
             ),
             (Command::ConfigPath, config_path_reply),
+            (Command::DaemonInfo, daemon_info_reply),
         ]
+    }
+
+    fn v4l2_info(device: &str) -> Response {
+        Response::ok_with(serde_json::json!({"output": {"kind": "v4l2", "device": device}}))
     }
 
     fn run_handshake(script: Vec<(Command, Response)>) -> Result<InitialState, String> {
@@ -476,11 +512,18 @@ mod tests {
     }
 
     #[test]
-    fn handshake_collects_all_five_replies() {
-        let initial = run_handshake(handshake_script(Response::ok_with(
-            serde_json::json!({"path": "/etc/fluxframe.toml"}),
-        )))
+    fn handshake_collects_all_replies() {
+        let initial = run_handshake(handshake_script(
+            Response::ok_with(serde_json::json!({"path": "/etc/fluxframe.toml"})),
+            v4l2_info("/dev/video11"),
+        ))
         .expect("handshake succeeds");
+        assert_eq!(
+            initial.output,
+            Some(OutputInfo::V4l2 {
+                device: PathBuf::from("/dev/video11")
+            })
+        );
         assert_eq!(initial.presets, vec!["default", "office"]);
         assert_eq!(initial.active_preset, "office");
         assert_eq!(initial.active_config, serde_json::json!({"marker": 42}));
@@ -495,9 +538,25 @@ mod tests {
     /// mode, not fail the handshake.
     #[test]
     fn handshake_tolerates_refused_config_path() {
-        let initial = run_handshake(handshake_script(Response::err("unknown command", None)))
-            .expect("refused config_path must not fail the handshake");
+        let initial = run_handshake(handshake_script(
+            Response::err("unknown command", None),
+            v4l2_info("/dev/video10"),
+        ))
+        .expect("refused config_path must not fail the handshake");
         assert_eq!(initial.config_path, None);
+        assert_eq!(initial.active_preset, "office");
+    }
+
+    /// A daemon predating `daemon_info` must still connect; the output
+    /// is simply unreported.
+    #[test]
+    fn handshake_tolerates_refused_daemon_info() {
+        let initial = run_handshake(handshake_script(
+            Response::ok_with(serde_json::Value::Null),
+            Response::err("invalid command: unknown variant `daemon_info`", None),
+        ))
+        .expect("refused daemon_info must not fail the handshake");
+        assert_eq!(initial.output, None);
         assert_eq!(initial.active_preset, "office");
     }
 

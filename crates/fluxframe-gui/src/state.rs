@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use fluxframe_core::{EffectSchema, SetPath, SubchainKind};
+use fluxframe_core::{EffectSchema, OutputInfo, SetPath, SubchainKind};
 use serde_json::{Map, Value};
 
 /// Inventory of available effects per sub-chain, as reported by the
@@ -94,6 +94,15 @@ pub(crate) enum ConfigSync {
     ResyncBaseline,
 }
 
+/// What the GUI showed right before the daemon link dropped; compared
+/// against the next handshake by [`AppState::apply_handshake`].
+#[derive(Debug, Clone)]
+pub(crate) struct LostSession {
+    active_preset: Option<String>,
+    active_config: Value,
+    baseline_config: Value,
+}
+
 /// Application state, owned by the root `AppModel`.
 #[derive(Debug)]
 pub(crate) struct AppState {
@@ -124,6 +133,9 @@ pub(crate) struct AppState {
     /// resolvable config (e.g. `--no-default-config` and no
     /// `--config`). The Save button is greyed out in that case.
     pub(crate) config_path: Option<PathBuf>,
+    /// Where the daemon publishes video, per `daemon_info`; `None` for a
+    /// daemon too old to report it.
+    pub(crate) output: Option<OutputInfo>,
 }
 
 impl AppState {
@@ -140,6 +152,7 @@ impl AppState {
             active_config: Value::Null,
             baseline_config: Value::Null,
             config_path: None,
+            output: None,
         }
     }
 
@@ -176,6 +189,43 @@ impl AppState {
             self.baseline_config = data.clone();
         }
         self.active_config = data;
+    }
+
+    /// Snapshot of the session to compare the next handshake against
+    /// after the link drops; see [`Self::apply_handshake`].
+    pub(crate) fn lost_session(&self) -> LostSession {
+        LostSession {
+            active_preset: self.active_preset.clone(),
+            active_config: self.active_config.clone(),
+            baseline_config: self.baseline_config.clone(),
+        }
+    }
+
+    /// Install the active preset and config reported by a handshake.
+    ///
+    /// On a first connect (`lost` is `None`) the snapshot is the clean
+    /// baseline. After a reconnect, unsaved edits the daemon still holds
+    /// — the same preset with the same config as before the drop — stay
+    /// dirty against the old baseline. Returns `true` when unsaved edits
+    /// the operator saw before the drop are gone.
+    pub(crate) fn apply_handshake(
+        &mut self,
+        active_preset: String,
+        config: Value,
+        lost: Option<&LostSession>,
+    ) -> bool {
+        let dirty_before = lost.filter(|l| l.active_config != l.baseline_config);
+        let survived = dirty_before.filter(|l| {
+            l.active_preset.as_deref() == Some(active_preset.as_str()) && l.active_config == config
+        });
+        if let Some(l) = survived {
+            self.baseline_config = l.baseline_config.clone();
+            self.active_config = config;
+        } else {
+            self.apply_config_snapshot(config, ConfigSync::ResyncBaseline);
+        }
+        self.active_preset = Some(active_preset);
+        dirty_before.is_some() && survived.is_none()
     }
 
     /// The daemon persisted the active preset: the in-memory state is
@@ -560,6 +610,56 @@ enabled = false
         s.set_effect_enabled(bg, "color_fill", true);
         assert_eq!(s.active_config, original);
         assert!(!s.is_dirty());
+    }
+
+    #[test]
+    fn first_handshake_is_a_clean_baseline() {
+        let mut s = AppState::new(PathBuf::from("/tmp/test.sock"));
+        let edits_lost = s.apply_handshake("a".into(), serde_json::json!({"mask": {}}), None);
+        assert!(!edits_lost);
+        assert!(!s.is_dirty());
+        assert_eq!(s.active_preset.as_deref(), Some("a"));
+    }
+
+    /// The link dropped but the daemon kept running: its in-memory preset
+    /// still carries the edits, so they must stay marked unsaved.
+    #[test]
+    fn reconnect_keeps_edits_the_daemon_still_holds() {
+        let mut s = fixture();
+        s.active_preset = Some("a".into());
+        s.set_config_field(&path("background.blur.radius"), serde_json::json!(12));
+        let lost = s.lost_session();
+        let daemon_view = s.active_config.clone();
+        let edits_lost = s.apply_handshake("a".into(), daemon_view, Some(&lost));
+        assert!(!edits_lost);
+        assert!(s.is_dirty(), "edits the daemon kept stay unsaved");
+    }
+
+    /// The daemon restarted from its file: the edits are gone, and the
+    /// operator must be told.
+    #[test]
+    fn reconnect_reports_edits_lost_to_a_daemon_restart() {
+        let mut s = fixture();
+        s.active_preset = Some("a".into());
+        let saved = s.baseline_config.clone();
+        s.set_config_field(&path("background.blur.radius"), serde_json::json!(12));
+        let lost = s.lost_session();
+        let edits_lost = s.apply_handshake("a".into(), saved.clone(), Some(&lost));
+        assert!(edits_lost);
+        assert!(!s.is_dirty());
+        assert_eq!(s.active_config, saved);
+    }
+
+    #[test]
+    fn reconnect_without_unsaved_edits_reports_nothing() {
+        let mut s = fixture();
+        s.active_preset = Some("a".into());
+        let lost = s.lost_session();
+        let edits_lost =
+            s.apply_handshake("b".into(), serde_json::json!({"mask": {}}), Some(&lost));
+        assert!(!edits_lost);
+        assert!(!s.is_dirty());
+        assert_eq!(s.active_preset.as_deref(), Some("b"));
     }
 
     #[test]

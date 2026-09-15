@@ -11,6 +11,7 @@ mod components;
 mod debounce;
 mod ipc;
 mod persistence;
+mod reconnect;
 mod reply;
 mod shortcuts;
 mod state;

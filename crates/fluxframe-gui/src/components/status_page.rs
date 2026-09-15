@@ -8,28 +8,31 @@ use adw::prelude::*;
 
 use crate::components::Emit;
 
-/// Build a self-contained "no daemon" status page with an embedded
-/// Retry button.
+/// Build a self-contained "no daemon" status page announcing the next
+/// automatic reconnect, with an embedded "Retry Now" button.
 ///
-/// `on_retry` fires when the user clicks Retry; the AppModel uses
-/// this to re-spawn the IPC worker.
+/// `retry_in` is the delay until the scheduled attempt; `on_retry`
+/// fires when the user clicks the button, and the AppModel then
+/// connects immediately.
 pub(crate) fn build(
     socket_path: &std::path::Path,
     reason: &str,
+    retry_in: std::time::Duration,
     on_retry: Emit<()>,
 ) -> adw::StatusPage {
     let page = adw::StatusPage::builder()
         .icon_name("network-offline-symbolic")
         .title("Daemon Unreachable")
         .description(format!(
-            "Socket: {}\n\n{reason}\n\nStart fluxframe with [control].enabled = true in its TOML, then click Retry.",
-            socket_path.display()
+            "Socket: {}\n\n{reason}\n\nStart fluxframe with [control].enabled = true in its TOML. Reconnecting automatically in {} s.",
+            socket_path.display(),
+            retry_in.as_secs()
         ))
         .hexpand(true)
         .vexpand(true)
         .build();
 
-    let retry = gtk::Button::with_label("Retry");
+    let retry = gtk::Button::with_label("Retry Now");
     retry.add_css_class("suggested-action");
     retry.add_css_class("pill");
     retry.set_halign(gtk::Align::Center);
