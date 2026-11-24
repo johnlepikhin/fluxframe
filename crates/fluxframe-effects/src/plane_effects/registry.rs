@@ -102,7 +102,7 @@ pub fn default_registry() -> PlaneEffectRegistry {
     #[cfg(feature = "image-fill")]
     use crate::plane_effects::ImageFillEffect;
     use crate::plane_effects::{
-        BlurPlaneEffect, ColorFillEffect, ExposureCorrectEffect, HaloEffect,
+        BlurPlaneEffect, ColorFillEffect, ColorFocusEffect, ExposureCorrectEffect, HaloEffect,
         PassthroughPlaneEffect, PixelateEffect, ShadowEffect, SharpenEffect, StainedGlassEffect,
         VignetteEffect,
     };
@@ -157,6 +157,11 @@ pub fn default_registry() -> PlaneEffectRegistry {
         Box::new(|| -> Box<dyn PlaneEffect> { Box::new(HaloEffect::new()) }),
         &HaloEffect::METADATA,
     );
+    registry.register(
+        ColorFocusEffect::NAME,
+        Box::new(|| -> Box<dyn PlaneEffect> { Box::new(ColorFocusEffect::new()) }),
+        &ColorFocusEffect::METADATA,
+    );
     #[cfg(feature = "image-fill")]
     registry.register(
         ImageFillEffect::NAME,
@@ -182,6 +187,7 @@ mod tests {
         assert!(names.contains(&"stained_glass"));
         assert!(names.contains(&"shadow"));
         assert!(names.contains(&"halo"));
+        assert!(names.contains(&"color_focus"));
         assert!(names.contains(&"vignette"));
         assert!(names.contains(&"exposure_correct"));
         #[cfg(feature = "image-fill")]

@@ -130,8 +130,9 @@ differs.
 | --------------------------------- | ---------------------------------- |
 | `pixelate`, `block_size = 14`     | 0.35-0.5 / 0.6-1.2 ms              |
 | `stained_glass`, `cell_size = 48` | 1.0-1.2 / 1.4-1.7 ms               |
-| `shadow`, defaults                | 0.9-1.0 / 1.3-1.7 ms               |
-| `halo`, defaults                  | 0.8-1.0 / 1.2-1.7 ms               |
+| `shadow`, defaults                | 0.9-1.2 / 1.3-1.7 ms               |
+| `halo`, defaults                  | 0.8-1.1 / 1.2-1.7 ms               |
+| `color_focus`, defaults           | 1.2-1.3 / 1.7-1.8 ms               |
 
 `stained_glass` was measured with `ignore_person` on, the default. Together
 `stained_glass`, `shadow` and `halo` used about 10% of a core more than

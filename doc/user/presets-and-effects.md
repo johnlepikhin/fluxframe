@@ -329,6 +329,17 @@ when you move and has no edges, so it does not draw attention.
 
 With `glow = 0` the effect only darkens the room away from you.
 
+### `color_focus`
+
+Keeps the room's colour next to you and fades it towards grey further away.
+Uses the mask. Like `halo`, it is a vignette centred on you, but it removes
+colour instead of light, so the room keeps its brightness.
+
+| Parameter | Type    | Default | Range    | Description                                     |
+| --------- | ------- | ------- | -------- | ----------------------------------------------- |
+| `radius`  | integer | 80      | 8 to 256 | How far the colour reaches from you, in pixels. |
+| `fade`    | float   | 0.8     | 0 to 1   | Colour lost far from you: 0 none, 1 grey.       |
+
 ### `passthrough`
 
 Leaves the plane unchanged. No parameters.
@@ -480,6 +491,24 @@ chain = ["stained_glass"]
 [presets.glass.background.stained_glass]
 cell_size = 48
 line_strength = 0.6
+```
+
+The room stays sharp but steps back: colour and light fade away from you and
+you cast a soft shadow on it:
+
+```toml
+[presets.spotlight.mask]
+model = "./models/selfie_segmentation.onnx"
+chain = ["smooth_temporal", "threshold", "largest_blob", "feather"]
+[presets.spotlight.mask.threshold]
+level = 0.8
+[presets.spotlight.mask.feather]
+radius = 3
+
+[presets.spotlight.background]
+chain = ["color_focus", "halo", "shadow"]
+[presets.spotlight.background.color_focus]
+fade = 0.7
 ```
 
 Robust Video Matting on the NPU over a blurred background, with MediaPipe as

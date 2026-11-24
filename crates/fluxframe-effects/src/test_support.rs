@@ -27,3 +27,29 @@ pub(crate) fn process_plane<E: PlaneEffect + ?Sized>(
     let mask = filled_mask(&mut buf, plane.width, plane.height, 0.0);
     effect.process(plane, &mask, ctx)
 }
+
+/// Frame-sized mask with `value(x, y)` at each pixel.
+pub(crate) fn mask_from(width: u32, height: u32, value: impl Fn(u32, u32) -> f32) -> Vec<f32> {
+    (0..height)
+        .flat_map(|y| (0..width).map(move |x| (x, y)))
+        .map(|(x, y)| value(x, y))
+        .collect()
+}
+
+/// Run a plane effect over a uniform `fill` plane with `mask`; returns
+/// the plane.
+pub(crate) fn run_masked<E: PlaneEffect + ?Sized>(
+    effect: &mut E,
+    mask: &mut [f32],
+    width: u32,
+    height: u32,
+    fill: [u8; 3],
+) -> Vec<u8> {
+    let mut data = fill.repeat((width * height) as usize);
+    let mut plane = FramePlane::new(&mut data, width, height);
+    let mask = MaskPlane::new(mask, width, height);
+    effect
+        .process(&mut plane, &mask, &mut FrameContext::default())
+        .expect("process");
+    data
+}

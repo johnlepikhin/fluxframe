@@ -29,7 +29,7 @@ Cargo workspace with five crates under `crates/`:
 
 - `fluxframe-core` — `VideoFrame`, traits (`VideoEffect`, `InferenceEngine`, `VideoSource`, `VideoSink`), error model, `FluxConfig`, control-socket wire types (`protocol::Command` / `Response`). Zero GStreamer/ONNX deps; `#![forbid(unsafe_code)]`.
 - `fluxframe-gst` — GStreamer init plus `bus`/`input`/`output`/`slot`/`frame_conv`/`util`/`v4l2_caps` modules. Bus events arrive as a typed `BusEvent` enum via `BusListener::spawn`. Owns the V4L2 capture + v4l2loopback / pipewiresink output paths.
-- `fluxframe-effects` — effect registry, chain, composite (mask + plane + post sub-chains), built-in effects (ML segmentation, blur, color_fill, image_fill, pixelate, stained_glass, shadow, halo, sharpen, vignette, exposure_correct, auto_frame, mirror, …). ML, GPU-blur and image-processing helpers live as modules here.
+- `fluxframe-effects` — effect registry, chain, composite (mask + plane + post sub-chains), built-in effects (ML segmentation, blur, color_fill, image_fill, pixelate, stained_glass, shadow, halo, color_focus, sharpen, vignette, exposure_correct, auto_frame, mirror, …). ML, GPU-blur and image-processing helpers live as modules here.
 - `fluxframe-cli` — `fluxframe` binary: clap subcommands (`list`, `check`, `run`, `benchmark`), tracing init, config loader (`config_merge`: XDG default lookup + `--no-default-config`), supervisor (`runtime`), control listener (`control`), TOML write-back (`persist`), idle-mode supervisor (`idle`).
 - `fluxframe-gui` — `fluxframe-gui` binary: relm4 + GTK4 / libadwaita client over the UNIX control socket. Embedded live preview, chain editor, dirty tracking, Save / Save as / Revert.
 

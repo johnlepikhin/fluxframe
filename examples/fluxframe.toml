@@ -207,6 +207,43 @@ smoothing = 0.9
 line_width = 2
 line_strength = 0.6
 
+# Spotlight: the room stays sharp but steps back. Colour and light fade
+# away from you and you cast a soft shadow on it. All three effects
+# follow the mask.
+[presets.spotlight.mask]
+model = "./models/selfie_segmentation.onnx"
+chain = ["smooth_temporal", "threshold", "largest_blob", "feather"]
+
+[presets.spotlight.mask.smooth_temporal]
+factor = 0.85
+
+[presets.spotlight.mask.threshold]
+level = 0.8
+
+[presets.spotlight.mask.largest_blob]
+level = 0.5
+
+[presets.spotlight.mask.feather]
+radius = 3
+
+[presets.spotlight.background]
+chain = ["color_focus", "halo", "shadow"]
+
+[presets.spotlight.background.color_focus]
+radius = 80
+fade = 0.7
+
+[presets.spotlight.background.halo]
+radius = 60
+glow = 0.15
+dim = 0.3
+
+[presets.spotlight.background.shadow]
+offset_x = 14
+offset_y = 8
+blur = 12
+strength = 0.35
+
 # Robust Video Matting on an Intel NPU: soft hair edges and a steadier
 # mask, with the video delayed by one frame. Prepare the model first with
 # `tools/prepare-rvm.py --output-dir models` (see doc/user/installation.md),

@@ -3,6 +3,7 @@
 
 mod blur;
 mod color_fill;
+mod color_focus;
 mod exposure_correct;
 mod halo;
 pub(crate) mod helpers;
@@ -18,6 +19,7 @@ mod vignette;
 
 pub use blur::BlurPlaneEffect;
 pub use color_fill::ColorFillEffect;
+pub use color_focus::ColorFocusEffect;
 pub use exposure_correct::ExposureCorrectEffect;
 pub use halo::HaloEffect;
 #[cfg(feature = "image-fill")]
