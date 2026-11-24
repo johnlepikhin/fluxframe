@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use crate::frame::{PixelFormat, Timestamp};
+use crate::geometry::Region;
 use crate::metrics::{Counters, EffectTelemetry};
 
 /// Pipeline-wide context handed to every effect once during `prepare`.
@@ -48,6 +49,39 @@ pub struct FrameContext {
     /// invoking the effect chain; defaults to a no-op so test/stand-alone
     /// constructions of [`FrameContext`] work without wiring metrics.
     pub telemetry: EffectTelemetry,
+    /// Crop-before-processing handshake with the runtime's framing
+    /// stage (see [`Framing`]).
+    pub framing: Framing,
+}
+
+/// Handshake between the runtime's framing stage, which cuts each
+/// processed frame out of a (usually larger) captured frame, and an
+/// effect that decides where to cut (`auto_frame`).
+///
+/// The cut for frame *N + 1* is decided while processing frame *N*.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Framing {
+    /// Set by the runtime before the chain runs: where the frame being
+    /// processed came from.  `None` when the chain runs without a
+    /// framing stage (tests, stand-alone use) — framing effects then
+    /// have nothing to steer.
+    pub source: Option<FramingSource>,
+    /// Set by a framing effect: the region of the next captured frame
+    /// to process.  Cleared by the runtime before each frame; when no
+    /// effect sets it, the runtime returns to the full view.
+    pub request: Option<Region>,
+}
+
+/// Where a processed frame was cut from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FramingSource {
+    /// Captured frame width in pixels.
+    pub width: u32,
+    /// Captured frame height in pixels.
+    pub height: u32,
+    /// Region of the captured frame that was scaled to the processed
+    /// frame, in captured-frame pixels.
+    pub region: Region,
 }
 
 /// Coarse runtime state used by the metrics layer and shutdown logic.

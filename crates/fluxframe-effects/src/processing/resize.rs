@@ -2,6 +2,8 @@
 //! (`&[f32]`) buffers.  Letterbox mapping for non-matching aspect
 //! ratios.
 
+use fluxframe_core::Region;
+
 use super::parallel::for_each_row_mut;
 
 /// Description of how a model-input rectangle was placed inside a
@@ -64,13 +66,21 @@ struct AxisTap {
 /// the same convention the original per-pixel formula used, so the
 /// sampled positions are unchanged.
 fn axis_taps(src_len: u32, dst_len: u32) -> Vec<AxisTap> {
+    axis_taps_span(src_len, 0.0, src_len as f32, dst_len)
+}
+
+/// [`axis_taps`] over the sub-span `[start, start + len)` of an axis
+/// with `src_len` samples: `s = start + (d + 0.5) * len / dst - 0.5`,
+/// clamped to the valid sample range.  With `start = 0` and
+/// `len = src_len` the positions are bit-identical to [`axis_taps`].
+fn axis_taps_span(src_len: u32, start: f32, len: f32, dst_len: u32) -> Vec<AxisTap> {
     let last = (src_len as usize).saturating_sub(1);
-    let (sl, dl) = (src_len as f32, dst_len as f32);
+    let dl = dst_len as f32;
     (0..dst_len)
         .map(|d| {
-            // Evaluated exactly as the former per-pixel expression so
-            // the sampled positions are bit-identical to before.
-            let s = ((d as f32 + 0.5) * sl / dl - 0.5).max(0.0);
+            // Same expression order as the former per-pixel formula so
+            // full-frame positions stay bit-identical (`0.0 + x == x`).
+            let s = (start + (d as f32 + 0.5) * len / dl - 0.5).max(0.0);
             let i0 = (s.floor() as usize).min(last);
             let i1 = (i0 + 1).min(last);
             AxisTap {
@@ -145,16 +155,42 @@ pub fn resize_rgb_bilinear(
     dst_w: u32,
     dst_h: u32,
 ) {
+    let full = Region::full(src_w, src_h);
+    resize_rgb_bilinear_region(src, src_w, src_h, &full, dst, dst_w, dst_h);
+}
+
+/// Bilinear resize of the sub-pixel `region` of a packed RGB `src`
+/// frame into the whole of `dst` — a crop and a resize in one pass,
+/// with no intermediate copy of the crop.
+///
+/// Fractional region edges are honoured, so a crop window that moves
+/// by a fraction of a pixel per frame pans smoothly instead of
+/// stepping.  Samples outside `src` are clamped to its border.  Same
+/// fixed-point kernel and precision as [`resize_rgb_bilinear`], which
+/// is this function over the full frame.
+///
+/// # Panics
+///
+/// Panics in debug builds if slice lengths don't match the dimensions.
+pub fn resize_rgb_bilinear_region(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    region: &Region,
+    dst: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+) {
     debug_assert_eq!(src.len(), (src_w * src_h * 3) as usize);
     debug_assert_eq!(dst.len(), (dst_w * dst_h * 3) as usize);
     if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
         return;
     }
-    let xs: Vec<AxisTapQ8> = axis_taps(src_w, dst_w)
+    let xs: Vec<AxisTapQ8> = axis_taps_span(src_w, region.x, region.width, dst_w)
         .into_iter()
         .map(Into::into)
         .collect();
-    let ys: Vec<AxisTapQ8> = axis_taps(src_h, dst_h)
+    let ys: Vec<AxisTapQ8> = axis_taps_span(src_h, region.y, region.height, dst_h)
         .into_iter()
         .map(Into::into)
         .collect();
@@ -273,6 +309,59 @@ pub fn resize_mask_bilinear(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Horizontal ramp: pixel value = 10 * x in every channel.
+    fn ramp(w: u32, h: u32) -> Vec<u8> {
+        (0..h)
+            .flat_map(|_| (0..w).flat_map(|x| [(10 * x) as u8; 3]))
+            .collect()
+    }
+
+    #[test]
+    fn region_resize_of_integer_region_matches_crop() {
+        let (w, h) = (16, 4);
+        let src = ramp(w, h);
+        // 1:1 resize of columns 4..12 must copy them exactly.
+        let region = Region {
+            x: 4.0,
+            y: 0.0,
+            width: 8.0,
+            height: 4.0,
+        };
+        let mut dst = vec![0u8; 8 * 4 * 3];
+        resize_rgb_bilinear_region(&src, w, h, &region, &mut dst, 8, 4);
+        for x in 0..8 {
+            assert_eq!(dst[x * 3], (10 * (x + 4)) as u8, "column {x}");
+        }
+    }
+
+    #[test]
+    fn region_resize_honours_subpixel_offset() {
+        let (w, h) = (16, 2);
+        let src = ramp(w, h);
+        let region = Region {
+            x: 4.5,
+            y: 0.0,
+            width: 8.0,
+            height: 2.0,
+        };
+        let mut dst = vec![0u8; 8 * 2 * 3];
+        resize_rgb_bilinear_region(&src, w, h, &region, &mut dst, 8, 2);
+        // Half a pixel to the right of 40 → 45 (midpoint of 40 and 50).
+        assert_eq!(dst[0], 45);
+        assert_eq!(dst[3], 55);
+    }
+
+    #[test]
+    fn full_region_matches_plain_resize() {
+        let (w, h) = (16, 9);
+        let src: Vec<u8> = (0..w * h * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let mut a = vec![0u8; 10 * 6 * 3];
+        let mut b = a.clone();
+        resize_rgb_bilinear(&src, w, h, &mut a, 10, 6);
+        resize_rgb_bilinear_region(&src, w, h, &Region::full(w, h), &mut b, 10, 6);
+        assert_eq!(a, b);
+    }
 
     #[test]
     fn letterbox_preserves_aspect_ratio_wider_src() {

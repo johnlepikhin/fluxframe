@@ -65,17 +65,32 @@ If `check` warns that the output "does not look like a v4l2loopback",
 `output.device` points at a real camera. Correct it before running; otherwise
 the daemon would try to write into the camera device.
 
-## The camera mode is not supported
+## The camera runs at a lower frame rate or resolution than requested
 
-The requested `input.width`, `input.height` and `input.fps` must match a mode
-the camera offers. List the modes:
+The startup log line `camera mode selected` shows the mode the daemon picked for
+the capture size (`input.capture_width` × `input.capture_height`, or
+`input.width` × `input.height` when those are not set) and `input.fps`. Compare
+it with the modes the camera offers:
 
 ```bash
 v4l2-ctl --list-formats-ext -d /dev/video0
 ```
 
-Many USB 2.0 cameras deliver 1280x720 or more only at 5-10 fps in uncompressed
-formats. Choose a smaller mode with the full frame rate.
+Many USB 2.0 cameras deliver 1280x720 or more at a full frame rate only as
+MJPEG. If the camera offers no mode that reaches the requested frame rate, the
+daemon uses the fastest one. If no mode is large enough, the largest one is
+scaled up and the picture is softer than the requested size suggests. Lower
+the capture size to a mode the camera delivers at full rate.
+
+## The auto-framed picture moves too often or too late
+
+`auto_frame` waits until you have stayed off-centre by more than `deadband` for
+`hold_secs` before it moves the frame. If it still moves while you sit still,
+raise `deadband` (for example to 0.2) or `hold_secs`. If it follows too late,
+lower `hold_secs`. A soft face when zoomed in means the crop has fewer pixels
+than the output: set `input.capture_width` and `input.capture_height` larger
+than `input.width` and `input.height`; see
+[Presets and effects](presets-and-effects.md#auto_frame).
 
 ## ONNX Runtime cannot be loaded
 

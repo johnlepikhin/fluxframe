@@ -247,19 +247,38 @@ Post effects run on the blended frame and require a `mask` section.
 
 ### `auto_frame`
 
-Crops and zooms onto the person, keeping them centred as they move. It
+Crops and zooms onto the person, keeping them in frame as they move. It
 compensates for a badly placed camera without touching it.
 
-| Parameter   | Type  | Default | Range     | Description                                                                                              |
-| ----------- | ----- | ------- | --------- | -------------------------------------------------------------------------------------------------------- |
-| `threshold` | float | 0.5     | 0 to 1    | Mask confidence used to find the person's bounding box.                                                  |
-| `padding`   | float | 0.15    | 0 to 1    | Margin added around the bounding box, as a fraction of its size.                                         |
-| `smoothing` | float | 0.85    | 0 to 0.99 | Inertia of the crop window. 0 follows instantly; higher values move the frame slowly and without jitter. |
-| `zoom_max`  | float | 1.6     | 1 to 4    | Maximum zoom. 1 disables cropping.                                                                       |
+| Parameter    | Type  | Default | Range     | Description                                                                                         |
+| ------------ | ----- | ------- | --------- | --------------------------------------------------------------------------------------------------- |
+| `threshold`  | float | 0.5     | 0 to 1    | Mask confidence used to measure the person.                                                         |
+| `padding`    | float | 0.15    | 0 to 1    | Margin added around the person, as a fraction of their size.                                        |
+| `smoothing`  | float | 0.85    | 0 to 0.99 | Per-frame inertia of the measured position. 0 uses each frame's measurement as is.                  |
+| `zoom_max`   | float | 1.6     | 1 to 4    | Maximum zoom relative to the whole captured view. 1 disables cropping.                              |
+| `deadband`   | float | 0.12    | 0 to 0.5  | How far the person may drift, as a fraction of the frame, before the frame follows.                 |
+| `hold_secs`  | float | 1.0     | 0 to 10   | How long the person must stay outside the dead zone before the frame follows.                       |
+| `glide_secs` | float | 0.8     | 0 to 5    | Duration of a reframing move. 0 jumps.                                                              |
 
-The crop is scaled back to the full output size on every frame, which makes
-`auto_frame` one of the more expensive effects. Its cost does not depend on the
-zoom level.
+The frame stays still while you fidget, gesture or lean slightly. It moves only
+when your position has stayed off by more than `deadband` for `hold_secs`, and
+then glides there smoothly. If you are cut off at an edge of the frame, it
+follows at once. If nobody is in view for about two seconds, it returns to the
+whole view. Stray mask pixels and hands held to the side do not count towards
+your position.
+
+`auto_frame` does not resample the processed frame. It chooses which part of
+the captured frame is processed: the crop is cut out of the camera image before
+segmentation and the other effects. Combined with
+[`input.capture_width` and `input.capture_height`](configuration.md#input), a
+large capture keeps a zoomed-in face sharp while the effects run at the smaller
+`input.width` × `input.height`. Without the capture keys the crop is enlarged
+from the processing-size frame and holds no more detail than the pixels it
+covers. Real detail lasts up to a zoom of `capture_width / width` (1.6 for
+1280x720 processed at 800x448).
+
+The crop applies from the next frame. With a fixed camera this one-frame delay
+is not visible.
 
 ### `mirror`
 

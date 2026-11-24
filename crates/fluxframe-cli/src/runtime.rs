@@ -15,10 +15,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use fluxframe_core::context::{FrameContext, ProcessingContext};
+use fluxframe_core::Region;
+use fluxframe_core::context::{FrameContext, Framing, FramingSource, ProcessingContext};
 use fluxframe_core::error::PipelineError;
+use fluxframe_core::metrics::StageKey;
 use fluxframe_core::{FluxConfig, FluxError, InputDevice, Preset, SubchainKind};
 use fluxframe_effects::EffectChain;
+use fluxframe_effects::processing::framer::Framer;
 use fluxframe_gst::input::{InputParams, InputPipeline};
 use fluxframe_gst::output::{OutputParams, OutputPipeline, OutputSink};
 use fluxframe_gst::{BusEvent, BusListener, BusSource, LatestFrameSlot, WatchedPipeline};
@@ -2106,12 +2109,10 @@ where
             return Ok(None);
         }
         metrics.counters.inc_input_acquire_attempts();
-        let params = InputParams::new(
-            cfg.input.width,
-            cfg.input.height,
-            cfg.input.fps,
-            cfg.input.format,
-        );
+        // The camera delivers the capture size; the framing stage in the
+        // worker scales it to the processing size (`input.width/height`).
+        let (capture_w, capture_h) = cfg.input.capture_dimensions();
+        let params = InputParams::new(capture_w, capture_h, cfg.input.fps, cfg.input.format);
         // build + start in one shot; both can surface a busy device.
         //
         // On a failed `start` the pipeline has usually reached Ready or
@@ -2771,6 +2772,11 @@ fn spawn_metrics_reporter(
 /// composition changes have a stable rebuild source.
 struct WorkerState {
     frame_context: FrameContext,
+    /// Cuts each processed frame out of the captured one.
+    framer: Framer,
+    /// Region of the next captured frame to process: the window the
+    /// framing effect asked for on the previous frame, or the full view.
+    framing_region: Region,
     /// Track fallback edges so a single-frame visual artefact
     /// ("flicker") caused by an inference miss surfaces as a warn line
     /// tied to the exact frame_seq, instead of being lost in the
@@ -2785,12 +2791,16 @@ struct WorkerState {
 }
 
 impl WorkerState {
-    fn new(metrics: &RuntimeMetrics) -> Self {
+    fn new(metrics: &RuntimeMetrics, cfg: &FluxConfig) -> Self {
+        let (capture_w, capture_h) = cfg.input.capture_dimensions();
+        let framer = Framer::new(capture_w, capture_h, cfg.input.width, cfg.input.height);
         Self {
             frame_context: FrameContext {
                 telemetry: metrics.effect_telemetry(),
                 ..FrameContext::default()
             },
+            framer,
+            framing_region: framer.full_view(),
             prev_fallback: false,
             frames_seen: 0,
         }
@@ -2831,6 +2841,10 @@ fn drain_control_commands(
     }
 }
 
+/// Telemetry key of the framing stage (crop + scale of the captured
+/// frame to the processing size).
+const FRAMING_STAGE: StageKey = StageKey::new("framing", "crop_resize");
+
 /// Run the effect chain on a single frame and forward it to the
 /// output sink. Returns `Err` only on unrecoverable failure — the
 /// caller stops the worker loop.
@@ -2852,12 +2866,44 @@ fn process_one_frame(
     state.frame_context.fallback_active = false;
 
     let pre_process = Instant::now();
+    let region = state.framing_region;
+    let (capture_w, capture_h) = state.framer.capture_size();
+    frame = match state.framer.apply(frame, &region) {
+        Ok(framed) => framed,
+        Err(e) => {
+            metrics.counters.inc_effect_error();
+            error!(error = %e, "framing stage failed; stopping");
+            return Err(FluxError::from(e));
+        }
+    };
+    state
+        .frame_context
+        .telemetry
+        .record_stage(FRAMING_STAGE, pre_process.elapsed());
+    state.frame_context.framing = Framing {
+        source: Some(FramingSource {
+            width: capture_w,
+            height: capture_h,
+            region,
+        }),
+        request: None,
+    };
     if let Err(e) = chain.process(&mut frame, &mut state.frame_context) {
         metrics.counters.inc_effect_error();
         error!(error = %e, "effect chain failed; stopping");
         return Err(FluxError::from(e));
     }
     metrics.processing.record_duration(pre_process.elapsed());
+    // A pass that fell back (no fresh mask) keeps the window; a normal
+    // pass without a framing request — no `auto_frame` in the preset, or
+    // it is disabled — returns to the full view.
+    if !state.frame_context.fallback_active {
+        state.framing_region = state
+            .frame_context
+            .framing
+            .request
+            .unwrap_or_else(|| state.framer.full_view());
+    }
 
     if state.frame_context.fallback_active != state.prev_fallback {
         warn!(
@@ -3412,7 +3458,7 @@ fn run_process_loop(
     mut idle: Option<&mut IdleRuntime>,
     input_failure: InputFailureWatch<'_>,
 ) -> Result<(), FluxError> {
-    let mut state = WorkerState::new(deps.metrics);
+    let mut state = WorkerState::new(deps.metrics, deps.cfg);
     // Leaving on a *new* input failure hands control to the supervisor,
     // which recovers the camera and calls back in. Without this the loop
     // would spin against a dead input: `tick_idle` still reports Active

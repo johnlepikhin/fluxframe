@@ -49,8 +49,10 @@ and device paths are used as given.
 | Key                       | Type    | Default         | Description                                                                                                                        |
 | ------------------------- | ------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | `device`                  | string  | `"/dev/video0"` | Capture source: a device path, `"auto"` or `"testsrc"`.                                                                            |
-| `width`                   | integer | `1280`          | Requested capture width, 1 to 16384.                                                                                               |
-| `height`                  | integer | `720`           | Requested capture height, 1 to 16384.                                                                                              |
+| `width`                   | integer | `1280`          | Processing width: the size the effects run at and the output is derived from, 1 to 16384. Also the capture width by default.     |
+| `height`                  | integer | `720`           | Processing height, 1 to 16384. Also the capture height by default.                                                                 |
+| `capture_width`           | integer | `width`         | Capture width when it should differ from the processing size. Set together with `capture_height`; requires `format = "RGB"`.      |
+| `capture_height`          | integer | `height`        | Capture height; see `capture_width`.                                                                                               |
 | `fps`                     | integer | `30`            | Requested capture frame rate, 1 to 240.                                                                                            |
 | `format`                  | string  | `"RGB"`         | Pixel format negotiated with the source: `RGB`, `RGBA`, `BGR`, `YUY2`, `NV12` or `GRAY8`. Presets with segmentation require `RGB`. |
 | `acquire_backoff_base_ms` | integer | `500`           | Initial delay before retrying a busy or missing camera. Must be greater than 0.                                                    |
@@ -64,11 +66,40 @@ and device paths are used as given.
  - `"testsrc"` uses a synthetic test pattern instead of a camera. It is useful
    for checking the setup and for benchmarks.
 
-The width, height and frame rate must be a mode the camera supports.
-`v4l2-ctl --list-formats-ext -d /dev/video0` lists the modes. Many USB 2.0
-cameras deliver high resolutions only at a low frame rate in uncompressed
-formats. A smaller mode at a full frame rate usually looks better and costs less
-CPU.
+Each captured frame is scaled to `width` × `height` before processing; with
+`auto_frame` only the crop around the person is. Capturing larger than you
+process keeps that crop sharp at little extra cost: decoding and scaling grow
+with the capture size, all effects with the processing size. A typical setup
+for a person sitting far from the camera:
+
+```toml
+[input]
+width = 800
+height = 448
+capture_width = 1280
+capture_height = 720
+```
+
+When the aspect ratios differ, the processed view is the centred part of the
+capture with the processing aspect ratio; nothing is letterboxed.
+
+The capture size and `fps` do not have to match a camera mode exactly. At every
+start the daemon picks the camera mode that serves them best and logs it
+(`camera mode selected`):
+
+ 1. The mode must reach the requested frame rate (5 fps of slack). If none does,
+    the fastest modes are used.
+ 2. Exactly the requested size; otherwise the smallest larger mode with the same
+    aspect ratio, which is then scaled down; otherwise the largest mode
+    available, scaled up.
+ 3. Uncompressed formats are preferred over MJPEG when both serve the request
+    equally well.
+
+Many USB 2.0 cameras deliver 1280x720 or more at a full frame rate only as
+MJPEG. The daemon decodes MJPEG on the CPU (`jpegdec` from `gst-plugins-good`),
+so a high resolution at 30 fps is available at the cost of the decode.
+`v4l2-ctl --list-formats-ext -d /dev/video0` lists the modes. `format` is the
+pixel format delivered to the effects, not the camera's format.
 
 The retry delay starts at `acquire_backoff_base_ms` and doubles up to
 `acquire_backoff_max_ms`. Only temporary conditions (device busy, device absent)
@@ -105,9 +136,10 @@ no colour conversion (lower CPU usage) and shows none of the faint vertical
 colour banding that an RGB to YUY2 conversion introduces. Set `YUY2` only for a
 consumer that does not accept RGB.
 
-The output resolution is always the input resolution multiplied by `scale`,
-rounded down to an even number of pixels. The output frame rate always equals
-the input frame rate. Upscaling is not supported.
+The output resolution is always the processing size (`input.width` ×
+`input.height`) multiplied by `scale`, rounded down to an even number of pixels.
+The output frame rate always equals the input frame rate. Upscaling is not
+supported.
 
 ## `[realtime]`
 

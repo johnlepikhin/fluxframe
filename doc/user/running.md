@@ -160,8 +160,8 @@ useful for checking a configuration and for measuring performance:
 fluxframe run --input testsrc --output fakesink --preset blur
 ```
 
-The test pattern fills the whole frame, so the mask covers everything and some
-effects (notably `auto_frame`) do less work than with a real camera.
+The test pattern fills the whole frame, so the mask covers everything and
+`auto_frame` never zooms in.
 
 ## Switching presets
 

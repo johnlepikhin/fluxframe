@@ -325,15 +325,16 @@ pub trait PlaneEffect: Send {
 /// Post-effects receive the already-blended [`FramePlane`] (mutable)
 /// plus a read-only view of the frame-resolution mask. The mask
 /// resolution matches the frame, so a post-effect can pair pixel
-/// coordinates one-to-one. Typical implementations crop/translate the
-/// frame based on the mask's bounding box (`auto_frame`), apply
+/// coordinates one-to-one. Typical implementations steer the framing
+/// stage from the mask (`auto_frame` sets
+/// [`crate::context::Framing::request`] for the next frame), apply
 /// motion-stabilisation against the mask centroid, or paint
 /// mask-aware overlays.
 ///
 /// Post-effects MUST NOT change the frame dimensions — the GStreamer
-/// sink negotiated a fixed size at startup. Cropping is implemented
-/// by upscaling the cropped region back to the original `(width,
-/// height)` (see `processing::resize_rgb_bilinear`).
+/// sink negotiated a fixed size at startup. Cropping belongs to the
+/// runtime's framing stage, which cuts the next frame out of the
+/// captured one before any effect runs.
 ///
 /// Subsequent post-effects in the same chain see the result of
 /// preceding ones (same in-place mutation semantics as

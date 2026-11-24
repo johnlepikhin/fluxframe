@@ -18,6 +18,11 @@ device = "auto"
 width = 800
 height = 448
 fps = 30
+# Capture at a higher resolution than the effects run at. With
+# `auto_frame` the crop is cut from the large capture, so a zoomed-in
+# face stays sharp while processing costs what 800x448 costs.
+#capture_width = 1280
+#capture_height = 720
 
 [output]
 # v4l2loopback device created with video_nr=10.
@@ -165,8 +170,13 @@ chain = ["auto_frame", "mirror"]
 [presets.framed.post.auto_frame]
 threshold = 0.5
 padding = 0.15
-smoothing = 0.95
+smoothing = 0.85
 zoom_max = 1.3
+# The frame follows only after you stay off by 12 % for a second,
+# then glides there in 0.8 s.
+deadband = 0.12
+hold_secs = 1.0
+glide_secs = 0.8
 
 # Camera image without processing.
 [presets.raw]

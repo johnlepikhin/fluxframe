@@ -13,6 +13,7 @@ pub mod config;
 pub mod context;
 pub mod error;
 pub mod frame;
+pub mod geometry;
 pub mod metadata;
 pub mod metrics;
 pub mod paths;
@@ -25,9 +26,10 @@ pub use config::{
     IdlePresenceSource, InputConfig, InputDevice, LoggingConfig, OutputConfig, OutputScale,
     PipelineSection, Preset, RealtimeConfig,
 };
-pub use context::{FrameContext, ProcessingContext, RuntimeState};
+pub use context::{FrameContext, Framing, FramingSource, ProcessingContext, RuntimeState};
 pub use error::{Diagnostic, EffectError, FluxError, InferenceError, PipelineError};
 pub use frame::{FrameBuffer, FrameMeta, PixelFormat, Timestamp, VideoFrame};
+pub use geometry::Region;
 pub use metadata::{
     CommitStrategy, EFFECT_ENABLED_KEY, EffectMetadata, EffectSchema, ParamDescriptor, ParamKind,
     ParamKindSchema, ParamSchema, ResolvedEffect, Scale, resolve_effect_params,

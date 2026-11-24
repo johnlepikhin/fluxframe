@@ -124,17 +124,24 @@ In order of impact:
     800x448 or 960x540 is enough for most calls, and many conferencing services
     downscale further anyway. `output.scale` reduces only the output size, after
     processing. To reduce processing cost, lower `input.width` and
-    `input.height` instead.
+    `input.height` instead. With `auto_frame`, capture at a higher resolution
+    with `input.capture_width` and `input.capture_height` and keep
+    `input.width` and `input.height` small: the crop is cut from the large
+    capture, so the face stays sharp, while the effects run at the small size.
+    On the test system, capturing 1280x720 MJPEG and processing at 800x448 cost
+    about 36% CPU, against 31% for capturing at 800x448 and 55% for processing
+    the whole 1280x720.
  3. **Use `output.format = "RGB"`.**
  4. **Keep the default thread count.** Set `realtime.processing_threads` (or
     `FLUXFRAME_RAYON_THREADS`) higher only when latency matters more than CPU
     time, for example on a desktop machine.
  5. **Mind the expensive effects.**
     
-     - `auto_frame` scales the whole frame on every frame and was the most
-       expensive single effect in the call measurement, at about 1.1 ms.
-     - `blur` with `downscale = 1` and a large radius and `sharpen` are the next
+     - `blur` with `downscale = 1` and a large radius and `sharpen` are the
        most expensive.
+     - The crop and scale of the captured frame (`framing/crop_resize`) costs
+       1-2 ms whenever the capture size differs from the processing size or
+       `auto_frame` zooms in; `auto_frame` itself costs about 0.1 ms.
      - `color_fill`, `image_fill` and all mask effects are cheap.
      - Disabled effects (`enabled = false`) cost nothing.
  6. **Enable idle mode** if the daemon runs permanently.

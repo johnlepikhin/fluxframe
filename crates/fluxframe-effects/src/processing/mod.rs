@@ -8,13 +8,17 @@ pub mod blur;
 pub mod compose;
 #[cfg(feature = "image-fill")]
 pub mod fit;
+pub mod framer;
 #[cfg(feature = "image-fill")]
 pub mod image_loader;
 pub mod mask;
 pub mod parallel;
 pub mod resize;
+pub mod subject_tracker;
 
 pub use blur::box_blur_rgb;
 pub use compose::alpha_composite_rgb_in_place;
 pub use mask::{dilate, feather, smooth_temporal, threshold};
-pub use resize::{resize_mask_bilinear, resize_rgb_bilinear, resize_rgb_nearest};
+pub use resize::{
+    resize_mask_bilinear, resize_rgb_bilinear, resize_rgb_bilinear_region, resize_rgb_nearest,
+};

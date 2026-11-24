@@ -221,12 +221,24 @@ pub struct InputConfig {
         deserialize_with = "input_device_serde::deserialize"
     )]
     pub device: InputDevice,
-    /// Requested capture width in pixels.
+    /// Processing width in pixels: the size the effects work at and the
+    /// output is derived from.  Also the capture width unless
+    /// `capture_width` is set.
     #[serde(default = "default_width")]
     pub width: u32,
-    /// Requested capture height in pixels.
+    /// Processing height in pixels; see `width`.
     #[serde(default = "default_height")]
     pub height: u32,
+    /// Capture width in pixels when it differs from the processing
+    /// size.  Each captured frame is cropped (by `auto_frame`) and scaled
+    /// to `width × height` before processing, so a larger capture gives a
+    /// zoomed-in crop real detail without making the effects costlier.
+    /// Set together with `capture_height`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_width: Option<u32>,
+    /// Capture height in pixels; see `capture_width`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_height: Option<u32>,
     /// Requested capture frame rate (frames per second).
     #[serde(default = "default_fps")]
     pub fps: u32,
@@ -255,12 +267,48 @@ pub struct InputConfig {
     pub acquire_backoff_max_ms: u32,
 }
 
+impl InputConfig {
+    /// Size of the captured frames: `capture_width × capture_height`
+    /// when set, the processing size otherwise.
+    #[must_use]
+    pub fn capture_dimensions(&self) -> (u32, u32) {
+        (
+            self.capture_width.unwrap_or(self.width),
+            self.capture_height.unwrap_or(self.height),
+        )
+    }
+
+    fn validate_capture(&self) -> Result<(), crate::error::FluxError> {
+        match (self.capture_width, self.capture_height) {
+            (None, None) => return Ok(()),
+            (Some(_), Some(_)) => {}
+            _ => {
+                return Err(config_err(
+                    "input.capture_width and input.capture_height must be set together".into(),
+                ));
+            }
+        }
+        let (w, h) = self.capture_dimensions();
+        check_dimensions("input.capture", w, h)?;
+        if (w, h) != (self.width, self.height) && self.format != PixelFormat::Rgb {
+            return Err(config_err(format!(
+                "input.capture_width/capture_height require input.format = \"RGB\" \
+                 (cropping works on RGB frames), got {:?}",
+                self.format
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl Default for InputConfig {
     fn default() -> Self {
         Self {
             device: default_input_device(),
             width: default_width(),
             height: default_height(),
+            capture_width: None,
+            capture_height: None,
             fps: default_fps(),
             format: default_input_format(),
             auto: AutoInputConfig::default(),
@@ -977,6 +1025,7 @@ impl FluxConfig {
     /// excessive fps, unbounded inflight queue, out-of-range latency).
     pub fn validate(&self) -> Result<(), crate::error::FluxError> {
         check_dimensions("input", self.input.width, self.input.height)?;
+        self.input.validate_capture()?;
         check_fps("input", self.input.fps)?;
         // `OutputConfig.scale: OutputScale` is validated at construction
         // (TOML deserialize / TryFrom); no runtime re-check needed.
@@ -1164,6 +1213,45 @@ mod tests {
             idle.resolve_paths(&base).placeholder_path.as_deref(),
             Some(std::path::Path::new("/etc/ff/away.png"))
         );
+    }
+
+    #[test]
+    fn capture_size_defaults_to_processing_size() {
+        let cfg = FluxConfig::from_toml_str("[input]\nwidth = 800\nheight = 448\n").expect("parse");
+        assert_eq!(cfg.input.capture_dimensions(), (800, 448));
+        cfg.validate().expect("valid");
+    }
+
+    #[test]
+    fn capture_size_overrides_capture_only() {
+        let cfg = FluxConfig::from_toml_str(
+            "[input]\nwidth = 800\nheight = 448\ncapture_width = 1280\ncapture_height = 720\n",
+        )
+        .expect("parse");
+        assert_eq!(cfg.input.capture_dimensions(), (1280, 720));
+        assert_eq!((cfg.input.width, cfg.input.height), (800, 448));
+        cfg.validate().expect("valid");
+    }
+
+    #[test]
+    fn capture_size_must_be_complete_and_rgb() {
+        let half = FluxConfig::from_toml_str("[input]\ncapture_width = 1280\n").expect("parse");
+        assert!(half.validate().is_err());
+        let yuv = FluxConfig::from_toml_str(
+            "[input]\nformat = \"YUY2\"\ncapture_width = 1920\ncapture_height = 1080\n",
+        )
+        .expect("parse");
+        assert!(yuv.validate().is_err());
+        // Equal to the processing size (default 1280×720): no cropping,
+        // so a non-RGB format is fine.
+        let same = FluxConfig::from_toml_str(
+            "[input]\nformat = \"YUY2\"\ncapture_width = 1280\ncapture_height = 720\n",
+        )
+        .expect("parse");
+        same.validate().expect("no crop, any format");
+        let zero = FluxConfig::from_toml_str("[input]\ncapture_width = 0\ncapture_height = 720\n")
+            .expect("parse");
+        assert!(zero.validate().is_err());
     }
 
     #[test]
