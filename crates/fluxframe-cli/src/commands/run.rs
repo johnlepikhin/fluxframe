@@ -362,7 +362,7 @@ mod tests {
     fn compute_excludes_skips_non_dev_output() {
         let mut cfg = FluxConfig::default();
         cfg.output.device = "fakesink".into();
-        assert!(compute_excludes(&cfg).is_empty());
+        assert_eq!(compute_excludes(&cfg), Vec::<PathBuf>::new());
     }
 
     #[test]

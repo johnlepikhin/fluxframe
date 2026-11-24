@@ -445,13 +445,13 @@ chain = []
     #[test]
     fn chain_for_empty_section_returns_empty_vec() {
         let s = fixture();
-        assert!(s.chain_for(SubchainKind::Foreground).is_empty());
+        assert_eq!(s.chain_for(SubchainKind::Foreground), Vec::<String>::new());
     }
 
     #[test]
     fn chain_for_missing_section_returns_empty_vec() {
         let s = fixture();
-        assert!(s.chain_for(SubchainKind::Post).is_empty());
+        assert_eq!(s.chain_for(SubchainKind::Post), Vec::<String>::new());
     }
 
     #[test]
@@ -460,7 +460,7 @@ chain = []
         s.active_config = serde_json::json!({
             "mask": { "chain": "not-an-array" }
         });
-        assert!(s.chain_for(SubchainKind::Mask).is_empty());
+        assert_eq!(s.chain_for(SubchainKind::Mask), Vec::<String>::new());
     }
 
     #[test]

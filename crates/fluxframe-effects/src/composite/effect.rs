@@ -639,7 +639,7 @@ mod tests {
             c.set_effect_enabled(bg, "color_fill", true).ok(),
             Some(true)
         );
-        assert!(c.disabled_effects(bg).is_empty());
+        assert_eq!(c.disabled_effects(bg), Vec::<&str>::new());
     }
 
     #[test]
@@ -654,6 +654,9 @@ mod tests {
                 .expect_err("no such effect");
             assert!(format!("{err}").contains("no effect named"), "{err}");
         }
-        assert!(c.disabled_effects(SubchainKind::Background).is_empty());
+        assert_eq!(
+            c.disabled_effects(SubchainKind::Background),
+            Vec::<&str>::new()
+        );
     }
 }

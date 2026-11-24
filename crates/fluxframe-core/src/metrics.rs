@@ -1725,7 +1725,7 @@ mod tests {
         let h = Arc::new(LatencyHistogram::with_capacity(4));
         let t = EffectTelemetry::with_inference(Arc::clone(&h));
         t.record_inference(Duration::from_micros(7_500));
-        t.record_inference(Duration::from_micros(12_000));
+        t.record_inference(Duration::from_millis(12));
         let snap = h.snapshot();
         assert_eq!(snap.len(), 2);
         assert_eq!(snap.percentile_us(0.5), 7_500);

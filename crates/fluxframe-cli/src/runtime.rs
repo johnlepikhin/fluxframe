@@ -4818,7 +4818,7 @@ radius = 10
             "color_fill",
             true,
         ));
-        assert!(live_disabled(&mut chain, bg).is_empty());
+        assert_eq!(live_disabled(&mut chain, bg), Vec::<String>::new());
         assert_eq!(preset, original);
 
         // Enabling an enabled effect without a table does not create one.
@@ -4903,7 +4903,10 @@ radius = 10
         );
         assert!(err_reason(&resp).contains("not a table"), "{resp:?}");
         assert_eq!(preset, malformed);
-        assert!(live_disabled(&mut chain, SubchainKind::Background).is_empty());
+        assert_eq!(
+            live_disabled(&mut chain, SubchainKind::Background),
+            Vec::<String>::new()
+        );
 
         let mut maskless = Preset::default();
         let resp = apply_set_enabled_command(

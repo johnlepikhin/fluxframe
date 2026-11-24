@@ -427,7 +427,7 @@ mod tests {
         let mut chain = EffectChain::new(Vec::new());
         assert!(chain.is_empty());
         assert_eq!(chain.len(), 0);
-        assert!(chain.names().is_empty());
+        assert_eq!(chain.names(), Vec::<&str>::new());
 
         chain.prepare_all(&make_ctx()).expect("prepare ok");
         let mut frame = make_frame();

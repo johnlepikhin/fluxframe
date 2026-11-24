@@ -262,7 +262,7 @@ fn handle_connection<H: CommandHandler>(
                 break;
             }
             ReadOutcome::Ok => {
-                let line = std::str::from_utf8(&buf).map(str::trim).unwrap_or("");
+                let line = std::str::from_utf8(&buf).map_or("", str::trim);
                 if line.is_empty() {
                     continue;
                 }

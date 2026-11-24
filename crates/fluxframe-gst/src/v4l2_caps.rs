@@ -254,11 +254,7 @@ fn pick_fps(intervals: &[v4l::frameinterval::FrameInterval], prefer_fps: u32) ->
     for iv in intervals {
         let candidates: Vec<u32> = match &iv.interval {
             FrameIntervalEnum::Discrete(d) => {
-                if d.numerator == 0 {
-                    Vec::new()
-                } else {
-                    vec![d.denominator / d.numerator]
-                }
+                d.denominator.checked_div(d.numerator).into_iter().collect()
             }
             FrameIntervalEnum::Stepwise(_) => Vec::new(),
         };

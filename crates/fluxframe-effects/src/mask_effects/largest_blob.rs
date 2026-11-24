@@ -289,7 +289,9 @@ impl MaskEffect for LargestBlobMaskEffect {
 }
 
 #[cfg(test)]
-#[expect(
+// `allow`, not `expect`: newer clippy no longer flags these comparisons,
+// older toolchains still do.
+#[allow(
     clippy::float_cmp,
     reason = "Test inputs use only exact 0.0 / 1.0 values; equality compares correctly."
 )]

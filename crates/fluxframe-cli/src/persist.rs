@@ -767,7 +767,7 @@ device = \"/dev/video10\"
         // file may be `None` (toml omits empty Options) — both
         // shapes count as "no background content".
         if let Some(bg) = &reloaded.background {
-            assert!(bg.chain.is_empty());
+            assert_eq!(bg.chain, Vec::<String>::new());
             assert!(bg.per_effect.is_empty());
         }
     }

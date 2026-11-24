@@ -269,8 +269,7 @@ mod tests {
     fn unique_tmp(label: &str) -> PathBuf {
         let nano = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         let tid = std::thread::current().id();
         std::env::temp_dir().join(format!("ff-util-{label}-{nano}-{tid:?}"))
     }
@@ -379,8 +378,7 @@ mod tests {
     fn check_rejects_symlink_to_regular_file() {
         let nano = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_nanos());
         let tid = std::thread::current().id();
         let dir = std::env::temp_dir().join(format!("ff-symlink-test-{nano}-{tid:?}"));
         std::fs::create_dir_all(&dir).unwrap();

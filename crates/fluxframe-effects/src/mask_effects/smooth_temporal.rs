@@ -190,7 +190,7 @@ mod tests {
             .process(&mut MaskPlane::new(&mut old, 2, 1), &mut ctx)
             .expect("seed");
         effect.reset_state();
-        assert!(effect.prev.is_empty());
+        assert_eq!(effect.prev, Vec::<f32>::new());
 
         // Without the reset this frame would blend towards the old 1.0s.
         let mut fresh = vec![0.0, 0.0];
@@ -209,7 +209,7 @@ mod tests {
         let mut ctx = FrameContext::default();
         effect.process(&mut plane, &mut ctx).expect("ok");
         assert_eq!(data, vec![0.1, 0.9]);
-        assert!(effect.prev.is_empty());
+        assert_eq!(effect.prev, Vec::<f32>::new());
     }
 
     #[test]

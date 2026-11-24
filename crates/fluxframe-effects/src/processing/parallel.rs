@@ -145,7 +145,7 @@ where
 {
     debug_assert!(row_len == 0 || data.len() % row_len == 0);
     for_each_chunk_mut(data, row_len, move |offset, row| {
-        let y = if row_len == 0 { 0 } else { offset / row_len };
+        let y = offset.checked_div(row_len).unwrap_or(0);
         f(y, row);
     });
 }

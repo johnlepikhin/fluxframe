@@ -225,11 +225,8 @@ pub enum FluxError {
     ///
     /// Wraps the upstream [`toml::de::Error`] so `?` from `toml::from_str`
     /// works directly.  The TOML error already contains line/column info.
-    #[error("config parse failed: {source}")]
-    ConfigParse {
-        #[from]
-        source: toml::de::Error,
-    },
+    #[error("config parse failed: {0}")]
+    ConfigParse(#[from] toml::de::Error),
 
     /// An I/O operation failed, with the offending path attached.
     ///

@@ -129,8 +129,7 @@ impl OnnxEngine {
         //   * inter_threads = 1 (we don't have op-graph parallelism on this model)
         //   * spinning      = false (sleep between inferences)
         let intra_threads = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(2)
+            .map_or(2, std::num::NonZeroUsize::get)
             .saturating_sub(1)
             .clamp(2, 4);
         let session = Session::builder()

@@ -279,8 +279,7 @@ mod tests {
         fn new(label: &str) -> Self {
             let nano = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
+                .map_or(0, |d| d.as_nanos());
             // Add thread id to avoid collisions when tests run in parallel.
             let tid = std::thread::current().id();
             let p = std::env::temp_dir().join(format!("ff-v4l2-test-{label}-{nano}-{tid:?}"));

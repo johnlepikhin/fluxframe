@@ -490,7 +490,7 @@ device = "/dev/video0"
     fn auto_input_defaults_are_sensible() {
         let auto = AutoInputConfig::default();
         assert!(auto.poll_interval_secs >= 1);
-        assert!(auto.exclude_devices.is_empty());
+        assert_eq!(auto.exclude_devices, Vec::<std::path::PathBuf>::new());
     }
 
     #[test]

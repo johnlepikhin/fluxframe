@@ -179,14 +179,20 @@ mod tests {
     #[test]
     fn cover_zero_destination_returns_empty() {
         let src = solid_rgb(2, 2, [1, 2, 3]);
-        assert!(fit_cover_rgb(&src, 2, 2, 0, 4).is_empty());
-        assert!(fit_cover_rgb(&src, 2, 2, 4, 0).is_empty());
+        assert_eq!(fit_cover_rgb(&src, 2, 2, 0, 4), Vec::<u8>::new());
+        assert_eq!(fit_cover_rgb(&src, 2, 2, 4, 0), Vec::<u8>::new());
     }
 
     #[test]
     fn contain_zero_destination_returns_empty() {
         let src = solid_rgb(2, 2, [1, 2, 3]);
-        assert!(fit_contain_rgb(&src, 2, 2, 0, 4, [0, 0, 0]).is_empty());
-        assert!(fit_contain_rgb(&src, 2, 2, 4, 0, [0, 0, 0]).is_empty());
+        assert_eq!(
+            fit_contain_rgb(&src, 2, 2, 0, 4, [0, 0, 0]),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            fit_contain_rgb(&src, 2, 2, 4, 0, [0, 0, 0]),
+            Vec::<u8>::new()
+        );
     }
 }
