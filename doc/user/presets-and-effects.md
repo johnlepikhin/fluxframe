@@ -285,9 +285,17 @@ of tones rather than flicker.
 | `smoothing`     | float   | 0.9     | 0 to 0.99 | Per-frame inertia of the cell colours. 0 follows the frame.    |
 | `line_width`    | integer | 2       | 0 to 8    | Width of the lines between cells in pixels. 0 draws none.      |
 | `line_strength` | float   | 0.6     | 0 to 1    | How much darker the lines are: 0 invisible, 1 black.           |
+| `ignore_person` | boolean | true    |           | Leave the person out of the cell colours. Uses the mask.       |
 
 The pattern is the same on every run. It is rebuilt when `cell_size`,
 `irregularity`, `line_width` or the frame size changes.
+
+With `ignore_person`, the colour of a cell is averaged over the room only, so
+your clothes do not tint the glass around and behind you, and the cells do not
+change colour when you move. A cell you cover almost entirely keeps the last
+colour of the room it saw; one you have covered since the start shows the mean
+colour of the visible room until you move aside. Set `ignore_person = false` when the effect runs on
+the foreground, where the plane is the person.
 
 ### `shadow`
 

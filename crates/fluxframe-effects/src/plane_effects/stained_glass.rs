@@ -7,6 +7,11 @@
 //! behind the speaker turns into a slow shift of tones instead of
 //! flicker.  The room's own colours are kept, only averaged.
 //!
+//! With `ignore_person` (the default) each pixel counts in its cell's
+//! average with weight `1 - mask`, so the person's clothes and skin do
+//! not tint the glass around and behind them.  A cell the person covers
+//! almost entirely keeps its last colour of the room.
+//!
 //! Cost per frame is `O(width × height)`: one read pass summing colours
 //! per cell, one write pass.  The cell map (cell id and line weight per
 //! pixel) is built once per geometry and kept until the frame size or a
@@ -14,20 +19,24 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
-use fluxframe_core::metadata::{DEBOUNCE_HEAVY_MS, DEBOUNCE_STANDARD_MS, EffectMetadata};
+use fluxframe_core::metadata::{
+    CommitStrategy, DEBOUNCE_FAST_MS, DEBOUNCE_HEAVY_MS, DEBOUNCE_STANDARD_MS, EffectMetadata,
+    ParamDescriptor, ParamKind,
+};
 use fluxframe_core::plane::{FramePlane, MaskPlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
-use super::helpers::{float_param, integer_param, reject_int_out_of_range, reject_out_of_range};
+use super::helpers::{
+    check_mask_size, float_param, integer_param, reject_int_out_of_range, reject_out_of_range,
+};
 use crate::processing::parallel::{for_each_row_mut, map_reduce_chunks_indexed};
 
 /// Smallest accepted `cell_size`: below it cells are a few pixels wide
 /// and the pattern reads as noise.
 const MIN_CELL_SIZE: i64 = 8;
-/// Largest accepted `cell_size`.  Also keeps the per-cell `u32` colour
-/// sums far from overflow: a cell spans at most two grid steps per
-/// axis, `512² × 255 ≈ 6.7e7 < u32::MAX`.
+/// Largest accepted `cell_size`: above it the glass is a handful of
+/// panes even on 4K frames.
 const MAX_CELL_SIZE: i64 = 256;
 /// Largest accepted `line_width`, in pixels.
 const MAX_LINE_WIDTH: i64 = 8;
@@ -44,6 +53,12 @@ pub const DEFAULT_SMOOTHING: f32 = 0.9;
 pub const DEFAULT_LINE_WIDTH: u32 = 2;
 /// Default darkening of the lead lines.
 pub const DEFAULT_LINE_STRENGTH: f32 = 0.6;
+/// Default for excluding the person from the cell colours.
+pub const DEFAULT_IGNORE_PERSON: bool = true;
+/// A cell whose visible room covers less than this share of its area
+/// keeps its previous colour instead of averaging the few room pixels
+/// left around the person.
+const MIN_VISIBLE_SHARE: f32 = 0.1;
 
 /// Packed per-pixel entry used while building the map: cell id in the
 /// low 24 bits, line weight (0 = inside a cell, 255 = on a line) in the
@@ -87,6 +102,11 @@ pub struct StainedGlassConfig {
     /// `1.0` black.
     #[serde(default = "default_line_strength")]
     pub line_strength: f32,
+    /// Leave the person out of the cell colours (uses the mask).  Turn
+    /// off when the effect runs on `[foreground]`, where the plane is the
+    /// person.
+    #[serde(default = "default_ignore_person")]
+    pub ignore_person: bool,
 }
 
 fn default_cell_size() -> u32 {
@@ -104,6 +124,9 @@ fn default_line_width() -> u32 {
 fn default_line_strength() -> f32 {
     DEFAULT_LINE_STRENGTH
 }
+fn default_ignore_person() -> bool {
+    DEFAULT_IGNORE_PERSON
+}
 
 impl Default for StainedGlassConfig {
     fn default() -> Self {
@@ -113,6 +136,7 @@ impl Default for StainedGlassConfig {
             smoothing: default_smoothing(),
             line_width: default_line_width(),
             line_strength: default_line_strength(),
+            ignore_person: default_ignore_person(),
         }
     }
 }
@@ -183,6 +207,85 @@ impl CellMap {
     }
 }
 
+/// Colour sums of one cell for one frame.
+#[derive(Debug, Clone, Copy, Default)]
+struct CellSums {
+    plain: [u64; 3],
+    count: u64,
+    /// RGB sums weighted by `255 - 255 * mask` per pixel.
+    weighted: [u64; 3],
+    /// Sum of the weights; `255 × count` when no pixel is the person.
+    weight: u64,
+}
+
+/// Mask values below this count as pure room, above `1 - ROOM_EPS` as
+/// pure person: both round to the end weights `255` and `0`.
+const ROOM_EPS: f32 = 1.0 / 510.0;
+
+impl CellSums {
+    /// Add a run of pixels with `weight` (`0..=255`) each.
+    fn add_uniform<'a>(&mut self, pixels: impl Iterator<Item = &'a [u8]>, weight: u64) {
+        // `u32` per run: a run lies within one frame row, so even an
+        // 8K row sums to `7680 × 255 ≈ 2e6`.
+        let mut rgb = [0_u32; 3];
+        let mut n = 0_u64;
+        for px in pixels {
+            rgb[0] += u32::from(px[0]);
+            rgb[1] += u32::from(px[1]);
+            rgb[2] += u32::from(px[2]);
+            n += 1;
+        }
+        for ((plain, weighted), sum) in self.plain.iter_mut().zip(&mut self.weighted).zip(rgb) {
+            *plain += u64::from(sum);
+            *weighted += u64::from(sum) * weight;
+        }
+        self.count += n;
+        self.weight += n * weight;
+    }
+
+    /// Add a run of pixels weighted by how much of each is room
+    /// (`255 - 255 * mask`). Runs entirely in the room or entirely on
+    /// the person — most of them — take the uniform path.
+    fn add_masked<'a>(&mut self, pixels: impl Iterator<Item = &'a [u8]>, mask: &[f32]) {
+        if mask.iter().all(|&m| m < ROOM_EPS) {
+            return self.add_uniform(pixels, 255);
+        }
+        if mask.iter().all(|&m| m > 1.0 - ROOM_EPS) {
+            return self.add_uniform(pixels, 0);
+        }
+        // `u32` per run: an 8K row weighs at most
+        // `7680 × 255 × 255 ≈ 5e8 < u32::MAX`.
+        let mut plain = [0_u32; 3];
+        let mut weighted = [0_u32; 3];
+        let mut weight = 0_u32;
+        let mut n = 0_u64;
+        for (px, &m) in pixels.zip(mask) {
+            let w = 255 - (m.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+            for ((p, wsum), &v) in plain.iter_mut().zip(&mut weighted).zip(px) {
+                *p += u32::from(v);
+                *wsum += u32::from(v) * w;
+            }
+            weight += w;
+            n += 1;
+        }
+        for c in 0..3 {
+            self.plain[c] += u64::from(plain[c]);
+            self.weighted[c] += u64::from(weighted[c]);
+        }
+        self.count += n;
+        self.weight += u64::from(weight);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        for c in 0..3 {
+            self.plain[c] += other.plain[c];
+            self.weighted[c] += other.weighted[c];
+        }
+        self.count += other.count;
+        self.weight += other.weight;
+    }
+}
+
 /// `PlaneEffect` drawing the plane as stained glass.
 pub struct StainedGlassEffect {
     config: StainedGlassConfig,
@@ -190,6 +293,10 @@ pub struct StainedGlassEffect {
     /// Smoothed colour per cell; empty until the first frame after a
     /// (re)build or a reset, which seeds it.
     colors: Vec<[f32; 3]>,
+    /// Whether the cell's colour comes from the room.  A cell the person
+    /// covers from the start is seeded with its plain mean and takes the
+    /// room's colour at once when it first becomes visible.
+    seen: Vec<bool>,
     /// `colors` rounded for the write pass.
     colors_u8: Vec<[u8; 3]>,
 }
@@ -243,6 +350,16 @@ impl StainedGlassEffect {
                 DEBOUNCE_STANDARD_MS,
                 "How much darker the lines are: 0 invisible, 1 black.",
             ),
+            ParamDescriptor {
+                name: "ignore_person",
+                kind: ParamKind::Bool {
+                    default: DEFAULT_IGNORE_PERSON,
+                },
+                help: "Leave the person out of the cell colours; off on the foreground.",
+                commit: CommitStrategy::Live {
+                    debounce_ms: DEBOUNCE_FAST_MS,
+                },
+            },
         ],
     };
 
@@ -253,6 +370,7 @@ impl StainedGlassEffect {
             config: StainedGlassConfig::default(),
             map: None,
             colors: Vec::new(),
+            seen: Vec::new(),
             colors_u8: Vec::new(),
         }
     }
@@ -264,6 +382,56 @@ impl StainedGlassEffect {
             cell_size: self.config.cell_size,
             irregularity: self.config.irregularity,
             line_width: self.config.line_width,
+        }
+    }
+
+    /// Fold this frame's sums into the smoothed cell colours.
+    ///
+    /// A cell takes the room's colour at once the first time it sees
+    /// the room; a cell hidden behind the person keeps its colour.  A
+    /// cell hidden from the start shows the mean colour of the whole
+    /// visible room until it is revealed (its own plain mean would be
+    /// the person's colour); when no room is visible at all, the plain
+    /// mean is all there is.
+    fn update_colors(&mut self, sums: &[CellSums]) {
+        let cells = sums.len();
+        let total = sums.iter().fold(CellSums::default(), |mut acc, s| {
+            acc.merge(s);
+            acc
+        });
+        let room_mean =
+            (total.weight > 0).then(|| total.weighted.map(|sum| sum as f32 / total.weight as f32));
+        if self.colors.len() != cells {
+            self.colors = vec![[0.0; 3]; cells];
+            self.seen = vec![false; cells];
+        }
+        let smoothing = self.config.smoothing;
+        self.colors_u8.resize(cells, [0; 3]);
+        for (((color, seen), out), s) in self
+            .colors
+            .iter_mut()
+            .zip(&mut self.seen)
+            .zip(&mut self.colors_u8)
+            .zip(sums)
+        {
+            // A cell whose centre lies past the frame edge may cover no
+            // pixels; it is never drawn either.
+            if s.count > 0 {
+                let visible = s.weight as f32 / (s.count as f32 * 255.0);
+                if visible >= MIN_VISIBLE_SHARE {
+                    let keep = if *seen { smoothing } else { 0.0 };
+                    let w = s.weight as f32;
+                    for (channel, &sum) in color.iter_mut().zip(&s.weighted) {
+                        let mean = sum as f32 / w;
+                        *channel = keep * *channel + (1.0 - keep) * mean;
+                    }
+                    *seen = true;
+                } else if !*seen {
+                    let n = s.count as f32;
+                    *color = room_mean.unwrap_or(s.plain.map(|sum| sum as f32 / n));
+                }
+            }
+            *out = color.map(|v| v.round().clamp(0.0, 255.0) as u8);
         }
     }
 
@@ -375,6 +543,7 @@ impl PlaneEffect for StainedGlassEffect {
 
     fn reset_state(&mut self) {
         self.colors.clear();
+        self.seen.clear();
     }
 
     fn configure(&mut self, params: RawEffectParams) -> Result<(), EffectError> {
@@ -412,9 +581,10 @@ impl PlaneEffect for StainedGlassEffect {
     fn process(
         &mut self,
         plane: &mut FramePlane<'_>,
-        _mask: &MaskPlane<'_>,
+        mask: &MaskPlane<'_>,
         _ctx: &mut FrameContext,
     ) -> Result<(), EffectError> {
+        check_mask_size(Self::NAME, plane, mask)?;
         let width = plane.width as usize;
         let height = plane.height as usize;
         if width == 0 || height == 0 {
@@ -427,93 +597,83 @@ impl PlaneEffect for StainedGlassEffect {
         );
         self.ensure_map(self.map_key(plane.width, plane.height));
         let map = self.map.as_ref().expect("built above");
-        let cells = map.cells;
-        let row_stride = width * 3;
-
-        // Colour sums and pixel counts per cell.
-        let sums = map_reduce_chunks_indexed(
+        let mask = self.config.ignore_person.then_some(&*mask.data);
+        let sums = cell_sums(map, plane.data, width, mask);
+        self.update_colors(&sums);
+        let map = self.map.as_ref().expect("built above");
+        fill(
+            map,
             plane.data,
-            SUM_BAND_ROWS * row_stride,
-            || vec![[0_u32; 4]; cells],
-            |offset, band| {
-                let mut acc = vec![[0_u32; 4]; cells];
-                let first_row = offset / row_stride;
-                for (i, row) in band.chunks_exact(row_stride).enumerate() {
-                    let mut x = 0;
-                    for run in map.row(first_row + i) {
-                        let len = run.len as usize;
-                        let mut rgb = [0_u32; 3];
-                        for px in row[x * 3..(x + len) * 3].chunks_exact(3) {
-                            rgb[0] += u32::from(px[0]);
-                            rgb[1] += u32::from(px[1]);
-                            rgb[2] += u32::from(px[2]);
-                        }
-                        let cell = &mut acc[run.id as usize];
-                        cell[0] += rgb[0];
-                        cell[1] += rgb[1];
-                        cell[2] += rgb[2];
-                        cell[3] += run.len;
-                        x += len;
-                    }
-                }
-                acc
-            },
-            |mut a, b| {
-                for (x, y) in a.iter_mut().zip(&b) {
-                    for c in 0..4 {
-                        x[c] += y[c];
-                    }
-                }
-                a
-            },
+            width,
+            &self.colors_u8,
+            self.config.line_strength,
         );
-
-        // Smooth over time; a fresh state is seeded by this frame.
-        let seed = self.colors.len() != cells;
-        if seed {
-            self.colors = vec![[0.0; 3]; cells];
-        }
-        let keep = if seed { 0.0 } else { self.config.smoothing };
-        self.colors_u8.resize(cells, [0; 3]);
-        for ((color, out), s) in self.colors.iter_mut().zip(&mut self.colors_u8).zip(&sums) {
-            // A cell whose centre lies past the frame edge may cover no
-            // pixels; it is never drawn either.
-            if s[3] > 0 {
-                let n = s[3] as f32;
-                for c in 0..3 {
-                    let mean = s[c] as f32 / n;
-                    color[c] = keep * color[c] + (1.0 - keep) * mean;
-                }
-            }
-            *out = color.map(|v| v.round().clamp(0.0, 255.0) as u8);
-        }
-
-        // Fill each pixel with its cell's colour, darkened on the lines
-        // (8.8 fixed point).
-        let strength_q8 = (self.config.line_strength * 256.0).round() as u32;
-        let colors = &self.colors_u8;
-        for_each_row_mut(plane.data, row_stride, |y, row| {
-            let mut x = 0;
-            for run in map.row(y) {
-                let len = run.len as usize;
-                let color = colors[run.id as usize];
-                let gain = 256 - ((run.weight * strength_q8 + 127) / 255);
-                let shaded = color.map(|c| ((u32::from(c) * gain + 128) >> 8) as u8);
-                for px in row[x * 3..(x + len) * 3].chunks_exact_mut(3) {
-                    px.copy_from_slice(&shaded);
-                }
-                x += len;
-            }
-        });
         Ok(())
     }
+}
+
+/// Colour sums per cell over the plane. With `mask`, pixels are weighted
+/// by how much they are room (`255 - 255 * mask`); without, every pixel
+/// has the full weight.
+fn cell_sums(map: &CellMap, data: &[u8], width: usize, mask: Option<&[f32]>) -> Vec<CellSums> {
+    let cells = map.cells;
+    let row_stride = width * 3;
+    map_reduce_chunks_indexed(
+        data,
+        SUM_BAND_ROWS * row_stride,
+        || vec![CellSums::default(); cells],
+        |offset, band| {
+            let mut acc = vec![CellSums::default(); cells];
+            let first_row = offset / row_stride;
+            for (i, row) in band.chunks_exact(row_stride).enumerate() {
+                let y = first_row + i;
+                let mut x = 0;
+                for run in map.row(y) {
+                    let len = run.len as usize;
+                    let pixels = row[x * 3..(x + len) * 3].chunks_exact(3);
+                    let cell = &mut acc[run.id as usize];
+                    match mask {
+                        Some(mask) => cell.add_masked(pixels, &mask[y * width + x..][..len]),
+                        None => cell.add_uniform(pixels, 255),
+                    }
+                    x += len;
+                }
+            }
+            acc
+        },
+        |mut a, b| {
+            for (x, y) in a.iter_mut().zip(&b) {
+                x.merge(y);
+            }
+            a
+        },
+    )
+}
+
+/// Fill each pixel with its cell's colour, darkened on the lines (8.8
+/// fixed point).
+fn fill(map: &CellMap, data: &mut [u8], width: usize, colors: &[[u8; 3]], line_strength: f32) {
+    let strength_q8 = (line_strength * 256.0).round() as u32;
+    for_each_row_mut(data, width * 3, |y, row| {
+        let mut x = 0;
+        for run in map.row(y) {
+            let len = run.len as usize;
+            let color = colors[run.id as usize];
+            let gain = 256 - ((run.weight * strength_q8 + 127) / 255);
+            let shaded = color.map(|c| ((u32::from(c) * gain + 128) >> 8) as u8);
+            for px in row[x * 3..(x + len) * 3].chunks_exact_mut(3) {
+                px.copy_from_slice(&shaded);
+            }
+            x += len;
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::processing::parallel::MIN_PARALLEL_ELEMS;
-    use crate::test_support::process_plane;
+    use crate::test_support::{filled_mask, process_plane};
 
     fn ctx(w: u32, h: u32) -> ProcessingContext {
         ProcessingContext {
@@ -747,5 +907,111 @@ mod tests {
         let mut data = noise(80, 40);
         run(&mut e, &mut data, 80, 40);
         assert_eq!(packed(&e).len(), 80 * 40);
+    }
+    // Square 16-px cells without lines: cell 0 is x, y in 0..16.
+    const GRID: &str = "cell_size = 16\nirregularity = 0.0\nline_width = 0\nsmoothing = 0.0";
+    const GW: u32 = 64;
+    const GH: u32 = 32;
+    const ROOM: [u8; 3] = [0, 0, 200];
+    const SHIRT: [u8; 3] = [200, 0, 0];
+
+    /// Frame of `ROOM` with the person (`SHIRT`, mask 1) at `x < person_w`
+    /// in the top 16 rows; returns the output pixel at (0, 0).
+    fn run_with_person(e: &mut StainedGlassEffect, person_w: u32) -> [u8; 3] {
+        let mut data = Vec::with_capacity((GW * GH * 3) as usize);
+        let mut mask = Vec::with_capacity((GW * GH) as usize);
+        for y in 0..GH {
+            for x in 0..GW {
+                let person = x < person_w && y < 16;
+                data.extend_from_slice(if person { &SHIRT } else { &ROOM });
+                mask.push(if person { 1.0 } else { 0.0 });
+            }
+        }
+        let mut plane = FramePlane::new(&mut data, GW, GH);
+        let mask = MaskPlane::new(&mut mask, GW, GH);
+        e.process(&mut plane, &mask, &mut FrameContext::default())
+            .expect("process");
+        [data[0], data[1], data[2]]
+    }
+
+    #[test]
+    fn the_person_does_not_tint_the_cells() {
+        let mut e = prepared(GRID, GW, GH);
+        assert_eq!(run_with_person(&mut e, 8), ROOM);
+    }
+
+    #[test]
+    fn without_ignore_person_the_person_is_averaged_in() {
+        let mut e = prepared(&format!("{GRID}\nignore_person = false"), GW, GH);
+        assert_eq!(run_with_person(&mut e, 8), [100, 0, 100]);
+    }
+
+    #[test]
+    fn soft_mask_values_weight_the_average() {
+        // Every pixel partly person: the shirt with mask 0.75 (weight
+        // 64), the room with mask 0.25 (weight 191).
+        let mut e = prepared(GRID, GW, GH);
+        let mut data = Vec::new();
+        let mut mask = Vec::new();
+        for _ in 0..GH {
+            for x in 0..GW {
+                let shirt = x % 16 < 8;
+                data.extend_from_slice(if shirt { &SHIRT } else { &ROOM });
+                mask.push(if shirt { 0.75 } else { 0.25 });
+            }
+        }
+        let mut plane = FramePlane::new(&mut data, GW, GH);
+        let mask = MaskPlane::new(&mut mask, GW, GH);
+        e.process(&mut plane, &mask, &mut FrameContext::default())
+            .expect("process");
+        // R = 200 × 64 / 255, B = 200 × 191 / 255.
+        assert_eq!([data[0], data[1], data[2]], [50, 0, 150]);
+    }
+
+    #[test]
+    fn a_covered_cell_keeps_the_colour_of_the_room() {
+        let mut e = prepared(GRID, GW, GH);
+        assert_eq!(run_with_person(&mut e, 0), ROOM);
+        // The person now covers cell 0 entirely (and a bit more).
+        assert_eq!(run_with_person(&mut e, 20), ROOM);
+    }
+
+    #[test]
+    fn a_cell_covered_from_the_start_shows_the_room_until_revealed() {
+        const WALL: [u8; 3] = [0, 160, 0];
+        let mut e = prepared(
+            "cell_size = 16\nirregularity = 0.0\nline_width = 0\nsmoothing = 0.9",
+            GW,
+            GH,
+        );
+        // Never seen its own room: the mean colour of the visible room,
+        // not the shirt.
+        assert_eq!(run_with_person(&mut e, 16), ROOM);
+        // Revealed, with a wall of another colour behind: that colour at
+        // once, despite the smoothing.
+        let mut data = Vec::new();
+        for y in 0..GH {
+            for x in 0..GW {
+                data.extend_from_slice(if x < 16 && y < 16 { &WALL } else { &ROOM });
+            }
+        }
+        let mut buf = Vec::new();
+        let mask = filled_mask(&mut buf, GW, GH, 0.0);
+        let mut plane = FramePlane::new(&mut data, GW, GH);
+        e.process(&mut plane, &mask, &mut FrameContext::default())
+            .expect("process");
+        assert_eq!([data[0], data[1], data[2]], WALL);
+    }
+
+    #[test]
+    fn with_no_room_visible_the_plain_mean_is_used() {
+        let mut e = prepared(GRID, GW, GH);
+        let mut data = SHIRT.repeat((GW * GH) as usize);
+        let mut buf = Vec::new();
+        let mask = filled_mask(&mut buf, GW, GH, 1.0);
+        let mut plane = FramePlane::new(&mut data, GW, GH);
+        e.process(&mut plane, &mask, &mut FrameContext::default())
+            .expect("process");
+        assert_eq!([data[0], data[1], data[2]], SHIRT);
     }
 }

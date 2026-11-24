@@ -128,10 +128,14 @@ differs.
 
 | Background effect                 | Effect time per frame (mean / p95) |
 | --------------------------------- | ---------------------------------- |
-| `pixelate`, `block_size = 14`     | 0.35 / 0.7-1.2 ms                  |
-| `stained_glass`, `cell_size = 48` | 0.72 / 1.3-1.7 ms                  |
+| `pixelate`, `block_size = 14`     | 0.35-0.5 / 0.6-1.2 ms              |
+| `stained_glass`, `cell_size = 48` | 1.0-1.2 / 1.4-1.7 ms               |
+| `shadow`, defaults                | 0.9-1.0 / 1.3-1.7 ms               |
+| `halo`, defaults                  | 0.8-1.0 / 1.2-1.7 ms               |
 
-The difference in process CPU was within the run-to-run spread.
+`stained_glass` was measured with `ignore_person` on, the default. Together
+`stained_glass`, `shadow` and `halo` used about 10% of a core more than
+`pixelate` alone.
 
 ### Idle
 
