@@ -51,6 +51,11 @@ subtitle reads "Unsaved changes". Next to it are:
  - Revert: discards unsaved edits and restores the preset as last saved. Hidden
    in narrow windows; also available in the main menu.
 
+When the selected preset cannot run on this machine and its [fallback
+preset](presets-and-effects.md#fallback-preset) runs instead, a warning names
+both presets. It appears after connecting and after every preset switch or
+reload. The header bar then shows the fallback preset as the active one.
+
 The main menu contains Discard Unsaved Changes, Reload Configuration, Keyboard
 Shortcuts and About FluxFrame. The About dialog includes troubleshooting
 details: socket path, connection state, active preset, configuration path and

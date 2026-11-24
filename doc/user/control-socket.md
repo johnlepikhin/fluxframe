@@ -53,15 +53,15 @@ The value of `ok` is the string `"true"` or `"false"`, not a JSON boolean.
 
 ### Inspecting
 
-| Request                                         | Result                                                                                                              |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `{"cmd":"list_presets"}`                        | Array of preset names.                                                                                              |
-| `{"cmd":"current_preset"}`                      | Name of the active preset.                                                                                          |
-| `{"cmd":"get_config"}`                          | The active preset as JSON, including unsaved changes.                                                               |
-| `{"cmd":"get_config","path":"background.blur"}` | A part of the active preset, addressed by a dot-separated path.                                                     |
-| `{"cmd":"list_effects"}`                        | All available effects by group, with their parameters, types, defaults and ranges, and the daemon's build features. |
-| `{"cmd":"config_path"}`                         | `{"path":"..."}`: the file that saves write to, or `null` if there is none.                                         |
-| `{"cmd":"daemon_info"}`                         | `{"output":{"kind":"v4l2","device":"/dev/video10"}}`: where the daemon publishes video. `kind` is `v4l2` (with `device`), `pipewire` (with `node`), `auto` or `fakesink`. |
+| Request                                         | Result                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `{"cmd":"list_presets"}`                        | Array of preset names.                                                                                                                                                                                                                                                                                                                                                                                             |
+| `{"cmd":"current_preset"}`                      | Name of the running preset. While a [fallback preset](presets-and-effects.md#fallback-preset) runs, this is the fallback.                                                                                                                                                                                                                                                                                          |
+| `{"cmd":"get_config"}`                          | The active preset as JSON, including unsaved changes.                                                                                                                                                                                                                                                                                                                                                              |
+| `{"cmd":"get_config","path":"background.blur"}` | A part of the active preset, addressed by a dot-separated path.                                                                                                                                                                                                                                                                                                                                                    |
+| `{"cmd":"list_effects"}`                        | All available effects by group, with their parameters, types, defaults and ranges, and the daemon's build features.                                                                                                                                                                                                                                                                                                |
+| `{"cmd":"config_path"}`                         | `{"path":"..."}`: the file that saves write to, or `null` if there is none.                                                                                                                                                                                                                                                                                                                                        |
+| `{"cmd":"daemon_info"}`                         | `{"output":{"kind":"v4l2","device":"/dev/video10"},"requested_preset":"default","active_preset":"mediapipe"}`. `output` is where the daemon publishes video: `kind` is `v4l2` (with `device`), `pipewire` (with `node`), `auto` or `fakesink`. `requested_preset` is the preset that was selected, `active_preset` the one that runs; they differ while a fallback preset runs. Older daemons omit both.           |
 
 ### Changing the active preset
 
@@ -98,12 +98,12 @@ no longer in the chain are removed.
 
 ### Presets and files
 
-| Request                                     | Effect                                                                                                                                                                                              |
-| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `{"cmd":"set_preset","name":"blur"}`        | Activates a preset. The pipeline is rebuilt; with a model change this takes up to about half a second. Unsaved changes to the previous preset are discarded.                                        |
-| `{"cmd":"reload"}`                          | Re-reads the configuration file and rebuilds the active preset. Command-line overrides remain in effect. Fails if the daemon has no configuration file or the active preset no longer exists in it. |
-| `{"cmd":"save_preset"}`                     | Writes the active preset, including unsaved changes, to the configuration file.                                                                                                                     |
-| `{"cmd":"save_preset_as","name":"evening"}` | Writes the current state as a new preset. The name may contain letters, digits, `_` and `-` and must not exist yet. The active preset does not change.                                              |
+| Request                                     | Effect                                                                                                                                                                                                                                                                                                                              |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `{"cmd":"set_preset","name":"blur"}`        | Activates a preset. The pipeline is rebuilt; with a model change this takes up to about half a second. Unsaved changes to the previous preset are discarded. If the preset cannot run on this machine and has a `fallback_preset`, the fallback is activated and the request still succeeds; `daemon_info` shows which preset runs. |
+| `{"cmd":"reload"}`                          | Re-reads the configuration file and rebuilds the selected preset, trying it again if a fallback preset was running. Command-line overrides remain in effect. Fails if the daemon has no configuration file or the active preset no longer exists in it.                                                                             |
+| `{"cmd":"save_preset"}`                     | Writes the active preset, including unsaved changes, to the configuration file.                                                                                                                                                                                                                                                     |
+| `{"cmd":"save_preset_as","name":"evening"}` | Writes the current state as a new preset. The name may contain letters, digits, `_` and `-` and must not exist yet. The active preset does not change.                                                                                                                                                                              |
 
 Saving rewrites only the `[presets.NAME]` section and its subsections. Comments
 and all other content of the file are preserved. The file is written to a
@@ -144,5 +144,5 @@ Temporarily turn off the background effect:
 
 ```bash
 echo '{"cmd":"set_enabled","section":"background","effect":"blur","enabled":false}' \
-    | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock
+| socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/fluxframe.sock |
 ```

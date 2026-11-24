@@ -134,6 +134,31 @@ directory the daemon was started from; see
 [Configuration](configuration.md#relative-paths). Make sure the sidecar `.toml`
 file is next to the model.
 
+## The fallback preset runs instead of the selected one
+
+The log shows `preset cannot run on this machine; switching to its fallback
+preset` or `running the fallback preset`, and the GUI shows a warning naming
+both presets. The error in the log line gives the reason:
+
+ - "no allowed inference device can run this model: none of NPU can run the
+   model": the model's sidecar restricts it to the NPU (`devices = ["NPU"]`),
+   and OpenVINO cannot use the NPU. Check that the NPU driver is installed and
+   that `/dev/accel/accel0` exists and is accessible to your user. The text
+   after the colon is OpenVINO's own error.
+ - "the OpenVINO runtime is unavailable": see [Inference runs on the CPU
+   although OpenVINO is installed](#inference-runs-on-the-cpu-although-openvino-is-installed).
+ - "the CPU backend is forced": `FLUXFRAME_FORCE_INFERENCE_BACKEND=cpu` is set,
+   and the model cannot run on ONNX Runtime.
+ - "inference error inside effect 'segmentation'" after the preset had already
+   run: inference kept failing, for example because the NPU stopped responding.
+
+A model file that is damaged also produces the first error, because OpenVINO
+reads the file while trying each device. Run `tools/prepare-rvm.py` again if in
+doubt.
+
+After fixing the cause, select the preset again (`set_preset`, the GUI preset
+list, or `reload`); the daemon does not switch back on its own.
+
 ## The GUI shows "Daemon Unreachable"
 
 The reason is shown under the socket path:
@@ -168,6 +193,11 @@ conversion. Set `output.format = "RGB"`. It is also cheaper.
  - Halos around the person usually disappear with a higher `threshold.level`,
    for example 0.8.
  - Stray patches of person-coloured background are removed by `largest_blob`.
+
+With Robust Video Matting the video is delayed by one frame by design (see
+[Performance](performance.md#robust-video-matting)). Do not add
+`smooth_temporal` or `threshold` to its mask chain: the model is already stable
+over time, and thresholding destroys its soft edge.
 
 ## Applications get an I/O error when opening the camera
 

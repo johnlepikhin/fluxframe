@@ -23,7 +23,7 @@ On an Intel Core Ultra 7 155H laptop with inference on the NPU, a typical call p
 - Linux with the `v4l2loopback` kernel module (0.13 or newer recommended).
 - GStreamer 1.x with the base and good plugin sets.
 - ONNX Runtime (shared library). OpenVINO is optional.
-- A segmentation model: MediaPipe Selfie Segmentation in ONNX format.
+- A segmentation model: MediaPipe Selfie Segmentation in ONNX format. On a machine with an Intel NPU, Robust Video Matting gives a better mask; `tools/prepare-rvm.py` prepares it.
 - Rust 1.85 or newer to build from source.
 - For the GUI: GTK 4.18+ and libadwaita 1.8+.
 
@@ -88,4 +88,4 @@ pre-commit install
 
 ## License
 
-Dual-licensed under MIT or Apache-2.0, at your option. The MediaPipe Selfie Segmentation model is distributed separately under Apache-2.0.
+Dual-licensed under MIT or Apache-2.0, at your option. The MediaPipe Selfie Segmentation model is distributed separately under Apache-2.0. The Robust Video Matting weights are GPL-3.0 and are not distributed with FluxFrame; `tools/prepare-rvm.py` downloads them from their original release.

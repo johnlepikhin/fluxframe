@@ -9,12 +9,13 @@ and it can be switched while the daemon runs.
 A preset has up to four sections: `mask`, `background`, `foreground` and `post`.
 When the `mask` section is present, every frame goes through these steps:
 
- 1. The segmentation model produces a mask at the model's resolution (256x256
-    for the Selfie Segmentation model). Each mask value is the confidence that
-    the pixel belongs to a person.
+ 1. The segmentation model produces a mask at the model's resolution: 256x256
+    for the Selfie Segmentation model, the full frame size for Robust Video
+    Matting. Each mask value is the confidence that the pixel belongs to a
+    person.
  2. The mask chain refines the mask at model resolution: thresholding, removing
     stray regions, smoothing over time, softening the edge.
- 3. The mask is scaled up to the frame size.
+ 3. The mask is scaled up to the frame size, unless it already has that size.
  4. The background chain runs on a copy of the frame.
  5. The foreground chain runs on the original frame.
  6. The two planes are blended using the mask: foreground where the mask is 1,
@@ -90,10 +91,37 @@ Effects that keep state between frames (`smooth_temporal`, `auto_frame`) start
 from a clean state when they are enabled again. If the same effect appears twice
 in a chain, `enabled` applies to both.
 
+### Fallback preset
+
+A preset can name another preset to run when it cannot run on this machine:
+
+```toml
+[presets.default]
+fallback_preset = "mediapipe"
+```
+
+The daemon switches to the fallback preset, with that preset's own chains, in
+two cases:
+
+ - The preset's model is restricted to accelerators the machine does not have
+   (the sidecar key `devices`, see [Model sidecar files](#model-sidecar-files)).
+   The switch happens when the preset is loaded.
+ - Inference keeps failing while the preset runs, so the mask section's
+   `fallback_threshold` is exceeded. Without `fallback_preset` the daemon stops
+   in this case.
+
+The daemon logs a warning with the reason, and `daemon_info` on the [control
+socket](control-socket.md) reports both the selected and the running preset.
+The fallback stays active until the next `set_preset`, `reload` or restart, each
+of which tries the selected preset again. A fallback preset can have its own
+fallback. The target must exist, and a chain of fallbacks must not lead back to
+a preset already in it; `fluxframe check` reports both errors.
+
 ## Mask effects
 
 Mask effects operate on the mask at model resolution. They are cheap: a full
-mask chain costs well under a millisecond per frame.
+mask chain costs well under a millisecond per frame on a 256x256 mask and about
+1 ms on a frame-sized 800x448 mask.
 
 ### `threshold`
 
@@ -138,7 +166,9 @@ gradual.
 
 The radius is measured at model resolution. For a 256x256 mask and a 1280x720
 frame, one mask pixel is about five frame pixels wide, so small values (2 to 4)
-are usually enough.
+are usually enough. With a frame-sized model such as Robust Video Matting the
+radius is in frame pixels, so the same value gives a much narrower transition;
+2 suits its already soft edge.
 
 ### `dilate`
 
@@ -372,6 +402,43 @@ smoothing = 0.95
 zoom_max = 1.3
 ```
 
+Robust Video Matting on the NPU over a blurred background, with MediaPipe as
+the fallback on machines without an NPU (see
+[Installation](installation.md#robust-video-matting) for the model):
+
+```toml
+[presets.default]
+fallback_preset = "mediapipe"
+[presets.default.mask]
+model = "./models/rvm_mobilenetv3_d0.4.onnx"
+chain = ["largest_blob", "feather"]
+[presets.default.mask.feather]
+radius = 2
+[presets.default.background]
+chain = ["blur"]
+
+[presets.mediapipe.mask]
+model = "./models/selfie_segmentation.onnx"
+chain = ["smooth_temporal", "threshold", "largest_blob", "feather"]
+[presets.mediapipe.mask.threshold]
+level = 0.8
+[presets.mediapipe.mask.feather]
+radius = 3
+[presets.mediapipe.background]
+chain = ["blur"]
+```
+
+Robust Video Matting returns a soft alpha matte that is already stable over
+time, so its mask chain differs from the MediaPipe one:
+
+ - No `threshold`: it would turn the soft edge, including hair, into a hard
+   one.
+ - No `smooth_temporal`: the model carries state between frames and does not
+   flicker; extra smoothing only adds lag.
+ - `largest_blob` stays: in recorded test clips it removed detached fragments,
+   such as parts of a chair, in 6-8% of frames. It also clears faint
+   translucent areas away from the person.
+
 Camera image without processing:
 
 ```toml
@@ -385,20 +452,41 @@ Every model is described by a sidecar file next to it: `model.onnx` needs
 how to interpret the output, which makes it possible to use other single-person
 segmentation models with a compatible structure.
 
-| Key                           | Default  | Description                                           |
-| ----------------------------- | -------- | ----------------------------------------------------- |
-| `name`                        | required | Model name shown in logs.                             |
-| `input_width`, `input_height` | required | Input tensor size in pixels.                          |
-| `input_layout`                | `"NHWC"` | `NHWC` or `NCHW`.                                     |
-| `input_dtype`                 | `"f32"`  | `f32`, `u8` or `i8`.                                  |
-| `input_color`                 | `"RGB"`  | Channel order of the input.                           |
-| `input_scale`                 | 1/255    | Each pixel value is multiplied by this factor.        |
-| `input_zero_point`            | 0.0      | Subtracted from each pixel value before scaling.      |
-| `output_index`                | 0        | Which model output holds the mask.                    |
-| `output_layout`               | `"HW"`   | `HW`, `NHWC` or `NCHW`.                               |
-| `output_type`                 | `"mask"` | `mask`, `probabilities`, `logits` or `category_mask`. |
-| `person_class_index`          | none     | Class id of a person; required for `category_mask`.   |
-| `threshold`                   | none     | Mask threshold, 0 to 1.                               |
+| Key                           | Default   | Description                                                                                                                             |
+| ----------------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                        | required  | Model name shown in logs.                                                                                                               |
+| `input_size`                  | `"fixed"` | `fixed`: the model takes `input_width` x `input_height`. `frame`: the model takes the processed frame at its own size, without scaling. |
+| `input_width`, `input_height` | required  | Input tensor size in pixels. Required with `input_size = "fixed"`, not allowed with `"frame"`.                                          |
+| `input_layout`                | `"NHWC"`  | `NHWC` or `NCHW`.                                                                                                                       |
+| `input_dtype`                 | `"f32"`   | Only `f32` is supported.                                                                                                                |
+| `input_color`                 | `"RGB"`   | Channel order of the input.                                                                                                             |
+| `input_scale`                 | 1/255     | Each pixel value is multiplied by this factor.                                                                                          |
+| `input_zero_point`            | 0.0       | Subtracted from each pixel value before scaling.                                                                                        |
+| `output_index`                | 0         | Which model output holds the mask.                                                                                                      |
+| `output_layout`               | `"HW"`    | `HW`, `NHWC` or `NCHW`.                                                                                                                 |
+| `output_type`                 | `"mask"`  | `mask`, `probabilities`, `logits` or `category_mask`.                                                                                   |
+| `person_class_index`          | none      | Class id of a person; required for `category_mask`.                                                                                     |
+| `threshold`                   | none      | Mask threshold, 0 to 1.                                                                                                                 |
+| `state`                       | none      | Recurrent state: a list of `{ output = "...", input = "..." }` pairs. Each output is fed back into the paired input on the next frame.  |
+| `pipeline`                    | `false`   | Run inference one frame ahead of the rest of the processing.                                                                            |
+| `devices`                     | none      | OpenVINO devices the model may run on, in order of preference.                                                                          |
 
-Unknown keys are rejected. The sidecar for MediaPipe Selfie Segmentation is
+Unknown keys are rejected.
+
+`state`, `pipeline` and `devices` exist for models such as Robust Video Matting
+that are too slow to run within the frame time and must run on an accelerator:
+
+ - **`state`.** The model's state starts at zero and is reset whenever the
+   sequence of frames breaks: on a preset switch, on entering idle mode, after
+   an inference failure, and when `auto_frame` jumps to a distant area of the
+   capture. Models with state require OpenVINO; ONNX Runtime rejects them.
+ - **`pipeline`.** While the model processes frame N, the rest of the chain
+   processes frame N-1 with its own mask, so the mask always matches its frame.
+   The video is delayed by one frame (33 ms at 30 fps). The first frame after
+   the start or a reset is not published.
+ - **`devices`.** When set, the model runs only on the listed devices, tried in
+   order. It overrides the global device choice and
+   `FLUXFRAME_OPENVINO_DEVICE`. If none of them is available, or OpenVINO
+   cannot be used at all, the preset cannot run and its `fallback_preset`
+   takes over. The sidecar for MediaPipe Selfie Segmentation is
 shown in [Installation](installation.md#segmentation-model).

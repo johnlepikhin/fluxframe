@@ -14,7 +14,7 @@ device = "auto"
 # The daemon picks the camera mode that serves this size and rate best
 # (see `v4l2-ctl --list-formats-ext`), using MJPEG when the camera
 # reaches the size at full rate only that way. Processing cost grows
-# with the frame area; the segmentation model always runs at 256x256.
+# with the frame area; the MediaPipe model always runs at 256x256.
 width = 800
 height = 448
 fps = 30
@@ -177,6 +177,29 @@ zoom_max = 1.3
 deadband = 0.12
 hold_secs = 1.0
 glide_secs = 0.8
+
+# Robust Video Matting on an Intel NPU: soft hair edges and a steadier
+# mask, with the video delayed by one frame. Prepare the model first with
+# `tools/prepare-rvm.py --output-dir models` (see doc/user/installation.md),
+# then uncomment. Without an NPU the "blur" preset runs instead.
+#
+# [presets.rvm]
+# fallback_preset = "blur"
+#
+# [presets.rvm.mask]
+# model = "./models/rvm_mobilenetv3_d0.4.onnx"
+# # No threshold or smooth_temporal: the alpha is soft and already stable.
+# chain = ["largest_blob", "feather"]
+#
+# [presets.rvm.mask.feather]
+# # In frame pixels: the RVM mask has the frame size.
+# radius = 2
+#
+# [presets.rvm.background]
+# chain = ["blur"]
+#
+# [presets.rvm.background.blur]
+# radius = 20
 
 # Camera image without processing.
 [presets.raw]

@@ -214,6 +214,46 @@ To confirm that the model loads and to see the inference speed on your CPU:
 fluxframe benchmark --model ~/.config/fluxframe/models/selfie_segmentation.onnx --duration 5
 ```
 
+### Robust Video Matting
+
+On a machine with an Intel NPU, [Robust Video
+Matting](https://github.com/PeterL1n/RobustVideoMatting) (RVM, MobileNetV3
+variant) gives a noticeably better mask than MediaPipe: soft hair edges, no
+furniture in the mask, a face that stays opaque when leaning towards the camera,
+and about half the edge flicker. It works on the full processed frame and
+carries state from frame to frame. It needs about 22 ms of NPU time per frame at
+800x448, so the video is delayed by one frame (see
+[Performance](performance.md#robust-video-matting)). On the CPU it is too slow
+for 30 fps, so FluxFrame runs it only on the NPU.
+
+The RVM weights are licensed under GPL-3.0 and are not distributed with
+FluxFrame. `tools/prepare-rvm.py` in the repository downloads the original
+release file, checks its SHA-256 and converts it for the NPU: it fixes the
+model's internal scale (`--ratio`, default 0.4, suited to 800x448) and removes
+an output FluxFrame does not use. The script needs Python 3.9 or newer and the
+`onnx` package; FluxFrame itself does not need Python.
+
+```bash
+pip install --user onnx
+tools/prepare-rvm.py --output-dir ~/.config/fluxframe/models
+```
+
+The script writes `rvm_mobilenetv3_d0.4.onnx` and its sidecar
+`rvm_mobilenetv3_d0.4.toml`. Without network access, download
+`rvm_mobilenetv3_fp32.onnx` from the project's v1.0.0 release yourself and pass
+it with `--source`. For a processing size much larger than 800x448, choose a
+smaller `--ratio`, so that the frame's long side multiplied by the ratio stays
+between 256 and 512 pixels.
+
+The sidecar restricts the model to the NPU. Give the RVM preset a
+`fallback_preset` with a MediaPipe mask, so the same configuration also works
+on machines without an NPU; see [Presets and
+effects](presets-and-effects.md#fallback-preset) for an example.
+
+The first start compiles the model for the NPU, which takes a few seconds. The
+compiled model is cached in `~/.cache/fluxframe/openvino`, so later starts and
+exits from idle mode are faster.
+
 ## Verifying the installation
 
 ```bash

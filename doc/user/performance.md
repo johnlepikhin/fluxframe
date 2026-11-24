@@ -97,6 +97,29 @@ Same synthetic setup, two processing threads:
 Besides being cheaper, RGB output avoids faint vertical colour bands that the
 RGB to YUY2 conversion introduces.
 
+### Robust Video Matting
+
+Synthetic source at 800x448 with the output discarded, interleaved runs. Both
+presets pixelate and vignette the background and run `auto_frame` and `mirror`;
+the mask chains are those recommended for each model (see [Presets and
+effects](presets-and-effects.md#example-presets)).
+
+| Model                        | Process CPU | Processing time per frame (median / p95) |
+| ---------------------------- | ----------- | ---------------------------------------- |
+| MediaPipe 256x256, NPU       | 21.3%       | 7.7 / 9.1 ms                             |
+| RVM MobileNetV3 800x448, NPU | 24.6%       | 5.0 / 6.2 ms                             |
+
+Both held 30 fps without dropped frames. RVM needs about 22 ms of NPU time per
+frame, more than a 30 fps frame can wait for, so FluxFrame runs it one frame
+ahead: while the NPU works on frame N, the CPU finishes frame N-1 with the mask
+computed for it. The processing time above therefore does not include the
+inference, and the video is delayed by one frame (33 ms at 30 fps) on top of
+it. The extra CPU time is spent preparing the full-size input (about 0.6 ms)
+and running the mask chain on a frame-sized mask (about 1 ms).
+
+On the CPU, RVM takes several times longer than a frame and is not supported;
+the sidecar restricts it to the NPU.
+
 ### Idle
 
 With idle mode enabled and no application reading the virtual camera, the daemon
@@ -171,6 +194,15 @@ stages="seg/preprocess=488/610 mask/feather=128/170 background/blur=903/1200 com
 Keys have the form `section/effect`. `seg/*` keys are segmentation steps and
 `composite/*` keys are mask scaling and blending. Disabled effects are not
 listed.
+
+For a model that runs one frame ahead (`pipeline = true` in its sidecar, such as
+Robust Video Matting), the segmentation is split into three keys:
+
+| Key             | Meaning                                                                                                                                    |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `seg/submit`    | Preparing the input and handing it to the accelerator.                                                                                     |
+| `seg/wait`      | Waiting for the previous frame's result. Values near zero mean the accelerator keeps up; values of several ms mean it does not.            |
+| `seg/in_flight` | Time from submitting a frame to collecting its result. Normally about one frame period, because the result is collected on the next frame. |
 
 The `cpu shares` line reports CPU usage by thread role since the previous line,
 as a percentage of one core:
