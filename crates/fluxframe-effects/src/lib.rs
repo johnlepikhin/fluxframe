@@ -36,6 +36,8 @@ pub mod processing;
 // the public API self-documenting (a `MaskEffectRegistry` is a more
 // obvious type signature than `Registry<dyn MaskEffect>`).
 pub(crate) mod registry_common;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use chain::EffectChain;
 #[cfg(feature = "ml")]

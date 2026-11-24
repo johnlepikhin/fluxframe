@@ -12,6 +12,11 @@
 //! 3. **Foreground pipeline**: another [`PlaneEffect`] chain produces
 //!    the "foreground" plane (default = identity over the original).
 //!
+//! Plane effects in both pipelines also receive the frame-resolution
+//! mask read-only, so they can treat the person and the room
+//! differently (exclude the person from a colour average, cast a
+//! shadow of the silhouette, …).
+//!
 //! Mask and plane effects intentionally use different traits because
 //! their value types differ (`f32` confidence vs `u8` RGB), and a
 //! shared generic trait would push every implementation through
@@ -263,6 +268,13 @@ pub trait MaskEffect: Send {
 /// …) and operate on the plane in place — either truly in place
 /// (colour fill) or through scratch + ping-pong (blur).
 ///
+/// Every call also gets a read-only view of the frame-resolution mask
+/// for the same frame (`1.0` = person, `0.0` = background). Values are
+/// not clamped, so an effect reading them clamps to `[0, 1]` itself.
+/// The effect does not know whether it runs in the background or the
+/// foreground chain; one whose behaviour depends on that exposes it as
+/// a parameter.
+///
 /// Lifecycle and threading mirror [`MaskEffect`].
 pub trait PlaneEffect: Send {
     /// Stable identifier used by the registry and config (`snake_case`).
@@ -297,7 +309,8 @@ pub trait PlaneEffect: Send {
     /// failure.
     fn prepare(&mut self, context: &ProcessingContext) -> Result<(), EffectError>;
 
-    /// Transform `plane` in place. Must not block on I/O.
+    /// Transform `plane` in place, using `mask` (same size as `plane`)
+    /// as read-only context. Must not block on I/O.
     ///
     /// # Errors
     ///
@@ -306,6 +319,7 @@ pub trait PlaneEffect: Send {
     fn process(
         &mut self,
         plane: &mut FramePlane<'_>,
+        mask: &MaskPlane<'_>,
         context: &mut FrameContext,
     ) -> Result<(), EffectError>;
 

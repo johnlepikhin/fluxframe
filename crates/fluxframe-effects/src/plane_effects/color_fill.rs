@@ -7,7 +7,7 @@
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
 use fluxframe_core::metadata::{CommitStrategy, EffectMetadata, ParamDescriptor, ParamKind};
-use fluxframe_core::plane::{FramePlane, PlaneEffect};
+use fluxframe_core::plane::{FramePlane, MaskPlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
@@ -86,6 +86,7 @@ impl PlaneEffect for ColorFillEffect {
     fn process(
         &mut self,
         plane: &mut FramePlane<'_>,
+        _mask: &MaskPlane<'_>,
         _ctx: &mut FrameContext,
     ) -> Result<(), EffectError> {
         for chunk in plane.data.chunks_exact_mut(3) {
@@ -100,6 +101,7 @@ impl PlaneEffect for ColorFillEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::process_plane;
 
     #[test]
     fn configure_sets_rgb() {
@@ -116,7 +118,7 @@ mod tests {
         let mut data = vec![0u8; 12];
         let mut plane = FramePlane::new(&mut data, 2, 2);
         let mut ctx = FrameContext::default();
-        effect.process(&mut plane, &mut ctx).expect("ok");
+        process_plane(&mut effect, &mut plane, &mut ctx).expect("ok");
         for chunk in data.chunks_exact(3) {
             assert_eq!(chunk, [255, 0, 0]);
         }

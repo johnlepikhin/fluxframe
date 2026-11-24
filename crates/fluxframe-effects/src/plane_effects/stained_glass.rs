@@ -18,7 +18,7 @@ use fluxframe_core::metadata::{
     CommitStrategy, DEBOUNCE_HEAVY_MS, DEBOUNCE_STANDARD_MS, EffectMetadata, ParamDescriptor,
     ParamKind, Scale,
 };
-use fluxframe_core::plane::{FramePlane, PlaneEffect};
+use fluxframe_core::plane::{FramePlane, MaskPlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
@@ -462,6 +462,7 @@ impl PlaneEffect for StainedGlassEffect {
     fn process(
         &mut self,
         plane: &mut FramePlane<'_>,
+        _mask: &MaskPlane<'_>,
         _ctx: &mut FrameContext,
     ) -> Result<(), EffectError> {
         let width = plane.width as usize;
@@ -562,6 +563,7 @@ impl PlaneEffect for StainedGlassEffect {
 mod tests {
     use super::*;
     use crate::processing::parallel::MIN_PARALLEL_ELEMS;
+    use crate::test_support::process_plane;
 
     fn ctx(w: u32, h: u32) -> ProcessingContext {
         ProcessingContext {
@@ -586,8 +588,7 @@ mod tests {
 
     fn run(e: &mut StainedGlassEffect, data: &mut [u8], w: u32, h: u32) {
         let mut plane = FramePlane::new(data, w, h);
-        e.process(&mut plane, &mut FrameContext::default())
-            .expect("process");
+        process_plane(e, &mut plane, &mut FrameContext::default()).expect("process");
     }
 
     /// Per-pixel packed entries, expanded back from the runs.

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
 use fluxframe_core::metadata::{CommitStrategy, EffectMetadata, ParamDescriptor, ParamKind};
-use fluxframe_core::plane::{FramePlane, PlaneEffect};
+use fluxframe_core::plane::{FramePlane, MaskPlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use image::imageops::FilterType;
 use serde::Deserialize;
@@ -283,6 +283,7 @@ impl PlaneEffect for ImageFillEffect {
     fn process(
         &mut self,
         plane: &mut FramePlane<'_>,
+        _mask: &MaskPlane<'_>,
         _ctx: &mut FrameContext,
     ) -> Result<(), EffectError> {
         if !self.prepared {
@@ -343,6 +344,7 @@ impl PlaneEffect for ImageFillEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::process_plane;
     use tempfile::NamedTempFile;
 
     fn make_png(width: u32, height: u32, rgb: [u8; 3]) -> NamedTempFile {
@@ -476,7 +478,7 @@ fit = "stretch"
         let mut data = vec![0u8; 4 * 4 * 3];
         let mut plane = FramePlane::new(&mut data, 4, 4);
         let mut fctx = FrameContext::default();
-        effect.process(&mut plane, &mut fctx).expect("process");
+        process_plane(&mut effect, &mut plane, &mut fctx).expect("process");
         // Stretching a single-colour image: every pixel must match the
         // source colour exactly (no border, no resampling artefact).
         for chunk in data.chunks_exact(3) {
@@ -504,7 +506,7 @@ letterbox_rgb = [10, 20, 30]
         let mut data = vec![0u8; 4 * 4 * 3];
         let mut plane = FramePlane::new(&mut data, 4, 4);
         let mut fctx = FrameContext::default();
-        effect.process(&mut plane, &mut fctx).expect("process");
+        process_plane(&mut effect, &mut plane, &mut fctx).expect("process");
         // First and last rows should be letterbox.
         let row0 = &data[0..12];
         let row3 = &data[36..48];
@@ -544,7 +546,7 @@ fit = "cover"
         let mut data = vec![0u8; 4 * 4 * 3];
         let mut plane = FramePlane::new(&mut data, 4, 4);
         let mut fctx = FrameContext::default();
-        effect.process(&mut plane, &mut fctx).expect("process");
+        process_plane(&mut effect, &mut plane, &mut fctx).expect("process");
         // Monochrome source → every pixel still that colour after the
         // cover-scale + crop.
         for chunk in data.chunks_exact(3) {
@@ -563,7 +565,7 @@ fit = "cover"
         let mut data = vec![0u8; 4 * 4 * 3];
         let mut plane = FramePlane::new(&mut data, 4, 4);
         let mut fctx = FrameContext::default();
-        let err = effect.process(&mut plane, &mut fctx).unwrap_err();
+        let err = process_plane(&mut effect, &mut plane, &mut fctx).unwrap_err();
         match err {
             EffectError::ProcessFailed { reason, .. } => {
                 assert!(
@@ -596,7 +598,7 @@ fit = "cover"
         let mut data = vec![0u8; 4 * 4 * 3];
         let mut plane = FramePlane::new(&mut data, 4, 4);
         let mut fctx = FrameContext::default();
-        let err = effect.process(&mut plane, &mut fctx).unwrap_err();
+        let err = process_plane(&mut effect, &mut plane, &mut fctx).unwrap_err();
         match err {
             EffectError::ProcessFailed { reason, .. } => {
                 assert!(
@@ -630,7 +632,7 @@ fit = "stretch"
         let mut data = vec![0u8; 4 * 4 * 3];
         let mut plane = FramePlane::new(&mut data, 4, 4);
         let mut fctx = FrameContext::default();
-        effect.process(&mut plane, &mut fctx).expect("process A");
+        process_plane(&mut effect, &mut plane, &mut fctx).expect("process A");
         assert_eq!(&data[0..3], &[200, 0, 0]);
 
         // Live re-configure to point at the green image.
@@ -648,7 +650,7 @@ fit = "stretch"
         // detection.
         let mut data2 = vec![0u8; 4 * 4 * 3];
         let mut plane2 = FramePlane::new(&mut data2, 4, 4);
-        effect.process(&mut plane2, &mut fctx).expect("process B");
+        process_plane(&mut effect, &mut plane2, &mut fctx).expect("process B");
         assert_eq!(&data2[0..3], &[0, 200, 0]);
     }
 }

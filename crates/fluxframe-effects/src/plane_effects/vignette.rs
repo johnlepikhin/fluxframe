@@ -17,7 +17,7 @@ use fluxframe_core::error::EffectError;
 use fluxframe_core::metadata::{
     CommitStrategy, DEBOUNCE_FAST_MS, EffectMetadata, ParamDescriptor, ParamKind, Scale,
 };
-use fluxframe_core::plane::{FramePlane, PlaneEffect};
+use fluxframe_core::plane::{FramePlane, MaskPlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
@@ -229,6 +229,7 @@ impl PlaneEffect for VignetteEffect {
     fn process(
         &mut self,
         plane: &mut FramePlane<'_>,
+        _mask: &MaskPlane<'_>,
         _ctx: &mut FrameContext,
     ) -> Result<(), EffectError> {
         if plane.width != self.frame_w || plane.height != self.frame_h {
@@ -282,6 +283,7 @@ impl PlaneEffect for VignetteEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::process_plane;
 
     fn run(effect: &mut VignetteEffect, data: &mut [u8], w: u32, h: u32) {
         let context = ProcessingContext {
@@ -294,7 +296,7 @@ mod tests {
         effect.prepare(&context).expect("prepare");
         let mut plane = FramePlane::new(data, w, h);
         let mut ctx = FrameContext::default();
-        effect.process(&mut plane, &mut ctx).expect("process");
+        process_plane(effect, &mut plane, &mut ctx).expect("process");
     }
 
     #[test]
@@ -445,7 +447,7 @@ mod tests {
         let mut data = vec![128u8; 4 * 4 * 3];
         let mut plane = FramePlane::new(&mut data, 4, 4);
         let mut ctx = FrameContext::default();
-        let err = effect.process(&mut plane, &mut ctx).expect_err("must fail");
+        let err = process_plane(&mut effect, &mut plane, &mut ctx).expect_err("must fail");
         match err {
             EffectError::ProcessFailed { reason, .. } => {
                 assert!(

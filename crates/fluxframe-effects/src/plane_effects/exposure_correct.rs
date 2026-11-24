@@ -21,7 +21,7 @@ use fluxframe_core::error::EffectError;
 use fluxframe_core::metadata::{
     CommitStrategy, DEBOUNCE_STANDARD_MS, EffectMetadata, ParamDescriptor, ParamKind, Scale,
 };
-use fluxframe_core::plane::{FramePlane, PlaneEffect};
+use fluxframe_core::plane::{FramePlane, MaskPlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
@@ -369,6 +369,7 @@ impl PlaneEffect for ExposureCorrectEffect {
     fn process(
         &mut self,
         plane: &mut FramePlane<'_>,
+        _mask: &MaskPlane<'_>,
         _ctx: &mut FrameContext,
     ) -> Result<(), EffectError> {
         let width = plane.width as usize;
@@ -400,6 +401,7 @@ impl PlaneEffect for ExposureCorrectEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::process_plane;
 
     fn run(effect: &mut ExposureCorrectEffect, data: &mut [u8], w: u32, h: u32) {
         let context = ProcessingContext {
@@ -412,7 +414,7 @@ mod tests {
         effect.prepare(&context).expect("prepare");
         let mut plane = FramePlane::new(data, w, h);
         let mut ctx = FrameContext::default();
-        effect.process(&mut plane, &mut ctx).expect("process");
+        process_plane(effect, &mut plane, &mut ctx).expect("process");
     }
 
     fn mean_luma(data: &[u8]) -> f32 {

@@ -7,7 +7,7 @@
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
 use fluxframe_core::metadata::EffectMetadata;
-use fluxframe_core::plane::{FramePlane, PlaneEffect};
+use fluxframe_core::plane::{FramePlane, MaskPlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 
 /// Identity plane effect: `process` returns immediately without
@@ -49,6 +49,7 @@ impl PlaneEffect for PassthroughPlaneEffect {
     fn process(
         &mut self,
         _plane: &mut FramePlane<'_>,
+        _mask: &MaskPlane<'_>,
         _ctx: &mut FrameContext,
     ) -> Result<(), EffectError> {
         Ok(())
@@ -58,6 +59,7 @@ impl PlaneEffect for PassthroughPlaneEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::process_plane;
 
     #[test]
     fn leaves_plane_untouched() {
@@ -66,7 +68,7 @@ mod tests {
         let snapshot = data.clone();
         let mut plane = FramePlane::new(&mut data, 2, 2);
         let mut ctx = FrameContext::default();
-        effect.process(&mut plane, &mut ctx).expect("ok");
+        process_plane(&mut effect, &mut plane, &mut ctx).expect("ok");
         assert_eq!(data, snapshot);
     }
 }

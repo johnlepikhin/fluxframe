@@ -16,7 +16,9 @@ When the `mask` section is present, every frame goes through these steps:
  2. The mask chain refines the mask at model resolution: thresholding, removing
     stray regions, smoothing over time, softening the edge.
  3. The mask is scaled up to the frame size, unless it already has that size.
- 4. The background chain runs on a copy of the frame.
+ 4. The background chain runs on a copy of the frame. The copy still contains
+    the person; effects that need to tell the person from the room read the
+    mask.
  5. The foreground chain runs on the original frame.
  6. The two planes are blended using the mask: foreground where the mask is 1,
     background where it is 0, a mix in between.
@@ -190,7 +192,8 @@ Leaves the mask unchanged. No parameters.
 ## Background and foreground effects
 
 These effects operate on full-resolution frames, so their cost grows with the
-frame size.
+frame size. Every effect can read the mask, but most ignore it. Effects that
+use it say so in their description.
 
 ### `blur`
 

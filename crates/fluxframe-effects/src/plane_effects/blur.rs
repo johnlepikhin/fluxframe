@@ -11,7 +11,7 @@ use fluxframe_core::metadata::{
     CommitStrategy, DEBOUNCE_FAST_MS, DEBOUNCE_HEAVY_MS, DEBOUNCE_STANDARD_MS, EffectMetadata,
     ParamDescriptor, ParamKind, Scale,
 };
-use fluxframe_core::plane::{FramePlane, PlaneEffect};
+use fluxframe_core::plane::{FramePlane, MaskPlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
@@ -275,6 +275,7 @@ impl PlaneEffect for BlurPlaneEffect {
     fn process(
         &mut self,
         plane: &mut FramePlane<'_>,
+        _mask: &MaskPlane<'_>,
         _ctx: &mut FrameContext,
     ) -> Result<(), EffectError> {
         if plane.width != self.frame_w || plane.height != self.frame_h {
@@ -345,6 +346,7 @@ impl PlaneEffect for BlurPlaneEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::process_plane;
 
     #[test]
     fn configure_applies_defaults() {
@@ -399,7 +401,7 @@ mod tests {
         let original = data.clone();
         let mut plane = FramePlane::new(&mut data, 4, 4);
         let mut ctx = FrameContext::default();
-        effect.process(&mut plane, &mut ctx).expect("process");
+        process_plane(&mut effect, &mut plane, &mut ctx).expect("process");
         assert_ne!(data, original, "blur must change the plane");
     }
 
@@ -431,7 +433,7 @@ mod tests {
         let mut data = vec![128u8; 16 * 16 * 3];
         let mut plane = FramePlane::new(&mut data, 16, 16);
         let mut fctx = FrameContext::default();
-        effect.process(&mut plane, &mut fctx).expect("process");
+        process_plane(&mut effect, &mut plane, &mut fctx).expect("process");
         assert_eq!(effect.downscale_effective, 2);
         assert_eq!(
             effect.frame_down.len(),

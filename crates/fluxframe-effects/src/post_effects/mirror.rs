@@ -115,9 +115,7 @@ mod tests {
     /// Build an all-1.0 mask plane matching the given dimensions.
     /// Mirror ignores the mask, but the trait still needs one.
     fn full_mask(buf: &mut Vec<f32>, width: u32, height: u32) -> MaskPlane<'_> {
-        buf.clear();
-        buf.resize((width as usize) * (height as usize), 1.0);
-        MaskPlane::new(buf, width, height)
+        crate::test_support::filled_mask(buf, width, height, 1.0)
     }
 
     /// Even-width row: every pixel has a partner; whole row reverses.

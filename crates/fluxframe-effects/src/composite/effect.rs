@@ -445,12 +445,13 @@ impl CompositeEffect {
         // 6. Background chain runs on the snapshot.
         timed(ctx, StageKey::new(SCOPE, "bg_chain"), |ctx| {
             let mut background = FramePlane::new(&mut self.bg_plane, self.frame_w, self.frame_h);
+            let mask_plane = MaskPlane::new(&mut self.mask_full, self.frame_w, self.frame_h);
             for slot in self.bg_chain.iter_mut().filter(|slot| slot.enabled) {
                 let effect = &mut slot.effect;
                 timed(
                     ctx,
                     StageKey::new(SubchainKind::Background.as_str(), effect.name()),
-                    |ctx| effect.process(&mut background, ctx),
+                    |ctx| effect.process(&mut background, &mask_plane, ctx),
                 )?;
             }
             Ok::<(), EffectError>(())
@@ -459,12 +460,13 @@ impl CompositeEffect {
         // 7. Foreground chain runs in place on `frame.data`.
         timed(ctx, StageKey::new(SCOPE, "fg_chain"), |ctx| {
             let mut foreground = FramePlane::new(frame_bytes, self.frame_w, self.frame_h);
+            let mask_plane = MaskPlane::new(&mut self.mask_full, self.frame_w, self.frame_h);
             for slot in self.fg_chain.iter_mut().filter(|slot| slot.enabled) {
                 let effect = &mut slot.effect;
                 timed(
                     ctx,
                     StageKey::new(SubchainKind::Foreground.as_str(), effect.name()),
-                    |ctx| effect.process(&mut foreground, ctx),
+                    |ctx| effect.process(&mut foreground, &mask_plane, ctx),
                 )?;
             }
             Ok::<(), EffectError>(())
