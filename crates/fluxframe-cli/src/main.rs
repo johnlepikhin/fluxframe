@@ -23,6 +23,8 @@ mod preset;
 mod runtime;
 mod runtime_metrics;
 mod session;
+#[cfg(all(test, feature = "ml"))]
+mod test_support;
 mod thread_cpu;
 
 fn main() -> ExitCode {

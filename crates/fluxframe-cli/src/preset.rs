@@ -288,6 +288,8 @@ fn build_composite_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "ml")]
+    use crate::test_support::UnrunnableModel;
     use fluxframe_core::PipelineSection;
 
     fn cfg_with_preset(name: &str, body: &str) -> FluxConfig {
@@ -430,41 +432,6 @@ mod tests {
 
     /// A model restricted to a device no machine has: preparing it is
     /// always `AcceleratorUnavailable`, whatever the build and host.
-    struct UnrunnableModel {
-        dir: std::path::PathBuf,
-    }
-
-    impl UnrunnableModel {
-        fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("fluxframe-fallback-{tag}-{}", std::process::id()));
-            std::fs::create_dir_all(&dir).expect("temp dir");
-            std::fs::write(dir.join("m.onnx"), b"").expect("model");
-            std::fs::write(
-                dir.join("m.toml"),
-                "name = \"m\"\ninput_width = 4\ninput_height = 4\ndevices = [\"NO_SUCH_DEVICE\"]\n",
-            )
-            .expect("sidecar");
-            Self { dir }
-        }
-
-        fn config(&self, fallback: Option<&str>) -> FluxConfig {
-            let fallback =
-                fallback.map_or(String::new(), |f| format!("fallback_preset = \"{f}\"\n"));
-            FluxConfig::from_toml_str(&format!(
-                "[presets.accel]\n{fallback}[presets.accel.mask]\nmodel = \"{}\"\n[presets.plain]\n",
-                self.dir.join("m.onnx").display()
-            ))
-            .expect("config parses")
-        }
-    }
-
-    impl Drop for UnrunnableModel {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
     fn rgb_ctx() -> ProcessingContext {
         ProcessingContext {
             width: 8,

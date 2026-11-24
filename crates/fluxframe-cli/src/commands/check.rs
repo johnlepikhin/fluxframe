@@ -4,8 +4,12 @@
 
 use std::path::Path;
 
+#[cfg(feature = "ml")]
+use fluxframe_core::error::InferenceError;
 use fluxframe_core::paths::ConfigBase;
 use fluxframe_core::{FluxConfig, FluxError, InputDevice, PipelineSection, Preset};
+#[cfg(feature = "ml")]
+use fluxframe_effects::backend::{BackendOverrides, build_inference_engine};
 #[cfg(feature = "ml")]
 use fluxframe_effects::ml::OnnxEngine;
 #[cfg(feature = "ml")]
@@ -307,7 +311,9 @@ fn exclusive_caps_for_device(
 ///      feature-gated and bg-without-mask errors that `run` would
 ///      raise, so `check` and `run` cannot disagree.
 ///   5. (`ml` feature only) The model path referenced by the mask
-///      section exists on disk and loads as an ONNX model.
+///      section exists on disk and loads. A model that may run only on
+///      an accelerator, and this machine cannot run it, sends the check
+///      on to the preset's `fallback_preset`, as `run` would.
 ///
 /// [`EffectChain`]: fluxframe_effects::EffectChain
 fn check_preset(
@@ -333,9 +339,26 @@ fn check_preset(
     let _ = preset::build_chain(name, preset, config_base)?;
 
     #[cfg(feature = "ml")]
-    if let Some(mask) = preset.mask.as_ref() {
-        if let Some(model) = mask.model.as_deref() {
-            check_model_file(&config_base.resolve(model))?;
+    if let Some(model) = preset.mask.as_ref().and_then(|m| m.model.as_deref()) {
+        match check_model_file(
+            &config_base.resolve(model),
+            (cfg.input.width, cfg.input.height),
+        ) {
+            Err(FluxError::Inference(InferenceError::AcceleratorUnavailable { reason })) => {
+                let Some(fallback) = preset.fallback_preset.as_deref() else {
+                    return Err(InferenceError::AcceleratorUnavailable { reason }.into());
+                };
+                // Config validation rules out fallback cycles, so the
+                // recursion ends.
+                warn!(
+                    preset = %name,
+                    fallback = %fallback,
+                    reason = %reason,
+                    "preset cannot run on this machine; `run` would use its fallback preset",
+                );
+                return check_preset(cfg, Some(fallback), config_base);
+            }
+            other => other?,
         }
     }
 
@@ -450,7 +473,9 @@ fn check_post_chain(
 }
 
 #[cfg(feature = "ml")]
-fn check_model_file(path: &Path) -> Result<(), FluxError> {
+/// `processing_size` is the frame size the model sees at run time; a
+/// frame-sized model is loaded at that size.
+fn check_model_file(path: &Path, processing_size: (u32, u32)) -> Result<(), FluxError> {
     if !path.exists() {
         return Err(FluxError::Config {
             reason: format!("model file not found: {}", path.display()),
@@ -461,7 +486,14 @@ fn check_model_file(path: &Path) -> Result<(), FluxError> {
             ),
         });
     }
-    let config = fluxframe_effects::ml::load_sidecar_or_placeholder(path)?;
+    let mut config = fluxframe_effects::ml::load_sidecar_or_placeholder(path)?;
+    config.resolve_input_size(processing_size.0, processing_size.1);
+    // ONNX Runtime cannot run these; load them the way `run` does.
+    if config.devices.is_some() || config.is_recurrent() {
+        build_inference_engine(path, config, BackendOverrides::current(), None)?;
+        info!("model file: loads OK");
+        return Ok(());
+    }
     let engine = OnnxEngine::load(path, config)?;
     info!(
         inputs = engine.input_count(),
@@ -642,5 +674,30 @@ chain = ["passthrough"]
         // no chains to validate.
         let preset = Preset::default();
         check_preset_sections("empty", &preset).expect("empty preset has no chains to validate");
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn check_preset_follows_the_fallback_when_the_model_cannot_run_here() {
+        let model = crate::test_support::UnrunnableModel::new("check-switch");
+        let cfg = model.config(Some("plain"));
+        check_preset(&cfg, Some("accel"), &ConfigBase::default())
+            .expect("the fallback preset is checked instead");
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn check_preset_fails_when_the_model_cannot_run_here_and_there_is_no_fallback() {
+        let model = crate::test_support::UnrunnableModel::new("check-none");
+        let cfg = model.config(None);
+        let err =
+            check_preset(&cfg, Some("accel"), &ConfigBase::default()).expect_err("nothing can run");
+        assert!(
+            matches!(
+                err,
+                FluxError::Inference(InferenceError::AcceleratorUnavailable { .. })
+            ),
+            "got: {err:?}"
+        );
     }
 }
