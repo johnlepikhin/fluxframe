@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use fluxframe_core::Region;
 use fluxframe_core::context::{FrameContext, Framing, FramingSource, ProcessingContext};
-use fluxframe_core::error::PipelineError;
+use fluxframe_core::error::{EffectError, PipelineError};
 use fluxframe_core::metrics::StageKey;
 use fluxframe_core::{FluxConfig, FluxError, InputDevice, Preset, SubchainKind};
 use fluxframe_effects::EffectChain;
@@ -178,7 +178,7 @@ fn apply_read_only_command(
         }
         ControlCommand::ListEffects => apply_list_effects_command(),
         ControlCommand::ConfigPath => apply_config_path_command(session.config_path.as_deref()),
-        ControlCommand::DaemonInfo => apply_daemon_info_command(&session.cfg),
+        ControlCommand::DaemonInfo => apply_daemon_info_command(session),
         _ => return None,
     };
     Some(response)
@@ -218,6 +218,7 @@ fn apply_control_command(
         config_base,
         active_preset_name,
         active_preset,
+        fallen_back_from,
     } = session;
     let config_path = config_path.as_deref();
     match cmd {
@@ -229,29 +230,34 @@ fn apply_control_command(
                     Some(format!("available: {}", available.join(", "))),
                 );
             };
-            let mut new_chain = match preset::build_chain(&name, new_preset, config_base) {
-                Ok(c) => c,
-                Err(e) => return ControlResponse::err(format!("build chain failed: {e}"), None),
+            let prepared = match preset::prepare_with_fallback(
+                cfg,
+                config_base,
+                &name,
+                new_preset,
+                processing_ctx,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    return ControlResponse::err(
+                        format!("preset '{name}' did not initialise: {e}"),
+                        Some("the live chain is unchanged".into()),
+                    );
+                }
             };
-            if let Err(e) = new_chain.prepare_all(processing_ctx) {
-                return ControlResponse::err(
-                    format!("prepare failed: {e}"),
-                    Some(format!(
-                        "preset '{name}' parsed but did not initialise at runtime"
-                    )),
-                );
-            }
+            let mut new_chain = prepared.chain;
             // Swap in the new chain; old chain is shut down on the
             // local variable.
             std::mem::swap(chain, &mut new_chain);
             if let Err(e) = new_chain.shutdown_all() {
                 warn!(error = %e, "old chain shutdown reported an error");
             }
-            active_preset_name.clone_from(&name);
-            // Refresh the working preset copy from the source-of-truth
+            // The working preset copy comes from the source-of-truth
             // config so `current_config` / `set` see the new pipeline.
-            *active_preset = new_preset.clone();
-            info!(preset = %name, "control: swapped active preset");
+            *fallen_back_from = (prepared.name != name).then(|| name.clone());
+            *active_preset_name = prepared.name;
+            *active_preset = prepared.preset;
+            info!(requested = %name, active = %active_preset_name, "control: swapped active preset");
             ControlResponse::ok()
         }
         ControlCommand::Set { path, value } => {
@@ -280,6 +286,7 @@ fn apply_control_command(
             chain,
             active_preset_name,
             active_preset,
+            fallen_back_from,
         ),
         ControlCommand::SavePreset => {
             apply_save_preset_command(cfg, config_path, active_preset_name, active_preset)
@@ -392,10 +399,10 @@ fn apply_config_path_command(config_path: Option<&std::path::Path>) -> ControlRe
 
 /// Apply `daemon_info`: where the processed video is published, so a
 /// client (the GUI preview) does not have to guess the device.
-fn apply_daemon_info_command(cfg: &FluxConfig) -> ControlResponse {
+fn apply_daemon_info_command(session: &ControlSession) -> ControlResponse {
     use fluxframe_core::{DaemonInfo, OutputInfo};
 
-    let output = match classify_output(cfg) {
+    let output = match classify_output(&session.cfg) {
         OutputSpec::V4l2(device) => OutputInfo::V4l2 { device },
         OutputSpec::Pipewire(node) => OutputInfo::Pipewire { node },
         OutputSpec::Auto => OutputInfo::Auto,
@@ -404,7 +411,12 @@ fn apply_daemon_info_command(cfg: &FluxConfig) -> ControlResponse {
             return ControlResponse::err(format!("output '{device}' is not supported"), None);
         }
     };
-    match serde_json::to_value(DaemonInfo { output }) {
+    let info = DaemonInfo {
+        output,
+        requested_preset: Some(session.requested_preset_name().to_string()),
+        active_preset: Some(session.active_preset_name.clone()),
+    };
+    match serde_json::to_value(info) {
         Ok(data) => ControlResponse::ok_with(data),
         Err(e) => ControlResponse::err(format!("serialise failed: {e}"), None),
     }
@@ -491,6 +503,7 @@ fn apply_reload_command(
     chain: &mut EffectChain,
     active_preset_name: &mut String,
     active_preset: &mut Preset,
+    fallen_back_from: &mut Option<String>,
 ) -> ControlResponse {
     let Some(path) = config_path else {
         return ControlResponse::err(
@@ -510,10 +523,15 @@ fn apply_reload_command(
     if let Err(e) = new_cfg.validate() {
         return ControlResponse::err(format!("validation failed: {e}"), None);
     }
-    let Some(new_preset) = new_cfg.presets.get(active_preset_name) else {
+    // A running fallback is a stand-in: reload tries the preset the
+    // operator selected again.
+    let requested = fallen_back_from
+        .clone()
+        .unwrap_or_else(|| active_preset_name.clone());
+    let Some(new_preset) = new_cfg.presets.get(&requested) else {
         let available: Vec<&str> = new_cfg.presets.keys().map(String::as_str).collect();
         return ControlResponse::err(
-            format!("active preset '{active_preset_name}' is gone from the reloaded config"),
+            format!("active preset '{requested}' is gone from the reloaded config"),
             Some(format!(
                 "available presets after reload: {}",
                 available.join(", ")
@@ -521,23 +539,36 @@ fn apply_reload_command(
         );
     };
     let config_base = ConfigBase::for_config(Some(path));
-    let mut new_chain = match preset::build_chain(active_preset_name, new_preset, &config_base) {
-        Ok(c) => c,
-        Err(e) => return ControlResponse::err(format!("build chain failed: {e}"), None),
+    let prepared = match preset::prepare_with_fallback(
+        &new_cfg,
+        &config_base,
+        &requested,
+        new_preset,
+        processing_ctx,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return ControlResponse::err(
+                format!("prepare on reloaded chain failed: {e}"),
+                Some("the live chain is unchanged".into()),
+            );
+        }
     };
-    if let Err(e) = new_chain.prepare_all(processing_ctx) {
-        return ControlResponse::err(
-            format!("prepare on reloaded chain failed: {e}"),
-            Some("the live chain is unchanged".into()),
-        );
-    }
+    let mut new_chain = prepared.chain;
     std::mem::swap(chain, &mut new_chain);
     if let Err(e) = new_chain.shutdown_all() {
         warn!(error = %e, "old chain shutdown reported an error during reload");
     }
-    *active_preset = new_preset.clone();
+    *fallen_back_from = (prepared.name != requested).then(|| requested.clone());
+    *active_preset_name = prepared.name;
+    *active_preset = prepared.preset;
     *cfg = new_cfg;
-    info!(path = %path.display(), preset = %active_preset_name, "control: reloaded config from disk");
+    info!(
+        path = %path.display(),
+        requested = %requested,
+        active = %active_preset_name,
+        "control: reloaded config from disk",
+    );
     ControlResponse::ok()
 }
 
@@ -1754,7 +1785,7 @@ fn run_chain<F>(
     cfg: &FluxConfig,
     session: &mut ControlSession,
     control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
-    mut chain: EffectChain,
+    chain: EffectChain,
     source_label: &'static str,
     input_builder: F,
 ) -> Result<(), FluxError>
@@ -1786,9 +1817,7 @@ where
     // builder (preset path) and at construction for [`PassthroughEffect`],
     // so the runtime only needs to drive `prepare_all` here. The chain
     // never sees standalone effects with unconfigured state.
-    chain
-        .prepare_all(&processing_ctx)
-        .map_err(FluxError::from)?;
+    let mut chain = session.prepare(chain, &processing_ctx)?;
 
     let (effective_out_w, effective_out_h) = cfg
         .output
@@ -2891,7 +2920,7 @@ fn process_one_frame(
     };
     if let Err(e) = chain.process(&mut frame, &mut state.frame_context) {
         metrics.counters.inc_effect_error();
-        error!(error = %e, "effect chain failed; stopping");
+        error!(error = %e, "effect chain failed");
         return Err(FluxError::from(e));
     }
     metrics.processing.record_duration(pre_process.elapsed());
@@ -3501,7 +3530,7 @@ fn run_process_loop(
             // closed by shutdown.  Re-check the flag and continue.
             continue;
         };
-        process_one_frame(
+        if let Err(e) = process_one_frame(
             &mut state,
             frame,
             chain,
@@ -3509,7 +3538,9 @@ fn run_process_loop(
             deps.metrics,
             slot,
             no_consumer_attached(idle.as_deref()),
-        )?;
+        ) {
+            fall_back_on_inference_failure(session, deps.processing_ctx, chain, e)?;
+        }
     }
     // Reap any in-flight reload thread so it doesn't outlive the
     // supervisor. Surface the wall-clock cost so a reload that was
@@ -3532,6 +3563,37 @@ fn run_process_loop(
         }
     }
     Ok(())
+}
+
+/// A preset whose inference keeps failing (the segmentation failure
+/// budget is exhausted) hands over to its `fallback_preset` instead of
+/// stopping the daemon.  Any other error, or a preset without a
+/// fallback, is returned.
+fn fall_back_on_inference_failure(
+    session: &mut ControlSession,
+    processing_ctx: &ProcessingContext,
+    chain: &mut EffectChain,
+    err: FluxError,
+) -> Result<(), FluxError> {
+    if !matches!(err, FluxError::Effect(EffectError::Inference { .. })) {
+        return Err(err);
+    }
+    let preset = session.active_preset_name.clone();
+    match session.fall_back(processing_ctx) {
+        Ok(Some(mut fallback)) => {
+            warn!(preset = %preset, error = %err, "inference keeps failing; switched to the fallback preset");
+            std::mem::swap(chain, &mut fallback);
+            if let Err(e) = fallback.shutdown_all() {
+                warn!(error = %e, "failed chain shutdown reported an error");
+            }
+            Ok(())
+        }
+        Ok(None) => Err(err),
+        Err(e) => {
+            error!(preset = %preset, error = %e, "fallback preset failed to start");
+            Err(err)
+        }
+    }
 }
 
 fn teardown(input: &InputPipeline, output: &OutputPipeline, chain: &mut EffectChain) {
@@ -4571,6 +4633,7 @@ mod tests {
             config_base: ConfigBase::default(),
             active_preset_name: preset_name.into(),
             active_preset,
+            fallen_back_from: None,
         }
     }
 
@@ -4644,8 +4707,90 @@ mod tests {
         let resp = apply_offline_command(&session, &ControlCommand::DaemonInfo);
         assert_eq!(
             ok_payload(&resp),
-            &serde_json::json!({"output": {"kind": "pipewire", "node": "studio"}})
+            &serde_json::json!({
+                "output": {"kind": "pipewire", "node": "studio"},
+                "requested_preset": "default",
+                "active_preset": "default",
+            })
         );
+    }
+
+    fn inference_failure() -> FluxError {
+        FluxError::Effect(EffectError::Inference {
+            name: "segmentation".into(),
+            source: fluxframe_core::error::InferenceError::InferenceFailed {
+                reason: "device lost".into(),
+            },
+        })
+    }
+
+    #[test]
+    fn repeated_inference_failure_switches_to_the_fallback_preset() {
+        let mut cfg = base_cfg();
+        cfg.presets.insert("lite".into(), Preset::default());
+        cfg.presets.insert(
+            "default".into(),
+            Preset {
+                fallback_preset: Some("lite".into()),
+                ..Preset::default()
+            },
+        );
+        let mut session = test_session(cfg, "default");
+        let mut chain = stub_chain();
+        fall_back_on_inference_failure(&mut session, &stub_ctx(), &mut chain, inference_failure())
+            .expect("the fallback takes over");
+        assert_eq!(session.active_preset_name, "lite");
+        assert_eq!(session.requested_preset_name(), "default");
+    }
+
+    #[test]
+    fn inference_failure_without_a_fallback_stops_the_run() {
+        let mut session = test_session(base_cfg(), "default");
+        let mut chain = stub_chain();
+        assert!(
+            fall_back_on_inference_failure(
+                &mut session,
+                &stub_ctx(),
+                &mut chain,
+                inference_failure()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn other_chain_errors_do_not_trigger_the_fallback() {
+        let mut cfg = base_cfg();
+        cfg.presets.insert("lite".into(), Preset::default());
+        cfg.presets.insert(
+            "default".into(),
+            Preset {
+                fallback_preset: Some("lite".into()),
+                ..Preset::default()
+            },
+        );
+        let mut session = test_session(cfg, "default");
+        let mut chain = stub_chain();
+        let err = FluxError::Effect(EffectError::ProcessFailed {
+            name: "composite".into(),
+            reason: "bad frame".into(),
+        });
+        assert!(
+            fall_back_on_inference_failure(&mut session, &stub_ctx(), &mut chain, err).is_err()
+        );
+        assert_eq!(session.active_preset_name, "default");
+    }
+
+    #[test]
+    fn daemon_info_reports_a_running_fallback() {
+        let mut cfg = base_cfg();
+        cfg.presets.insert("lite".into(), Preset::default());
+        let mut session = test_session(cfg, "lite");
+        session.fallen_back_from = Some("default".into());
+        let resp = apply_offline_command(&session, &ControlCommand::DaemonInfo);
+        let payload = ok_payload(&resp);
+        assert_eq!(payload["requested_preset"], "default");
+        assert_eq!(payload["active_preset"], "lite");
     }
 
     /// While the daemon waits for a camera no worker loop drains the
@@ -5097,7 +5242,15 @@ radius = 10
         let mut name = "default".to_string();
         let mut preset = Preset::default();
         let ctx = stub_ctx();
-        let resp = apply_reload_command(&mut cfg, None, &ctx, &mut chain, &mut name, &mut preset);
+        let resp = apply_reload_command(
+            &mut cfg,
+            None,
+            &ctx,
+            &mut chain,
+            &mut name,
+            &mut preset,
+            &mut None,
+        );
         let reason = err_reason(&resp);
         assert!(reason.contains("config path"), "reason: {reason}");
     }

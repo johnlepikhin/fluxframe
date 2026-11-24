@@ -356,6 +356,7 @@ mod tests {
         blur_table.insert("radius".into(), toml::Value::Integer(40));
         per_effect.insert("blur".into(), toml::Value::Table(blur_table));
         Preset {
+            fallback_preset: None,
             mask: None,
             background: Some(PipelineSection {
                 chain: vec!["blur".into()],
@@ -439,6 +440,21 @@ strength = 0.3
             blur_cfg.get("radius").and_then(toml::Value::as_integer),
             Some(40)
         );
+    }
+
+    #[test]
+    fn fallback_preset_round_trips_through_save() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("cfg.toml");
+        save_preset(&path, "lite", &sample_preset()).unwrap();
+        let demo = Preset {
+            fallback_preset: Some("lite".into()),
+            ..sample_preset()
+        };
+        save_preset(&path, "demo", &demo).unwrap();
+        let cfg = fluxframe_core::FluxConfig::from_toml_str(&fs::read_to_string(&path).unwrap())
+            .expect("re-parse saved file");
+        assert_eq!(cfg.presets.get("demo"), Some(&demo));
     }
 
     #[test]
@@ -536,6 +552,7 @@ strength = 0.3
         post_per_effect.insert("auto_frame".into(), toml::Value::Table(auto_frame));
 
         Preset {
+            fallback_preset: None,
             mask: Some(PipelineSection {
                 chain: vec![
                     "smooth_temporal".into(),

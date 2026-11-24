@@ -21,7 +21,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use fluxframe_core::protocol::{Command, DaemonInfo, OutputInfo, Response};
+use fluxframe_core::protocol::{Command, DaemonInfo, Response};
 use relm4::Worker;
 use relm4::prelude::ComponentSender;
 
@@ -88,9 +88,9 @@ pub struct InitialState {
     /// the GUI's Save button tooltip and used to grey the button out
     /// when `None`.
     pub config_path: Option<PathBuf>,
-    /// Where the daemon publishes video, per `daemon_info`; `None` when
-    /// the daemon is too old to answer it.
-    pub output: Option<OutputInfo>,
+    /// Where the daemon publishes video and which preset it runs, per
+    /// `daemon_info`; `None` when the daemon is too old to answer it.
+    pub daemon_info: Option<DaemonInfo>,
 }
 
 /// Read timeout applied to the socket so a wedged daemon does not
@@ -324,8 +324,8 @@ fn handshake(stream: &mut BufferedStream) -> Result<InitialState, String> {
     };
     // Optional as well: a daemon without `daemon_info` leaves the
     // preview on its historical default device.
-    let output = match stream.round_trip(&Command::DaemonInfo) {
-        Ok(Response::Ok { data }) => parse_output(data),
+    let daemon_info = match stream.round_trip(&Command::DaemonInfo) {
+        Ok(Response::Ok { data }) => parse_daemon_info(data),
         Ok(Response::Err { error, .. }) => {
             tracing::debug!(error, "daemon_info refused; assuming an older daemon");
             None
@@ -339,15 +339,15 @@ fn handshake(stream: &mut BufferedStream) -> Result<InitialState, String> {
         active_preset,
         active_config,
         config_path,
-        output,
+        daemon_info,
     })
 }
 
-/// Decode the `DaemonInfo` payload into its output; an unexpected shape
-/// is treated as "not reported" with a debug-level breadcrumb.
-fn parse_output(data: serde_json::Value) -> Option<OutputInfo> {
+/// Decode the `DaemonInfo` payload; an unexpected shape is treated as
+/// "not reported" with a debug-level breadcrumb.
+fn parse_daemon_info(data: serde_json::Value) -> Option<DaemonInfo> {
     match serde_json::from_value::<DaemonInfo>(data) {
-        Ok(info) => Some(info.output),
+        Ok(info) => Some(info),
         Err(e) => {
             tracing::debug!(error = %e, "daemon_info: unexpected payload; treating as unreported");
             None
@@ -400,6 +400,7 @@ fn fmt_hint(hint: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluxframe_core::protocol::OutputInfo;
 
     #[test]
     fn ipc_error_display_distinguishes_timeout_from_closed() {
@@ -519,7 +520,7 @@ mod tests {
         ))
         .expect("handshake succeeds");
         assert_eq!(
-            initial.output,
+            initial.daemon_info.map(|i| i.output),
             Some(OutputInfo::V4l2 {
                 device: PathBuf::from("/dev/video11")
             })
@@ -556,7 +557,7 @@ mod tests {
             Response::err("invalid command: unknown variant `daemon_info`", None),
         ))
         .expect("refused daemon_info must not fail the handshake");
-        assert_eq!(initial.output, None);
+        assert_eq!(initial.daemon_info, None);
         assert_eq!(initial.active_preset, "office");
     }
 

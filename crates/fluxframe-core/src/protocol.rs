@@ -192,6 +192,26 @@ impl Response {
 pub struct DaemonInfo {
     /// Where the processed video is published.
     pub output: OutputInfo,
+    /// The preset the operator selected (`set_preset`, `--preset`).
+    /// `None` from daemons that predate preset fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_preset: Option<String>,
+    /// The preset actually running: the requested one, or its
+    /// `fallback_preset` when the requested one cannot run here.
+    /// `None` from daemons that predate preset fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_preset: Option<String>,
+}
+
+impl DaemonInfo {
+    /// A fallback preset runs in place of the selected one.
+    #[must_use]
+    pub fn is_fallback_active(&self) -> bool {
+        matches!(
+            (&self.requested_preset, &self.active_preset),
+            (Some(requested), Some(active)) if requested != active
+        )
+    }
 }
 
 /// Output sink reported by [`Command::DaemonInfo`], tagged by `kind`.
@@ -411,16 +431,29 @@ mod tests {
             output: OutputInfo::V4l2 {
                 device: PathBuf::from("/dev/video10"),
             },
+            requested_preset: Some("rvm".into()),
+            active_preset: Some("mediapipe".into()),
         };
         let wire = serde_json::to_value(&info).expect("serialises");
         assert_eq!(
             wire,
-            serde_json::json!({"output": {"kind": "v4l2", "device": "/dev/video10"}})
+            serde_json::json!({
+                "output": {"kind": "v4l2", "device": "/dev/video10"},
+                "requested_preset": "rvm",
+                "active_preset": "mediapipe",
+            })
         );
-        assert_eq!(
-            serde_json::from_value::<DaemonInfo>(wire).expect("parses back"),
-            info
-        );
+        let back = serde_json::from_value::<DaemonInfo>(wire).expect("parses back");
+        assert_eq!(back, info);
+        assert!(back.is_fallback_active());
+    }
+
+    #[test]
+    fn daemon_info_from_an_older_daemon_has_no_presets() {
+        let info: DaemonInfo =
+            serde_json::from_str(r#"{"output":{"kind":"fakesink"}}"#).expect("parses");
+        assert_eq!(info.active_preset, None);
+        assert!(!info.is_fallback_active());
     }
 
     #[test]

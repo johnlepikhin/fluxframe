@@ -656,6 +656,13 @@ impl PipelineSection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Preset {
+    /// Preset to run instead when this one cannot run for lack of an
+    /// accelerator: its model is restricted to devices this machine
+    /// does not have, or its inference keeps failing at runtime.  The
+    /// daemon switches once and stays on the fallback until the next
+    /// `set_preset`, `reload` or restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_preset: Option<String>,
     /// Mask sub-pipeline: segmentation model plus the chain of
     /// `MaskEffect`s post-processing the confidence mask.
     #[serde(default)]
@@ -1117,6 +1124,33 @@ impl FluxConfig {
             ));
         }
 
+        self.validate_fallback_presets()
+    }
+
+    /// Every `fallback_preset` names a defined preset, and following
+    /// them never returns to a preset already visited.
+    fn validate_fallback_presets(&self) -> Result<(), crate::error::FluxError> {
+        for (start, preset) in &self.presets {
+            let mut visited = vec![start.as_str()];
+            let mut next = preset.fallback_preset.as_deref();
+            while let Some(name) = next {
+                let Some(target) = self.presets.get(name) else {
+                    return Err(config_err(format!(
+                        "presets.{}.fallback_preset names preset '{name}', which is not defined",
+                        visited.last().copied().unwrap_or(start)
+                    )));
+                };
+                if visited.contains(&name) {
+                    visited.push(name);
+                    return Err(config_err(format!(
+                        "fallback_preset forms a cycle: {}",
+                        visited.join(" -> ")
+                    )));
+                }
+                visited.push(name);
+                next = target.fallback_preset.as_deref();
+            }
+        }
         Ok(())
     }
 }
@@ -1191,7 +1225,7 @@ fn default_log_level() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FluxConfig, MAX_IDLE_RESYNC_INTERVAL_SECS, MIN_IDLE_RESYNC_INTERVAL_SECS,
+        FluxConfig, MAX_IDLE_RESYNC_INTERVAL_SECS, MIN_IDLE_RESYNC_INTERVAL_SECS, Preset,
         default_idle_resync_interval_secs,
     };
 
@@ -1291,5 +1325,58 @@ mod tests {
             let cfg = cfg_with_resync(&value.to_string()).expect("parse");
             cfg.validate().unwrap_or_else(|e| panic!("{value}: {e}"));
         }
+    }
+
+    fn presets_with_fallbacks(links: &[(&str, Option<&str>)]) -> FluxConfig {
+        let mut cfg = FluxConfig::default();
+        for (name, fallback) in links {
+            cfg.presets.insert(
+                (*name).to_string(),
+                Preset {
+                    fallback_preset: fallback.map(str::to_string),
+                    ..Preset::default()
+                },
+            );
+        }
+        cfg
+    }
+
+    #[test]
+    fn fallback_preset_chain_validates() {
+        let cfg =
+            presets_with_fallbacks(&[("rvm", Some("mp")), ("mp", Some("raw")), ("raw", None)]);
+        cfg.validate()
+            .expect("a fallback chain ending in a plain preset is valid");
+    }
+
+    #[test]
+    fn fallback_preset_must_exist() {
+        let cfg = presets_with_fallbacks(&[("rvm", Some("missing"))]);
+        let err = cfg.validate().expect_err("unknown fallback").to_string();
+        assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn fallback_preset_cycles_are_rejected() {
+        let cfg = presets_with_fallbacks(&[("a", Some("b")), ("b", Some("a"))]);
+        let err = cfg.validate().expect_err("cycle").to_string();
+        assert!(err.contains("cycle"), "{err}");
+        let selfie = presets_with_fallbacks(&[("a", Some("a"))]);
+        assert!(
+            selfie.validate().is_err(),
+            "a preset cannot fall back to itself"
+        );
+    }
+
+    #[test]
+    fn fallback_preset_parses_from_toml() {
+        let cfg = FluxConfig::from_toml_str(
+            "[presets.default]\nfallback_preset = \"lite\"\n[presets.lite]\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            cfg.presets["default"].fallback_preset.as_deref(),
+            Some("lite")
+        );
     }
 }

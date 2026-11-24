@@ -69,6 +69,9 @@ pub(crate) enum PendingKind {
         /// Name of the preset being created.
         new_name: String,
     },
+    /// A `Command::DaemonInfo` sent with every refetch of the active
+    /// preset, to tell the operator when a fallback preset runs.
+    DaemonInfo,
     /// Anything else (SetChain, …). Tracked so their errors still
     /// reach the operator.
     Other,
@@ -223,56 +226,90 @@ pub(crate) fn apply_reply(
                     effects.presets_changed = true;
                 }
             }
+            Some(PendingKind::DaemonInfo) => {
+                match serde_json::from_value::<fluxframe_core::DaemonInfo>(data) {
+                    Ok(info) => effects.notice = fallback_notice(&info),
+                    Err(e) => tracing::debug!(error = %e, "malformed daemon_info reply"),
+                }
+            }
             // SetChain or an untracked tag — the follow-up GetConfig
             // refreshes the UI.
             Some(PendingKind::Other) | None => {}
         },
         Response::Err { error, hint } => {
             tracing::warn!(error = %error, hint = ?hint, "reply err");
-            match kind {
-                Some(PendingKind::SetParam { path, .. }) => {
-                    // `active_config` still holds the previous value
-                    // (we only commit on Ok), so resetting the widget
-                    // from it snaps the control back.
-                    effects.notice = Some(error_notice(&error, hint.as_deref()));
-                    effects.reset_param = Some(path);
-                }
-                Some(PendingKind::SetEnabled {
-                    section, effect, ..
-                }) => {
-                    // `active_config` is untouched, so syncing the switch
-                    // from it flips it back.
-                    effects.notice = Some(error_notice(&error, hint.as_deref()));
-                    effects.sync_toggle = Some((section, effect));
-                }
-                Some(
-                    PendingKind::Other
-                    | PendingKind::Save
-                    | PendingKind::SaveAs { .. }
-                    | PendingKind::SetPreset
-                    | PendingKind::Revert
-                    | PendingKind::Reload,
-                ) => {
-                    // No rollback and no refetch: the daemon kept its
-                    // state, so the dirty baseline must stay put. The
-                    // operator still needs to know it refused.
-                    effects.notice = Some(error_notice(&error, hint.as_deref()));
-                }
-                // Internal refetches and unknown tags — the warn above
-                // is enough.
-                Some(
-                    PendingKind::CurrentPreset
-                    | PendingKind::GetConfig(_)
-                    | PendingKind::GetConfigQuiet
-                    | PendingKind::ListPresets,
-                )
-                | None => {}
-            }
+            apply_err(kind, &error, hint.as_deref(), &mut effects);
         }
         // `Response` is `#[non_exhaustive]`; tolerate future variants.
         _ => tracing::warn!("unrecognised Response variant"),
     }
     effects
+}
+
+/// Warning shown while a fallback preset runs in place of the one the
+/// operator selected; `None` when the selected preset itself runs.
+pub(crate) fn fallback_notice(info: &fluxframe_core::DaemonInfo) -> Option<Notice> {
+    if !info.is_fallback_active() {
+        return None;
+    }
+    let requested = info.requested_preset.as_deref().unwrap_or_default();
+    let active = info.active_preset.as_deref().unwrap_or_default();
+    Some(Notice {
+        kind: NoticeKind::Error,
+        message: format!(
+            "Preset “{requested}” cannot run on this machine; its fallback “{active}” is running"
+        ),
+    })
+}
+
+/// The `Err` half of [`apply_reply`]: the daemon kept its state, so
+/// nothing is committed; the operator learns what it refused.
+fn apply_err(
+    kind: Option<PendingKind>,
+    error: &str,
+    hint: Option<&str>,
+    effects: &mut ReplyEffects,
+) {
+    match kind {
+        Some(PendingKind::SetParam { path, .. }) => {
+            // `active_config` still holds the previous value
+            // (we only commit on Ok), so resetting the widget
+            // from it snaps the control back.
+            effects.notice = Some(error_notice(error, hint));
+            effects.reset_param = Some(path);
+        }
+        Some(PendingKind::SetEnabled {
+            section, effect, ..
+        }) => {
+            // `active_config` is untouched, so syncing the switch
+            // from it flips it back.
+            effects.notice = Some(error_notice(error, hint));
+            effects.sync_toggle = Some((section, effect));
+        }
+        Some(
+            PendingKind::Other
+            | PendingKind::Save
+            | PendingKind::SaveAs { .. }
+            | PendingKind::SetPreset
+            | PendingKind::Revert
+            | PendingKind::Reload,
+        ) => {
+            // No rollback and no refetch: the daemon kept its
+            // state, so the dirty baseline must stay put. The
+            // operator still needs to know it refused.
+            effects.notice = Some(error_notice(error, hint));
+        }
+        // Internal refetches and unknown tags — the warn above
+        // is enough.
+        Some(
+            PendingKind::CurrentPreset
+            | PendingKind::DaemonInfo
+            | PendingKind::GetConfig(_)
+            | PendingKind::GetConfigQuiet
+            | PendingKind::ListPresets,
+        )
+        | None => {}
+    }
 }
 
 fn confirmation(message: String) -> Notice {
@@ -582,5 +619,33 @@ mod tests {
             assert_eq!(fx.notice.map(|n| n.message), Some("nope".into()));
             assert!(!fx.rebuild_chain);
         }
+    }
+
+    #[test]
+    fn daemon_info_reply_warns_while_a_fallback_preset_runs() {
+        let mut s = AppState::new("/tmp/sock".into());
+        let fx = apply_reply(
+            &mut s,
+            Some(PendingKind::DaemonInfo),
+            ok(json!({
+                "output": {"kind": "fakesink"},
+                "requested_preset": "rvm",
+                "active_preset": "mediapipe",
+            })),
+        );
+        let notice = fx.notice.expect("fallback is reported");
+        assert_eq!(notice.kind, NoticeKind::Error);
+        assert!(notice.message.contains("rvm") && notice.message.contains("mediapipe"));
+
+        let fx = apply_reply(
+            &mut s,
+            Some(PendingKind::DaemonInfo),
+            ok(json!({
+                "output": {"kind": "fakesink"},
+                "requested_preset": "rvm",
+                "active_preset": "rvm",
+            })),
+        );
+        assert_eq!(fx.notice, None, "the selected preset runs");
     }
 }

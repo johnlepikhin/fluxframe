@@ -436,6 +436,7 @@ impl AppModel {
     /// Refetch the active preset name and config as a clean baseline.
     fn refetch_active(&mut self) {
         self.send_kind(Command::CurrentPreset, PendingKind::CurrentPreset);
+        self.send_kind(Command::DaemonInfo, PendingKind::DaemonInfo);
         self.send_kind(
             Command::GetConfig { path: None },
             PendingKind::GetConfig(ConfigSync::ResyncBaseline),
@@ -482,7 +483,11 @@ impl AppModel {
                 self.state.presets = initial.presets;
                 self.state.inventory = initial.inventory;
                 self.state.config_path = initial.config_path;
-                self.state.output = initial.output;
+                self.state.output = initial.daemon_info.as_ref().map(|i| i.output.clone());
+                let fallback = initial
+                    .daemon_info
+                    .as_ref()
+                    .and_then(reply::fallback_notice);
                 let edits_lost = self.state.apply_handshake(
                     initial.active_preset,
                     initial.active_config,
@@ -497,6 +502,9 @@ impl AppModel {
                         kind: NoticeKind::Error,
                         message: RECONNECT_EDITS_LOST.to_string(),
                     });
+                }
+                if let Some(notice) = fallback {
+                    self.show_notice(&notice);
                 }
             }
             WorkerOutput::Disconnected { reason } => {

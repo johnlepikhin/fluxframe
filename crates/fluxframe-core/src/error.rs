@@ -68,6 +68,21 @@ pub enum EffectError {
     },
 }
 
+impl EffectError {
+    /// The effect's inference model may only run on accelerators this
+    /// machine cannot provide ([`InferenceError::AcceleratorUnavailable`]).
+    #[must_use]
+    pub fn is_accelerator_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Inference {
+                source: InferenceError::AcceleratorUnavailable { .. },
+                ..
+            }
+        )
+    }
+}
+
 /// Errors raised from an `InferenceEngine` implementation.
 ///
 /// Covers model lifecycle (load, configure) and per-call execution.

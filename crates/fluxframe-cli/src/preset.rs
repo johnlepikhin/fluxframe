@@ -14,11 +14,12 @@
 //!    (bg/fg without mask is a config bug; mask without the `ml`
 //!    feature is a build mismatch).
 
+use fluxframe_core::context::ProcessingContext;
 use fluxframe_core::paths::ConfigBase;
 use fluxframe_core::traits::VideoEffect;
 use fluxframe_core::{FluxConfig, FluxError, Preset};
 use fluxframe_effects::{EffectChain, PassthroughEffect};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Default preset name looked up when `--preset` is omitted.
 pub const DEFAULT_PRESET_NAME: &str = "default";
@@ -67,6 +68,78 @@ fn resolution_error(cfg: &FluxConfig, requested: Option<&str>) -> FluxError {
     FluxError::Config {
         reason,
         hint: Some(hint),
+    }
+}
+
+/// A preset whose chain is built and prepared: the one asked for, or
+/// a fallback of it ([`prepare_with_fallback`]).
+pub(crate) struct PreparedPreset {
+    pub(crate) chain: EffectChain,
+    pub(crate) name: String,
+    pub(crate) preset: Preset,
+}
+
+/// Build and prepare the chain of preset `name`.  While a preset cannot
+/// run for lack of an accelerator and names a `fallback_preset`, the
+/// fallback is tried instead (fallback presets come from `cfg`, saved
+/// state).
+///
+/// # Errors
+///
+/// The last preset tried fails to build or prepare, or a fallback is
+/// missing from `cfg` or revisits a preset (both rejected by config
+/// validation).
+pub(crate) fn prepare_with_fallback(
+    cfg: &FluxConfig,
+    config_base: &ConfigBase,
+    name: &str,
+    preset: &Preset,
+    ctx: &ProcessingContext,
+) -> Result<PreparedPreset, FluxError> {
+    let mut name = name.to_string();
+    let mut preset = preset.clone();
+    let mut tried = Vec::new();
+    loop {
+        let mut chain = build_chain(&name, &preset, config_base)?;
+        let err = match chain.prepare_all(ctx) {
+            Ok(()) => {
+                return Ok(PreparedPreset {
+                    chain,
+                    name,
+                    preset,
+                });
+            }
+            Err(e) => e,
+        };
+        let fallback = preset
+            .fallback_preset
+            .clone()
+            .filter(|_| err.is_accelerator_unavailable());
+        let Some(fallback) = fallback else {
+            return Err(err.into());
+        };
+        tried.push(name);
+        if tried.contains(&fallback) {
+            return Err(FluxError::Config {
+                reason: format!("fallback_preset cycle through '{fallback}'"),
+                hint: None,
+            });
+        }
+        let next = cfg
+            .presets
+            .get(&fallback)
+            .ok_or_else(|| FluxError::Config {
+                reason: format!("fallback_preset '{fallback}' is not defined"),
+                hint: None,
+            })?;
+        warn!(
+            preset = %tried.last().map_or("", String::as_str),
+            fallback = %fallback,
+            error = %err,
+            "preset cannot run on this machine; switching to its fallback preset",
+        );
+        name = fallback;
+        preset = next.clone();
     }
 }
 
@@ -351,5 +424,102 @@ mod tests {
         };
         let msg = format!("{err}");
         assert!(msg.contains("ml"), "expected 'ml' mention: {msg}");
+    }
+
+    // ---------- prepare_with_fallback ----------
+
+    /// A model restricted to a device no machine has: preparing it is
+    /// always `AcceleratorUnavailable`, whatever the build and host.
+    struct UnrunnableModel {
+        dir: std::path::PathBuf,
+    }
+
+    impl UnrunnableModel {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("fluxframe-fallback-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            std::fs::write(dir.join("m.onnx"), b"").expect("model");
+            std::fs::write(
+                dir.join("m.toml"),
+                "name = \"m\"\ninput_width = 4\ninput_height = 4\ndevices = [\"NO_SUCH_DEVICE\"]\n",
+            )
+            .expect("sidecar");
+            Self { dir }
+        }
+
+        fn config(&self, fallback: Option<&str>) -> FluxConfig {
+            let fallback =
+                fallback.map_or(String::new(), |f| format!("fallback_preset = \"{f}\"\n"));
+            FluxConfig::from_toml_str(&format!(
+                "[presets.accel]\n{fallback}[presets.accel.mask]\nmodel = \"{}\"\n[presets.plain]\n",
+                self.dir.join("m.onnx").display()
+            ))
+            .expect("config parses")
+        }
+    }
+
+    impl Drop for UnrunnableModel {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn rgb_ctx() -> ProcessingContext {
+        ProcessingContext {
+            width: 8,
+            height: 8,
+            format: fluxframe_core::frame::PixelFormat::Rgb,
+            fps: 30,
+            counters: None,
+        }
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn prepare_falls_back_when_no_accelerator_can_run_the_model() {
+        let model = UnrunnableModel::new("switch");
+        let cfg = model.config(Some("plain"));
+        let prepared = prepare_with_fallback(
+            &cfg,
+            &ConfigBase::default(),
+            "accel",
+            &cfg.presets["accel"],
+            &rgb_ctx(),
+        )
+        .expect("the fallback runs");
+        assert_eq!(prepared.name, "plain");
+        assert_eq!(prepared.preset, cfg.presets["plain"]);
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn prepare_without_fallback_reports_the_accelerator_error() {
+        let model = UnrunnableModel::new("nofallback");
+        let cfg = model.config(None);
+        let err = prepare_with_fallback(
+            &cfg,
+            &ConfigBase::default(),
+            "accel",
+            &cfg.presets["accel"],
+            &rgb_ctx(),
+        )
+        .err()
+        .expect("no fallback to run");
+        assert!(err.to_string().contains("NO_SUCH_DEVICE"), "{err}");
+    }
+
+    #[test]
+    fn prepare_runs_a_preset_that_works_as_is() {
+        let cfg = cfg_with_preset("plain", "fallback_preset = \"other\"\n[presets.other]\n");
+        let prepared = prepare_with_fallback(
+            &cfg,
+            &ConfigBase::default(),
+            "plain",
+            &cfg.presets["plain"],
+            &rgb_ctx(),
+        )
+        .expect("runs");
+        assert_eq!(prepared.name, "plain");
     }
 }
