@@ -1,26 +1,27 @@
-//! V4L2 camera capability discovery — picks a native mode at startup so
-//! the input pipeline never silently stretches content.
+//! V4L2 camera capability discovery — picks the native capture mode that
+//! best serves the operator's `[input] width/height/fps` and pins it on
+//! the source, so the camera never runs in a mode we did not choose.
 //!
-//! Operators should not need to know their camera's native mode list
-//! (different cameras advertise different mode tables, and asking for
-//! something the camera does not natively provide forces `videoscale`
-//! to anisotropically scale — content ends up visually distorted).
+//! Operators should not need to know their camera's native mode list:
+//! the requested geometry is a target, and the camera mode is picked to
+//! serve it (the input pipeline's `videoscale` adapts whatever remains,
+//! padding instead of stretching).
 //!
-//! Selection policy (highest priority first):
-//! 1. **Prefer raw formats** (`YUYV`, `NV12`) over compressed (`MJPG`,
-//!    `H264`) so we avoid the CPU cost of decode and the artefacts of
-//!    re-encoding.
-//! 2. **Prefer the requested fps** (or the highest fps that does not
-//!    exceed the requested ceiling).
-//! 3. **Prefer the largest resolution** within the format and fps
-//!    constraints — operators almost always want the camera's full
-//!    detail (downscaling for output is cheap; upscaling cannot
-//!    invent detail).
-//! 4. Cap at 1920×1080 by default — 4K capture pushes CPU budgets we
-//!    haven't validated and is out of scope for the MVP.
+//! Selection policy (highest priority first), see [`select_best`]:
+//! 1. **Frame rate**: the mode must reach the requested fps (with
+//!    [`FPS_TOLERANCE`] slack). When no mode does, only the fastest
+//!    modes stay in the running.
+//! 2. **Size**: exactly the requested size; otherwise the smallest mode
+//!    that covers it (downscaling keeps detail, upscaling cannot invent
+//!    it); otherwise the largest mode available. Within a size class a
+//!    mode with the requested aspect ratio wins, so the output is not
+//!    letterboxed.
+//! 3. **Fps distance** to the requested fps.
+//! 4. **Encoding**: raw formats (`YUYV`, `NV12`, …) over compressed
+//!    ones, which cost a decode on the CPU.
 //!
-//! If no matching mode exists the function returns an error explaining
-//! what the camera does advertise.
+//! If the camera advertises no usable mode at all, the function returns
+//! an error listing what it does advertise.
 //!
 //! # Device enumeration helpers
 //!
@@ -57,42 +58,92 @@ use v4l::capability::Flags as CapFlags;
 use v4l::video::Capture;
 use v4l::{Device, FourCC};
 
-/// Upper bound on the resolution auto-detect will pick.  4K+ capture
-/// is outside MVP CPU/memory budgets; operators who explicitly want
-/// it can still force the mode via `[input] width/height` overrides.
-pub const AUTODETECT_MAX_WIDTH: u32 = 1920;
-/// See [`AUTODETECT_MAX_WIDTH`].
-pub const AUTODETECT_MAX_HEIGHT: u32 = 1080;
+use crate::frame_conv::pixel_format_to_gst;
+use crate::util::caps_i32;
 
 /// Slack in frames-per-second granted when filtering out modes that
 /// fall below `prefer_fps`.  A camera advertising 25fps survives a
 /// request for 30fps; one advertising 5fps does not.
 pub const FPS_TOLERANCE: u32 = 5;
 
-/// A concrete v4l2 capture mode the input pipeline can pin via caps.
+/// Relative aspect-ratio difference under which a mode counts as having
+/// the requested aspect ratio (800×448 vs 16:9 differs by ~0.5 %).
+const ASPECT_TOLERANCE: f64 = 0.02;
+
+/// How the camera encodes frames on the wire in a given mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureEncoding {
+    /// Uncompressed frames in the given pixel format.
+    Raw(PixelFormat),
+    /// Motion-JPEG: every frame is a JPEG image, decoded on the CPU.
+    /// USB 2.0 cameras typically reach 720p/1080p at full frame rate
+    /// only in this encoding.
+    Mjpeg,
+}
+
+impl std::fmt::Display for CaptureEncoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Raw(format) => write!(f, "raw {format:?}"),
+            Self::Mjpeg => f.write_str("MJPEG"),
+        }
+    }
+}
+
+/// A concrete v4l2 capture mode the input pipeline pins via caps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeMode {
     /// Frame width in pixels (as advertised by `VIDIOC_ENUM_FRAMESIZES`).
     pub width: u32,
     /// Frame height in pixels.
     pub height: u32,
-    /// Pixel format the camera natively delivers.
-    pub format: PixelFormat,
+    /// Wire encoding the camera delivers in this mode.
+    pub encoding: CaptureEncoding,
     /// Frame rate to request (preferred fps clamped to what the mode
     /// supports).
     pub fps: u32,
 }
 
-/// Pick the best native mode for `device` honouring `prefer_fps` as
-/// an upper bound.  See the module header for the selection policy.
+impl NativeMode {
+    /// Caps that pin `v4l2src` to exactly this mode.
+    ///
+    /// The frame rate is a narrow range around [`Self::fps`] rather than
+    /// an exact fraction: drivers report intervals such as
+    /// `333333/10000000` s, which GStreamer may expose as a fraction that
+    /// is not exactly `30/1`.
+    pub(crate) fn source_caps(&self) -> Result<gstreamer::Caps, PipelineError> {
+        let width = caps_i32("width", self.width)?;
+        let height = caps_i32("height", self.height)?;
+        let fps2 = caps_i32("fps", self.fps.saturating_mul(2))?;
+        let framerate = gstreamer::FractionRange::new(
+            gstreamer::Fraction::new(fps2.saturating_sub(1).max(1), 2),
+            gstreamer::Fraction::new(fps2.saturating_add(1), 2),
+        );
+        let builder = match self.encoding {
+            CaptureEncoding::Raw(format) => gstreamer::Caps::builder("video/x-raw")
+                .field("format", pixel_format_to_gst(format).to_str()),
+            CaptureEncoding::Mjpeg => gstreamer::Caps::builder("image/jpeg"),
+        };
+        Ok(builder
+            .field("width", width)
+            .field("height", height)
+            .field("framerate", framerate)
+            .build())
+    }
+}
+
+/// Pick the native mode of `device` that best serves a requested
+/// `width × height` at `prefer_fps`.  See the module header for the
+/// selection policy.
 ///
 /// # Errors
 ///
 /// Returns [`PipelineError::InputDeviceUnavailable`] when the device
-/// cannot be opened or when no mode is acceptable (no raw format,
-/// or every mode exceeds the auto-detect cap).
+/// cannot be opened or advertises no mode in a supported encoding.
 pub fn detect_native_mode(
     device_path: &Path,
+    width: u32,
+    height: u32,
     prefer_fps: u32,
 ) -> Result<NativeMode, PipelineError> {
     let device =
@@ -112,7 +163,7 @@ pub fn detect_native_mode(
 
     let mut candidates: Vec<NativeMode> = Vec::new();
     for fmt in &formats {
-        let Some(pixel_format) = fourcc_to_pixel_format(fmt.fourcc) else {
+        let Some(encoding) = fourcc_to_encoding(fmt.fourcc) else {
             // Unsupported / compressed format we don't model.
             continue;
         };
@@ -130,9 +181,6 @@ pub fn detect_native_mode(
         for size in sizes {
             for d in size.size.to_discrete() {
                 let (w, h) = (d.width, d.height);
-                if w > AUTODETECT_MAX_WIDTH || h > AUTODETECT_MAX_HEIGHT {
-                    continue;
-                }
                 // Pick the highest fps the mode supports that does not
                 // exceed `prefer_fps`.  An empty list means the driver
                 // does not enumerate intervals — treat as "any fps OK"
@@ -155,7 +203,7 @@ pub fn detect_native_mode(
                 candidates.push(NativeMode {
                     width: w,
                     height: h,
-                    format: pixel_format,
+                    encoding,
                     fps,
                 });
             }
@@ -170,69 +218,106 @@ pub fn detect_native_mode(
         return Err(PipelineError::InputDeviceUnavailable {
             device: device_path.display().to_string(),
             reason: format!(
-                "no usable raw-format mode under {AUTODETECT_MAX_WIDTH}x{AUTODETECT_MAX_HEIGHT}; \
-                 advertised: [{}]",
+                "no capture mode in a supported encoding; advertised: [{}]",
                 advertised.join(", ")
             ),
-            hint: "set [input] format to one of YUY2/NV12/RGB/BGR/RGBA/GRAY8 if the device offers it, \
-                   or set [input] width/height explicitly to override auto-detect"
-                .into(),
+            hint: "the camera must offer one of YUYV/NV12/RGB3/BGR3/RGB4/GREY/MJPG".into(),
         });
     }
 
-    select_best(candidates, prefer_fps).ok_or_else(|| PipelineError::InputDeviceUnavailable {
+    let request = ModeRequest {
+        width,
+        height,
+        fps: prefer_fps,
+    };
+    select_best(candidates, request).ok_or_else(|| PipelineError::InputDeviceUnavailable {
         device: device_path.display().to_string(),
         reason: "no acceptable mode after policy filter (this is a bug)".into(),
         hint: "report this — `select_best` should never return None on non-empty input".into(),
     })
 }
 
-/// Pick the best mode from a candidate list given a target fps.
-/// Pure function — no I/O, fully unit-testable.
-///
-/// Selection policy:
-/// 1. Filter out modes whose fps is more than [`FPS_TOLERANCE`] below
-///    `prefer_fps` (a 5fps slack so 25fps survives a request for 30).
-/// 2. If filtering left nothing, fall back to highest-fps candidate.
-/// 3. Otherwise prefer largest area; tiebreak by closest fps to
-///    `prefer_fps`; tiebreak again by raw-YUV > raw-RGB > Gray
-///    (saves a `videoconvert` step on typical cameras).
-fn select_best(mut candidates: Vec<NativeMode>, prefer_fps: u32) -> Option<NativeMode> {
-    if candidates.is_empty() {
-        return None;
-    }
-    let fps_floor = prefer_fps.saturating_sub(FPS_TOLERANCE);
-    let mut filtered: Vec<NativeMode> = candidates
-        .iter()
-        .copied()
+/// What the operator asked the capture to deliver (`[input]` section).
+#[derive(Debug, Clone, Copy)]
+struct ModeRequest {
+    width: u32,
+    height: u32,
+    fps: u32,
+}
+
+/// How well a mode's frame size serves the request; lower is better.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SizeFit {
+    /// Exactly the requested size — no scaling at all.
+    Exact,
+    /// Larger than requested in both axes — downscaled, detail kept.
+    Covers,
+    /// Smaller in at least one axis — upscaled, detail lost.
+    Short,
+}
+
+/// Pick the best mode from a candidate list for `request`.
+/// Pure function — no I/O, fully unit-testable.  The policy is spelled
+/// out in the module header.
+fn select_best(candidates: Vec<NativeMode>, request: ModeRequest) -> Option<NativeMode> {
+    let max_fps = candidates.iter().map(|m| m.fps).max()?;
+    // When no mode reaches the fps target, the fastest modes are the
+    // only ones left in the running: the operator sees the chosen fps in
+    // the log line and can lower the requested size.
+    let fps_floor = request.fps.saturating_sub(FPS_TOLERANCE).min(max_fps);
+    candidates
+        .into_iter()
         .filter(|m| m.fps >= fps_floor)
-        .collect();
-    if filtered.is_empty() {
-        // No mode meets the fps target — fall back to all candidates
-        // sorted by fps-descending and pick the highest.  Operator
-        // sees the chosen fps in the auto-detected log line and can
-        // adjust if needed.
-        candidates.sort_by(|a, b| b.fps.cmp(&a.fps));
-        return Some(candidates[0]);
+        .min_by_key(|m| {
+            let fit = size_fit(m, request);
+            let area = i64::from(m.width) * i64::from(m.height);
+            // Covering modes: the smallest one is enough (less to
+            // decode and downscale). Short modes: the largest one loses
+            // the least detail.
+            let area_rank = match fit {
+                SizeFit::Exact => 0,
+                SizeFit::Covers => area,
+                SizeFit::Short => -area,
+            };
+            (
+                fit,
+                !same_aspect(m, request),
+                area_rank,
+                m.fps.abs_diff(request.fps),
+                encoding_priority(m.encoding),
+            )
+        })
+}
+
+fn size_fit(mode: &NativeMode, request: ModeRequest) -> SizeFit {
+    if mode.width == request.width && mode.height == request.height {
+        SizeFit::Exact
+    } else if mode.width >= request.width && mode.height >= request.height {
+        SizeFit::Covers
+    } else {
+        SizeFit::Short
     }
+}
 
-    // Within fps-acceptable modes, prefer largest area, then closest
-    // fps to `prefer_fps`, then raw-YUV > raw-RGB (saves a
-    // videoconvert step for typical V4L2 cameras).
-    filtered.sort_by(|a, b| {
-        let area_a = u64::from(a.width) * u64::from(a.height);
-        let area_b = u64::from(b.width) * u64::from(b.height);
-        area_b
-            .cmp(&area_a)
-            .then_with(|| {
-                let da = a.fps.abs_diff(prefer_fps);
-                let db = b.fps.abs_diff(prefer_fps);
-                da.cmp(&db)
-            })
-            .then_with(|| format_priority(a.format).cmp(&format_priority(b.format)))
-    });
+fn same_aspect(mode: &NativeMode, request: ModeRequest) -> bool {
+    if mode.height == 0 || request.height == 0 {
+        return false;
+    }
+    let mode_aspect = f64::from(mode.width) / f64::from(mode.height);
+    let request_aspect = f64::from(request.width) / f64::from(request.height);
+    ((mode_aspect - request_aspect) / request_aspect).abs() <= ASPECT_TOLERANCE
+}
 
-    Some(filtered[0])
+/// Lower value = higher priority for tie-breaking.
+fn encoding_priority(encoding: CaptureEncoding) -> u8 {
+    // Compressed modes lose to every known raw format: decoding costs
+    // CPU and JPEG adds artefacts. They still win whenever they serve
+    // the request better (rules 1–3), which is their whole point.
+    const MJPEG_PRIORITY: u8 = 16;
+    match encoding {
+        CaptureEncoding::Raw(format) => format_priority(format),
+        CaptureEncoding::Mjpeg => MJPEG_PRIORITY,
+    }
 }
 
 /// Lower value = higher priority for tie-breaking.
@@ -411,16 +496,18 @@ pub fn pick_input_device(candidates: &[PathBuf], exclude: &[PathBuf]) -> Option<
     None
 }
 
-fn fourcc_to_pixel_format(fcc: FourCC) -> Option<PixelFormat> {
-    match &fcc.repr {
-        b"YUYV" => Some(PixelFormat::Yuy2),
-        b"NV12" => Some(PixelFormat::Nv12),
-        b"RGB3" => Some(PixelFormat::Rgb),
-        b"BGR3" => Some(PixelFormat::Bgr),
-        b"RGB4" => Some(PixelFormat::Rgba),
-        b"GREY" => Some(PixelFormat::Gray8),
-        _ => None,
-    }
+fn fourcc_to_encoding(fcc: FourCC) -> Option<CaptureEncoding> {
+    let raw = match &fcc.repr {
+        b"MJPG" | b"JPEG" => return Some(CaptureEncoding::Mjpeg),
+        b"YUYV" => PixelFormat::Yuy2,
+        b"NV12" => PixelFormat::Nv12,
+        b"RGB3" => PixelFormat::Rgb,
+        b"BGR3" => PixelFormat::Bgr,
+        b"RGB4" => PixelFormat::Rgba,
+        b"GREY" => PixelFormat::Gray8,
+        _ => return None,
+    };
+    Some(CaptureEncoding::Raw(raw))
 }
 
 #[cfg(test)]
@@ -435,14 +522,20 @@ mod tests {
             (*b"RGB3", PixelFormat::Rgb),
             (*b"GREY", PixelFormat::Gray8),
         ] {
-            assert_eq!(fourcc_to_pixel_format(FourCC::new(&code)), Some(fmt));
+            assert_eq!(
+                fourcc_to_encoding(FourCC::new(&code)),
+                Some(CaptureEncoding::Raw(fmt))
+            );
         }
     }
 
     #[test]
-    fn fourcc_returns_none_for_compressed() {
-        assert_eq!(fourcc_to_pixel_format(FourCC::new(b"MJPG")), None);
-        assert_eq!(fourcc_to_pixel_format(FourCC::new(b"H264")), None);
+    fn fourcc_maps_mjpeg_and_rejects_other_compressed() {
+        assert_eq!(
+            fourcc_to_encoding(FourCC::new(b"MJPG")),
+            Some(CaptureEncoding::Mjpeg)
+        );
+        assert_eq!(fourcc_to_encoding(FourCC::new(b"H264")), None);
     }
 
     #[test]
@@ -463,35 +556,124 @@ mod tests {
         NativeMode {
             width,
             height,
-            format,
+            encoding: CaptureEncoding::Raw(format),
+            fps,
+        }
+    }
+
+    fn req(width: u32, height: u32, fps: u32) -> ModeRequest {
+        ModeRequest { width, height, fps }
+    }
+
+    fn size(m: NativeMode) -> (u32, u32) {
+        (m.width, m.height)
+    }
+
+    /// Mode table of the UGREEN 2K camera's YUYV path (USB 2.0 caps the
+    /// large modes' frame rate).
+    fn ugreen_yuyv() -> Vec<NativeMode> {
+        vec![
+            mode(640, 480, PixelFormat::Yuy2, 30),
+            mode(800, 448, PixelFormat::Yuy2, 30),
+            mode(864, 480, PixelFormat::Yuy2, 25),
+            mode(1280, 720, PixelFormat::Yuy2, 10),
+            mode(1920, 1080, PixelFormat::Yuy2, 5),
+        ]
+    }
+
+    #[test]
+    fn select_best_prefers_exact_size_over_larger() {
+        // The old policy picked the largest area (864×480@25) and ran the
+        // camera at 25 fps although 800×448@30 was requested.
+        let chosen = select_best(ugreen_yuyv(), req(800, 448, 30)).expect("non-empty");
+        assert_eq!(size(chosen), (800, 448));
+        assert_eq!(chosen.fps, 30);
+    }
+
+    #[test]
+    fn select_best_drops_low_fps_modes() {
+        // 1280×720 exists but only at 10 fps: below the floor (25).
+        // Nothing covers 720p at full rate, so the largest fast mode wins.
+        let chosen = select_best(ugreen_yuyv(), req(1280, 720, 30)).expect("non-empty");
+        assert_eq!(size(chosen), (864, 480));
+    }
+
+    fn mjpeg(width: u32, height: u32, fps: u32) -> NativeMode {
+        NativeMode {
+            width,
+            height,
+            encoding: CaptureEncoding::Mjpeg,
             fps,
         }
     }
 
     #[test]
-    fn select_best_drops_low_fps_modes() {
-        // 1080p@5 is below floor (25), 720p@30 and 480p@30 survive.
-        // Among survivors 720p has larger area than 480p.
-        let cands = vec![
-            mode(1920, 1080, PixelFormat::Yuy2, 5),
-            mode(1280, 720, PixelFormat::Yuy2, 30),
-            mode(640, 480, PixelFormat::Yuy2, 30),
-        ];
-        let chosen = select_best(cands, 30).expect("non-empty input");
-        assert_eq!(chosen.width, 1280);
-        assert_eq!(chosen.height, 720);
+    fn select_best_takes_mjpeg_when_raw_is_too_slow() {
+        let mut cands = ugreen_yuyv();
+        cands.extend([mjpeg(1280, 720, 30), mjpeg(1920, 1080, 30)]);
+        let chosen = select_best(cands, req(1280, 720, 30)).expect("non-empty");
+        assert_eq!(size(chosen), (1280, 720));
+        assert_eq!(chosen.encoding, CaptureEncoding::Mjpeg);
         assert_eq!(chosen.fps, 30);
     }
 
     #[test]
-    fn select_best_prefers_larger_area_among_acceptable_fps() {
+    fn select_best_prefers_raw_when_both_serve_the_request() {
+        let mut cands = ugreen_yuyv();
+        cands.extend([mjpeg(800, 448, 30), mjpeg(1280, 720, 30)]);
+        let chosen = select_best(cands, req(800, 448, 30)).expect("non-empty");
+        assert_eq!(size(chosen), (800, 448));
+        assert_eq!(chosen.encoding, CaptureEncoding::Raw(PixelFormat::Yuy2));
+    }
+
+    #[test]
+    fn select_best_uses_mjpeg_only_camera() {
+        let cands = vec![mjpeg(1280, 720, 30), mjpeg(640, 480, 30)];
+        let chosen = select_best(cands, req(640, 480, 30)).expect("non-empty");
+        assert_eq!(size(chosen), (640, 480));
+        assert_eq!(chosen.encoding, CaptureEncoding::Mjpeg);
+    }
+
+    #[test]
+    fn source_caps_for_mjpeg_are_image_jpeg() {
+        crate::init().expect("gstreamer init");
+        let caps = mjpeg(1280, 720, 30).source_caps().expect("caps");
+        let s = caps.structure(0).expect("one structure");
+        assert_eq!(s.name(), "image/jpeg");
+        assert!(!s.has_field("format"));
+        assert_eq!(s.get::<i32>("width").expect("width"), 1280);
+    }
+
+    #[test]
+    fn select_best_prefers_smallest_covering_mode() {
         let cands = vec![
+            mode(1920, 1080, PixelFormat::Yuy2, 30),
             mode(1280, 720, PixelFormat::Yuy2, 30),
+            mode(640, 360, PixelFormat::Yuy2, 30),
+        ];
+        let chosen = select_best(cands, req(960, 540, 30)).expect("non-empty");
+        assert_eq!(size(chosen), (1280, 720));
+    }
+
+    #[test]
+    fn select_best_covering_prefers_requested_aspect() {
+        // 1280×960 is smaller, but 4:3 would be letterboxed into 16:9.
+        let cands = vec![
+            mode(1280, 960, PixelFormat::Yuy2, 30),
             mode(1920, 1080, PixelFormat::Yuy2, 30),
         ];
-        let chosen = select_best(cands, 30).expect("non-empty input");
-        assert_eq!(chosen.width, 1920);
-        assert_eq!(chosen.height, 1080);
+        let chosen = select_best(cands, req(1280, 720, 30)).expect("non-empty");
+        assert_eq!(size(chosen), (1920, 1080));
+    }
+
+    #[test]
+    fn select_best_short_prefers_largest_area() {
+        let cands = vec![
+            mode(640, 360, PixelFormat::Yuy2, 30),
+            mode(1280, 720, PixelFormat::Yuy2, 30),
+        ];
+        let chosen = select_best(cands, req(1920, 1080, 30)).expect("non-empty");
+        assert_eq!(size(chosen), (1280, 720));
     }
 
     #[test]
@@ -500,7 +682,7 @@ mod tests {
             mode(1280, 720, PixelFormat::Yuy2, 60),
             mode(1280, 720, PixelFormat::Yuy2, 30),
         ];
-        let chosen = select_best(cands, 30).expect("non-empty input");
+        let chosen = select_best(cands, req(1280, 720, 30)).expect("non-empty");
         assert_eq!(chosen.fps, 30);
     }
 
@@ -510,24 +692,52 @@ mod tests {
             mode(1280, 720, PixelFormat::Rgb, 30),
             mode(1280, 720, PixelFormat::Yuy2, 30),
         ];
-        let chosen = select_best(cands, 30).expect("non-empty input");
-        assert_eq!(chosen.format, PixelFormat::Yuy2);
+        let chosen = select_best(cands, req(1280, 720, 30)).expect("non-empty");
+        assert_eq!(chosen.encoding, CaptureEncoding::Raw(PixelFormat::Yuy2));
     }
 
     #[test]
     fn select_best_falls_back_to_highest_fps_when_all_low() {
-        // Both modes below floor (25): fallback picks highest fps.
+        // All modes below the floor (25): only the fastest ones remain,
+        // and among them the size policy still applies.
         let cands = vec![
             mode(640, 480, PixelFormat::Yuy2, 5),
             mode(640, 480, PixelFormat::Yuy2, 10),
+            mode(320, 240, PixelFormat::Yuy2, 10),
         ];
-        let chosen = select_best(cands, 30).expect("non-empty input");
+        let chosen = select_best(cands, req(640, 480, 30)).expect("non-empty");
         assert_eq!(chosen.fps, 10);
+        assert_eq!(size(chosen), (640, 480));
     }
 
     #[test]
     fn select_best_returns_none_on_empty() {
-        assert_eq!(select_best(Vec::new(), 30), None);
+        assert_eq!(select_best(Vec::new(), req(640, 480, 30)), None);
+    }
+
+    #[test]
+    fn source_caps_pin_mode_with_fps_range() {
+        crate::init().expect("gstreamer init");
+        let caps = mode(800, 448, PixelFormat::Yuy2, 30)
+            .source_caps()
+            .expect("caps");
+        let s = caps.structure(0).expect("one structure");
+        assert_eq!(s.name(), "video/x-raw");
+        assert_eq!(s.get::<&str>("format").expect("format"), "YUY2");
+        assert_eq!(s.get::<i32>("width").expect("width"), 800);
+        assert_eq!(s.get::<i32>("height").expect("height"), 448);
+        // A driver interval of 333333/10000000 s must fall in the range.
+        let exact = gstreamer::Caps::builder("video/x-raw")
+            .field("framerate", gstreamer::Fraction::new(10_000_000, 333_333))
+            .build();
+        let range_only = gstreamer::Caps::builder("video/x-raw")
+            .field(
+                "framerate",
+                s.get::<gstreamer::FractionRange>("framerate")
+                    .expect("range"),
+            )
+            .build();
+        assert!(exact.can_intersect(&range_only));
     }
 
     #[test]

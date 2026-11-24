@@ -11,8 +11,9 @@ your own setup.
 For each frame, the work is split between:
 
  - **Capture and output conversion.** GStreamer converts the camera format
-   (usually YUYV) to RGB and, depending on `output.format`, back to the output
-   format.
+   (YUYV, or MJPEG at high resolutions) to RGB and, depending on
+   `output.format`, back to the output format. Decoding MJPEG is the most
+   expensive part of this and grows with the capture resolution.
  - **Inference.** The segmentation model runs at 256x256, independent of the
    camera resolution. On an NPU this takes a few milliseconds of wall time but
    very little CPU: the processing thread mostly waits for the accelerator.

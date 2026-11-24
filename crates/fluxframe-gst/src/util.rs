@@ -42,15 +42,9 @@ pub(crate) fn build_caps(
     fps: u32,
     format: PixelFormat,
 ) -> Result<gstreamer::Caps, PipelineError> {
-    let width_i32 = i32::try_from(width).map_err(|_| PipelineError::CapsNegotiationFailed {
-        reason: format!("value too large for GStreamer: width={width}"),
-    })?;
-    let height_i32 = i32::try_from(height).map_err(|_| PipelineError::CapsNegotiationFailed {
-        reason: format!("value too large for GStreamer: height={height}"),
-    })?;
-    let fps_i32 = i32::try_from(fps).map_err(|_| PipelineError::CapsNegotiationFailed {
-        reason: format!("value too large for GStreamer: fps={fps}"),
-    })?;
+    let width_i32 = caps_i32("width", width)?;
+    let height_i32 = caps_i32("height", height)?;
+    let fps_i32 = caps_i32("fps", fps)?;
 
     let gst_fmt = pixel_format_to_gst(format);
     Ok(gstreamer::Caps::builder("video/x-raw")
@@ -59,6 +53,14 @@ pub(crate) fn build_caps(
         .field("height", height_i32)
         .field("framerate", gstreamer::Fraction::new(fps_i32, 1))
         .build())
+}
+
+/// Convert a caps field value to the `i32` GStreamer requires, rejecting
+/// values that do not fit instead of truncating them.
+pub(crate) fn caps_i32(field: &str, value: u32) -> Result<i32, PipelineError> {
+    i32::try_from(value).map_err(|_| PipelineError::CapsNegotiationFailed {
+        reason: format!("value too large for GStreamer: {field}={value}"),
+    })
 }
 
 /// Whether the V4L2 device is being opened for capture or for output.

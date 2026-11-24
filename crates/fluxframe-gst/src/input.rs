@@ -19,6 +19,7 @@ use tracing::{debug, error, trace};
 use crate::frame_conv::sample_to_frame;
 use crate::slot::LatestFrameSlot;
 use crate::util::{build_caps, check_v4l2_input_access, make_element};
+use crate::v4l2_caps::{CaptureEncoding, NativeMode};
 
 /// Capture pipeline owning the GStreamer elements and the shared frame slot.
 pub struct InputPipeline {
@@ -76,10 +77,13 @@ impl InputPipeline {
         testsrc.set_property("is-live", true);
         testsrc.set_property_from_str("pattern", "smpte");
 
-        Self::build(&testsrc, params)
+        Self::build(&[testsrc], &[], params)
     }
 
-    /// Build a `v4l2src`-based pipeline pointed at `device`.
+    /// Build a `v4l2src`-based pipeline pointed at `device`, pinning the
+    /// camera to `mode` (see [`crate::v4l2_caps::detect_native_mode`]).
+    /// `params` describes the frames delivered downstream; the pipeline
+    /// scales and converts from `mode` to them.
     ///
     /// Pre-opens `device` for reading so a missing device, busy device or
     /// permission failure surfaces as a structured
@@ -94,7 +98,11 @@ impl InputPipeline {
     /// * [`PipelineError::MissingElement`] when the `v4l2src` plugin is
     ///   not registered.
     /// * Other [`PipelineError`] variants from element/link construction.
-    pub fn build_v4l2(device: &Path, params: InputParams) -> Result<Self, PipelineError> {
+    pub fn build_v4l2(
+        device: &Path,
+        mode: &NativeMode,
+        params: InputParams,
+    ) -> Result<Self, PipelineError> {
         // The check returns the canonicalised path (symlinks resolved,
         // verified to be a /dev/ character device); feed that to v4l2src
         // rather than the user-supplied original so the pipeline targets
@@ -106,10 +114,26 @@ impl InputPipeline {
         // PTS based on the running clock — required for the downstream
         // `appsink` to publish meaningful capture timestamps.
         src.set_property("do-timestamp", true);
-        Self::build(&src, params)
+        // Without pinned caps `v4l2src` fixates a mode of its own, which
+        // need not be the one `mode` was chosen for (size, rate or
+        // encoding).
+        let src_caps = make_element("capsfilter", "input_src_caps")?;
+        src_caps.set_property("caps", mode.source_caps()?);
+        let decode = match mode.encoding {
+            CaptureEncoding::Raw(_) => Vec::new(),
+            CaptureEncoding::Mjpeg => vec![make_element("jpegdec", "input_jpegdec")?],
+        };
+        Self::build(&[src, src_caps], &decode, params)
     }
 
-    fn build(source: &gstreamer::Element, params: InputParams) -> Result<Self, PipelineError> {
+    /// Assemble `source… → queue → decode… → videoconvert → videoscale →
+    /// videorate → capsfilter → appsink`.  `decode` sits after the leaky
+    /// queue so a slow consumer drops compressed frames, not decoded ones.
+    fn build(
+        source: &[gstreamer::Element],
+        decode: &[gstreamer::Element],
+        params: InputParams,
+    ) -> Result<Self, PipelineError> {
         let pipeline = gstreamer::Pipeline::with_name("fluxframe-input");
 
         let queue = make_element("queue", "input_queue")?;
@@ -142,31 +166,29 @@ impl InputPipeline {
         appsink_elem.set_property("max-buffers", 1u32);
         appsink_elem.set_property("drop", true);
 
-        pipeline
-            .add_many([
-                source,
-                &queue,
+        let chain: Vec<&gstreamer::Element> = source
+            .iter()
+            .chain([&queue])
+            .chain(decode)
+            .chain([
                 &videoconvert,
                 &videoscale,
                 &videorate,
                 &capsfilter,
                 &appsink_elem,
             ])
+            .collect();
+
+        pipeline
+            .add_many(chain.iter().copied())
             .map_err(|e| PipelineError::Runtime {
                 reason: format!("pipeline.add_many failed: {e}"),
             })?;
 
-        gstreamer::Element::link_many([
-            source,
-            &queue,
-            &videoconvert,
-            &videoscale,
-            &videorate,
-            &capsfilter,
-            &appsink_elem,
-        ])
-        .map_err(|e| PipelineError::Runtime {
-            reason: format!("element link failed: {e}"),
+        gstreamer::Element::link_many(chain.iter().copied()).map_err(|e| {
+            PipelineError::Runtime {
+                reason: format!("element link failed: {e}"),
+            }
         })?;
 
         let appsink =
@@ -324,4 +346,40 @@ fn attach_appsink_callbacks(appsink: &AppSink, slot: LatestFrameSlot, sequence: 
             .build(),
     );
     debug!("input appsink callbacks installed");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    /// The MJPEG capture path (`queue → jpegdec → videoconvert …`) must
+    /// deliver decoded RGB frames at the requested size. A camera is not
+    /// needed: `videotestsrc → jpegenc` stands in for an MJPEG `v4l2src`.
+    #[test]
+    #[ignore = "requires GStreamer plugins; run with `cargo test -- --ignored`"]
+    fn mjpeg_decode_chain_produces_rgb_frames() {
+        crate::init().expect("gstreamer init");
+        let testsrc = make_element("videotestsrc", "input_src").expect("videotestsrc");
+        testsrc.set_property("is-live", true);
+        let jpegenc = make_element("jpegenc", "test_jpegenc").expect("jpegenc");
+        let jpegdec = make_element("jpegdec", "input_jpegdec").expect("jpegdec");
+
+        let params = InputParams::new(320, 180, 30, PixelFormat::Rgb);
+        let input = InputPipeline::build(&[testsrc, jpegenc], &[jpegdec], params).expect("build");
+        input.start().expect("start");
+
+        let slot = input.slot();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut frame = None;
+        while frame.is_none() && Instant::now() < deadline {
+            frame = slot.recv_timeout(Duration::from_millis(100));
+        }
+        input.stop().expect("stop");
+
+        let frame = frame.expect("at least one decoded frame within 2 s");
+        assert_eq!((frame.width, frame.height), (320, 180));
+        assert_eq!(frame.format, PixelFormat::Rgb);
+    }
 }

@@ -11,9 +11,10 @@
 # "auto" picks the first available camera; use a path such as
 # "/dev/video0" to pin a specific one.
 device = "auto"
-# Must be a mode the camera supports: v4l2-ctl --list-formats-ext
-# Processing cost grows with the frame area; the segmentation model
-# itself always runs at 256x256.
+# The daemon picks the camera mode that serves this size and rate best
+# (see `v4l2-ctl --list-formats-ext`), using MJPEG when the camera
+# reaches the size at full rate only that way. Processing cost grows
+# with the frame area; the segmentation model always runs at 256x256.
 width = 800
 height = 448
 fps = 30

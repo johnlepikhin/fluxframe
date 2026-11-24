@@ -1684,20 +1684,22 @@ pub(crate) fn run_v4l2_chain(
     control_rx: Option<&crossbeam_channel::Receiver<ControlEnvelope>>,
     chain: EffectChain,
 ) -> Result<(), FluxError> {
-    // Detect the camera's native fps so the operator's `[input] fps`
-    // hint becomes an upper bound, not a hard requirement: requesting
-    // 30 fps from a 15 fps camera silently capped to 15 is friendlier
-    // than failing the pipeline.
+    // Pick the camera mode that best serves the operator's `[input]
+    // width/height/fps` and pin the camera to it. The operator's fps is
+    // an upper bound, not a hard requirement: requesting 30 fps from a
+    // 15 fps camera silently capped to 15 is friendlier than failing
+    // the pipeline.
     //
-    // Width/height are NOT overridden — operator's `[input]
-    // width/height` is the source of truth and propagates through to
-    // the output dimensions (which v4l2loopback then exposes to
-    // consumers).  Doing it the other way (cfg follows camera) made
-    // the output size change every time the camera changed, which
-    // broke the v4l2loopback `VIDIOC_S_FMT` negotiation on switch
-    // and made the consumer-visible resolution non-deterministic.
-    // `videoscale` in the input pipeline pads with `add-borders=true`
-    // so the aspect ratio is preserved across the resize.
+    // Width/height delivered downstream are NOT overridden by the mode —
+    // operator's `[input] width/height` is the source of truth and
+    // propagates through to the output dimensions (which v4l2loopback
+    // then exposes to consumers).  Doing it the other way (cfg follows
+    // camera) made the output size change every time the camera
+    // changed, which broke the v4l2loopback `VIDIOC_S_FMT` negotiation
+    // on switch and made the consumer-visible resolution
+    // non-deterministic.  When the mode's size differs, `videoscale` in
+    // the input pipeline pads with `add-borders=true` so the aspect
+    // ratio is preserved across the resize.
     let device_path = match &cfg.input.device {
         InputDevice::Path(p) => p.clone(),
         // run_v4l2_chain is only reachable from the V4l2 branch of
@@ -1723,10 +1725,22 @@ pub(crate) fn run_v4l2_chain(
     // adopts the detected native fps (width/height stay operator-set).
     let device_path_for_builder = device_path.clone();
     run_chain(cfg, session, control_rx, chain, "v4l2src", move |params| {
-        let detected =
-            fluxframe_gst::v4l2_caps::detect_native_mode(&device_path_for_builder, params.fps)?;
-        let resolved = InputParams::new(params.width, params.height, detected.fps, params.format);
-        InputPipeline::build_v4l2(&device_path_for_builder, resolved)
+        let mode = fluxframe_gst::v4l2_caps::detect_native_mode(
+            &device_path_for_builder,
+            params.width,
+            params.height,
+            params.fps,
+        )?;
+        info!(
+            device = %device_path_for_builder.display(),
+            width = mode.width,
+            height = mode.height,
+            fps = mode.fps,
+            encoding = %mode.encoding,
+            "camera mode selected",
+        );
+        let resolved = InputParams::new(params.width, params.height, mode.fps, params.format);
+        InputPipeline::build_v4l2(&device_path_for_builder, &mode, resolved)
     })
 }
 
