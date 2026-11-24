@@ -4,6 +4,7 @@
 mod blur;
 mod color_fill;
 mod exposure_correct;
+mod halo;
 pub(crate) mod helpers;
 #[cfg(feature = "image-fill")]
 mod image_fill;
@@ -18,6 +19,7 @@ mod vignette;
 pub use blur::BlurPlaneEffect;
 pub use color_fill::ColorFillEffect;
 pub use exposure_correct::ExposureCorrectEffect;
+pub use halo::HaloEffect;
 #[cfg(feature = "image-fill")]
 pub use image_fill::ImageFillEffect;
 pub use passthrough::PassthroughPlaneEffect;

@@ -307,6 +307,20 @@ The mask is blurred at a quarter of the frame size, so even `blur = 0` leaves
 an edge a few pixels soft. Placed before `stained_glass`, the shadow is
 averaged into the glass cells; placed after it, the shadow lies over the glass.
 
+### `halo`
+
+Lights the plane around the person and dims it further away: a vignette
+centred on you rather than on the frame. Uses the mask. The halo moves only
+when you move and has no edges, so it does not draw attention.
+
+| Parameter | Type    | Default | Range    | Description                                          |
+| --------- | ------- | ------- | -------- | ---------------------------------------------------- |
+| `radius`  | integer | 60      | 8 to 256 | How far the halo reaches from the person, in pixels. |
+| `glow`    | float   | 0.15    | 0 to 1   | Brightening next to the person: 0 none, 1 double.    |
+| `dim`     | float   | 0.3     | 0 to 1   | Darkening far from the person: 0 none, 1 black.      |
+
+With `glow = 0` the effect only darkens the room away from you.
+
 ### `passthrough`
 
 Leaves the plane unchanged. No parameters.
