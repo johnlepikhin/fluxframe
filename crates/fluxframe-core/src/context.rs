@@ -52,6 +52,13 @@ pub struct FrameContext {
     /// Crop-before-processing handshake with the runtime's framing
     /// stage (see [`Framing`]).
     pub framing: Framing,
+    /// Set by an effect that holds frames back (a pipelined composite
+    /// delays its output by one frame) when it has nothing to emit for
+    /// this call: the first frame after a start or reset.  The runtime
+    /// then neither publishes the frame nor counts it as dropped, and
+    /// later effects in the chain do not run.  Reset by the runtime
+    /// before each frame.
+    pub output_withheld: bool,
 }
 
 /// Handshake between the runtime's framing stage, which cuts each

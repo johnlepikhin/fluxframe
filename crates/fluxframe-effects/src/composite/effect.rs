@@ -8,7 +8,9 @@
 //! in [`crate::composite::builder`] which the CLI invokes once at
 //! startup.
 
-use fluxframe_core::context::{FrameContext, ProcessingContext};
+use std::time::{Duration, Instant};
+
+use fluxframe_core::context::{FrameContext, FramingSource, ProcessingContext};
 use fluxframe_core::error::EffectError;
 use fluxframe_core::frame::{PixelFormat, VideoFrame};
 use fluxframe_core::metrics::StageKey;
@@ -16,6 +18,7 @@ use fluxframe_core::plane::{
     FramePlane, MaskEffect, MaskPlane, PlaneEffect, PostEffect, SubchainKind,
 };
 use fluxframe_core::traits::{RawEffectParams, VideoEffect};
+use tracing::info;
 
 use crate::composite::segmentation::{SegmentationBase, SegmentationOutcome};
 use crate::processing::compose::alpha_composite_rgb_in_place;
@@ -23,6 +26,11 @@ use crate::processing::resize_mask_bilinear;
 
 /// Scope under which the composite's own stages are reported.
 const SCOPE: &str = "composite";
+
+/// A held frame older than this is not emitted: the stream stalled
+/// (camera recovery, idle, a slow control command) and both the frame
+/// and the recurrent model state it was computed with are stale.
+const STALE_HELD_FRAME: Duration = Duration::from_millis(500);
 
 /// Time `f` and publish the elapsed wall-clock under `key` through the
 /// frame's telemetry sink (a no-op sink costs one `Instant::now`
@@ -75,6 +83,21 @@ pub struct CompositeEffect {
     /// newly-injected sub-effects against the right resolution.
     /// `None` before the first `prepare()`.
     processing_ctx: Option<ProcessingContext>,
+    /// Pipelined segmentation only: the frame whose inference is in
+    /// flight, emitted on the next call.
+    held: Option<HeldFrame>,
+}
+
+/// A frame waiting for its mask while the next one is captured.
+struct HeldFrame {
+    frame: VideoFrame,
+    /// The frame's [`fluxframe_core::context::Framing::source`]:
+    /// `auto_frame` must steer in the coordinates of the frame it sees.
+    framing_source: Option<FramingSource>,
+    /// Inference was started for it; `false` after a transient failure
+    /// — the frame goes out unprocessed.
+    submitted: bool,
+    held_at: Instant,
 }
 
 /// Typed envelope of the four possible sub-chain payloads handed to
@@ -148,6 +171,7 @@ impl CompositeEffect {
             frame_w: 0,
             frame_h: 0,
             processing_ctx: None,
+            held: None,
         }
     }
 
@@ -184,6 +208,23 @@ impl CompositeEffect {
     #[must_use]
     pub fn segmentation(&self) -> &SegmentationBase {
         &self.segmentation
+    }
+
+    /// Drop the held frame and the pass in flight, and reset the
+    /// segmentation model's recurrent state: the next frame starts the
+    /// pipeline afresh (and is withheld).  Call before anything that
+    /// breaks frame continuity — unloading the engine, a jump of the
+    /// framing window.  No-op beyond the state reset when not pipelined.
+    pub fn abort_pipeline(&mut self) {
+        self.held = None;
+        self.segmentation.abort();
+    }
+
+    /// Frames by which the output trails the input: 1 when segmentation
+    /// is pipelined, 0 otherwise.  Valid after `prepare`.
+    #[must_use]
+    pub fn latency_frames(&self) -> u32 {
+        u32::from(self.segmentation.pipelined())
     }
 
     /// Replace one of the composite's sub-chains. New effects must
@@ -248,6 +289,180 @@ impl CompositeEffect {
             SubchainKind::Foreground => disabled(&self.fg_chain),
             SubchainKind::Post => disabled(&self.post_chain),
         }
+    }
+}
+
+impl CompositeEffect {
+    /// Pipelined frame: collect the mask of the held frame N-1, start
+    /// inference on the incoming frame N, then hand frame N-1 back to
+    /// the caller with the rest of the pipeline applied.  The inference
+    /// of N overlaps that work and the wait for the next capture.  The
+    /// first call after a reset has nothing to emit and sets
+    /// [`FrameContext::output_withheld`].
+    fn process_pipelined(
+        &mut self,
+        frame: &mut VideoFrame,
+        ctx: &mut FrameContext,
+    ) -> Result<(), EffectError> {
+        if self
+            .held
+            .as_ref()
+            .is_some_and(|h| h.held_at.elapsed() > STALE_HELD_FRAME)
+        {
+            self.abort_pipeline();
+        }
+        let held = self.held.take();
+        let t_seg = Instant::now();
+        // Collect N-1 first: the engine has one pass in flight at most.
+        let outcome = match &held {
+            Some(h) if h.submitted => self.segmentation.finish(ctx),
+            _ => SegmentationOutcome::Fallback,
+        };
+        if let SegmentationOutcome::Fatal(err) = outcome {
+            return Err(err);
+        }
+        frame.data.make_owned();
+        let submitted = self.segmentation.begin(frame, ctx)?;
+        ctx.telemetry
+            .record_stage(StageKey::new(SCOPE, "seg"), t_seg.elapsed());
+
+        let incoming_source = ctx.framing.source;
+        let Some(held) = held else {
+            self.held = Some(HeldFrame {
+                frame: frame.clone(),
+                framing_source: incoming_source,
+                submitted,
+                held_at: Instant::now(),
+            });
+            ctx.output_withheld = true;
+            return Ok(());
+        };
+        let incoming = std::mem::replace(frame, held.frame);
+        self.held = Some(HeldFrame {
+            frame: incoming,
+            framing_source: incoming_source,
+            submitted,
+            held_at: Instant::now(),
+        });
+        // From here on the context describes the emitted frame N-1.
+        ctx.frame_sequence = frame.meta.sequence;
+        ctx.frame_timestamp = frame.meta.timestamp;
+        ctx.framing.source = held.framing_source;
+
+        if let SegmentationOutcome::Ok { width, height } = outcome {
+            self.apply_mask(frame, ctx, width, height)
+        } else {
+            // No mask for N-1: it failed, or was never submitted.
+            ctx.fallback_active = true;
+            Ok(())
+        }
+    }
+
+    /// Everything after segmentation: mask chain, resize to frame size,
+    /// background / foreground chains, compose, post chain.
+    fn apply_mask(
+        &mut self,
+        frame: &mut VideoFrame,
+        ctx: &mut FrameContext,
+        mask_w: u32,
+        mask_h: u32,
+    ) -> Result<(), EffectError> {
+        // 2. Mask chain at model resolution.
+        timed(ctx, StageKey::new(SCOPE, "mask_chain"), |ctx| {
+            let mut mask_plane = MaskPlane::new(self.segmentation.mask_mut(), mask_w, mask_h);
+            for slot in self.mask_chain.iter_mut().filter(|slot| slot.enabled) {
+                let effect = &mut slot.effect;
+                timed(
+                    ctx,
+                    StageKey::new(SubchainKind::Mask.as_str(), effect.name()),
+                    |ctx| effect.process(&mut mask_plane, ctx),
+                )?;
+            }
+            Ok::<(), EffectError>(())
+        })?;
+
+        // 3. Resize mask to frame resolution. The composite owns the
+        //    implicit upscale — mask effects never resize.  Timed
+        //    separately from the chain: this is the frame-res part.
+        timed(ctx, StageKey::new(SCOPE, "mask_resize"), |_| {
+            resize_mask_bilinear(
+                self.segmentation.mask(),
+                mask_w,
+                mask_h,
+                &mut self.mask_full,
+                self.frame_w,
+                self.frame_h,
+            );
+        });
+
+        // 4. Promote the frame buffer to Owned so we can mutate it
+        //    directly as the foreground plane.
+        frame.data.make_owned();
+        let Some(frame_bytes) = frame.data.as_mut_owned() else {
+            return Err(process_err(
+                "frame buffer not owned after make_owned (FrameBuffer invariant broken)",
+            ));
+        };
+
+        // 5. Snapshot the original frame into `bg_plane`. This is the
+        //    only full-frame copy in the composite hot path.
+        timed(ctx, StageKey::new(SCOPE, "bg_copy"), |_| {
+            self.bg_plane.copy_from_slice(frame_bytes);
+        });
+
+        // 6. Background chain runs on the snapshot.
+        timed(ctx, StageKey::new(SCOPE, "bg_chain"), |ctx| {
+            let mut background = FramePlane::new(&mut self.bg_plane, self.frame_w, self.frame_h);
+            for slot in self.bg_chain.iter_mut().filter(|slot| slot.enabled) {
+                let effect = &mut slot.effect;
+                timed(
+                    ctx,
+                    StageKey::new(SubchainKind::Background.as_str(), effect.name()),
+                    |ctx| effect.process(&mut background, ctx),
+                )?;
+            }
+            Ok::<(), EffectError>(())
+        })?;
+
+        // 7. Foreground chain runs in place on `frame.data`.
+        timed(ctx, StageKey::new(SCOPE, "fg_chain"), |ctx| {
+            let mut foreground = FramePlane::new(frame_bytes, self.frame_w, self.frame_h);
+            for slot in self.fg_chain.iter_mut().filter(|slot| slot.enabled) {
+                let effect = &mut slot.effect;
+                timed(
+                    ctx,
+                    StageKey::new(SubchainKind::Foreground.as_str(), effect.name()),
+                    |ctx| effect.process(&mut foreground, ctx),
+                )?;
+            }
+            Ok::<(), EffectError>(())
+        })?;
+
+        // 8. Composite bg into fg/frame in place using the parallel
+        //    helper.
+        timed(ctx, StageKey::new(SCOPE, "compose"), |_| {
+            alpha_composite_rgb_in_place(frame_bytes, &self.bg_plane, &self.mask_full);
+        });
+
+        // 9. Post chain. Each post-effect mutates the composed frame
+        //    while reading the upscaled mask. Split-borrow so the
+        //    mask buffer can be passed as `&MaskPlane` without
+        //    clashing with `&mut self.post_chain`.
+        timed(ctx, StageKey::new(SCOPE, "post_chain"), |ctx| {
+            let mut composed = FramePlane::new(frame_bytes, self.frame_w, self.frame_h);
+            let mask_plane = MaskPlane::new(&mut self.mask_full, self.frame_w, self.frame_h);
+            for slot in self.post_chain.iter_mut().filter(|slot| slot.enabled) {
+                let effect = &mut slot.effect;
+                timed(
+                    ctx,
+                    StageKey::new(SubchainKind::Post.as_str(), effect.name()),
+                    |ctx| effect.process(&mut composed, &mask_plane, ctx),
+                )?;
+            }
+            Ok::<(), EffectError>(())
+        })?;
+
+        Ok(())
     }
 }
 
@@ -361,6 +576,7 @@ impl VideoEffect for CompositeEffect {
             });
         }
 
+        self.held = None;
         self.segmentation.prepare(context)?;
         // Disabled effects are prepared too, so enabling one is instant.
         for slot in &mut self.mask_chain {
@@ -383,6 +599,9 @@ impl VideoEffect for CompositeEffect {
         self.mask_full = vec![0.0_f32; frame_pixels];
         self.bg_plane = vec![0_u8; frame_bytes];
         self.processing_ctx = Some(context.clone());
+        if self.segmentation.pipelined() {
+            info!("segmentation runs one frame ahead: output is delayed by one frame");
+        }
         Ok(())
     }
 
@@ -404,114 +623,25 @@ impl VideoEffect for CompositeEffect {
             )));
         }
 
+        if self.segmentation.pipelined() {
+            return self.process_pipelined(frame, ctx);
+        }
         // 1. Segmentation produces a mask at model resolution.
         let seg_result = timed(ctx, StageKey::new(SCOPE, "seg"), |ctx| {
             self.segmentation.process(frame, ctx)
         });
-        let (mask_w, mask_h) = match seg_result {
-            SegmentationOutcome::Ok { width, height } => (width, height),
+        match seg_result {
+            SegmentationOutcome::Ok { width, height } => self.apply_mask(frame, ctx, width, height),
             SegmentationOutcome::Fallback => {
                 ctx.fallback_active = true;
-                return Ok(());
+                Ok(())
             }
-            SegmentationOutcome::Fatal(err) => return Err(err),
-        };
+            SegmentationOutcome::Fatal(err) => Err(err),
+        }
+    }
 
-        // 2. Mask chain at model resolution.
-        timed(ctx, StageKey::new(SCOPE, "mask_chain"), |ctx| {
-            let mut mask_plane = MaskPlane::new(self.segmentation.mask_mut(), mask_w, mask_h);
-            for slot in self.mask_chain.iter_mut().filter(|slot| slot.enabled) {
-                let effect = &mut slot.effect;
-                timed(
-                    ctx,
-                    StageKey::new(SubchainKind::Mask.as_str(), effect.name()),
-                    |ctx| effect.process(&mut mask_plane, ctx),
-                )?;
-            }
-            Ok::<(), EffectError>(())
-        })?;
-
-        // 3. Resize mask to frame resolution. The composite owns the
-        //    implicit upscale — mask effects never resize.  Timed
-        //    separately from the chain: this is the frame-res part.
-        timed(ctx, StageKey::new(SCOPE, "mask_resize"), |_| {
-            resize_mask_bilinear(
-                self.segmentation.mask(),
-                mask_w,
-                mask_h,
-                &mut self.mask_full,
-                self.frame_w,
-                self.frame_h,
-            );
-        });
-
-        // 4. Promote the frame buffer to Owned so we can mutate it
-        //    directly as the foreground plane.
-        frame.data.make_owned();
-        let Some(frame_bytes) = frame.data.as_mut_owned() else {
-            return Err(process_err(
-                "frame buffer not owned after make_owned (FrameBuffer invariant broken)",
-            ));
-        };
-
-        // 5. Snapshot the original frame into `bg_plane`. This is the
-        //    only full-frame copy in the composite hot path.
-        timed(ctx, StageKey::new(SCOPE, "bg_copy"), |_| {
-            self.bg_plane.copy_from_slice(frame_bytes);
-        });
-
-        // 6. Background chain runs on the snapshot.
-        timed(ctx, StageKey::new(SCOPE, "bg_chain"), |ctx| {
-            let mut background = FramePlane::new(&mut self.bg_plane, self.frame_w, self.frame_h);
-            for slot in self.bg_chain.iter_mut().filter(|slot| slot.enabled) {
-                let effect = &mut slot.effect;
-                timed(
-                    ctx,
-                    StageKey::new(SubchainKind::Background.as_str(), effect.name()),
-                    |ctx| effect.process(&mut background, ctx),
-                )?;
-            }
-            Ok::<(), EffectError>(())
-        })?;
-
-        // 7. Foreground chain runs in place on `frame.data`.
-        timed(ctx, StageKey::new(SCOPE, "fg_chain"), |ctx| {
-            let mut foreground = FramePlane::new(frame_bytes, self.frame_w, self.frame_h);
-            for slot in self.fg_chain.iter_mut().filter(|slot| slot.enabled) {
-                let effect = &mut slot.effect;
-                timed(
-                    ctx,
-                    StageKey::new(SubchainKind::Foreground.as_str(), effect.name()),
-                    |ctx| effect.process(&mut foreground, ctx),
-                )?;
-            }
-            Ok::<(), EffectError>(())
-        })?;
-
-        // 8. Composite bg into fg/frame in place using the parallel
-        //    helper.
-        timed(ctx, StageKey::new(SCOPE, "compose"), |_| {
-            alpha_composite_rgb_in_place(frame_bytes, &self.bg_plane, &self.mask_full);
-        });
-
-        // 9. Post chain. Each post-effect mutates the composed frame
-        //    while reading the upscaled mask. Split-borrow so the
-        //    mask buffer can be passed as `&MaskPlane` without
-        //    clashing with `&mut self.post_chain`.
-        timed(ctx, StageKey::new(SCOPE, "post_chain"), |ctx| {
-            let mut composed = FramePlane::new(frame_bytes, self.frame_w, self.frame_h);
-            let mask_plane = MaskPlane::new(&mut self.mask_full, self.frame_w, self.frame_h);
-            for slot in self.post_chain.iter_mut().filter(|slot| slot.enabled) {
-                let effect = &mut slot.effect;
-                timed(
-                    ctx,
-                    StageKey::new(SubchainKind::Post.as_str(), effect.name()),
-                    |ctx| effect.process(&mut composed, &mask_plane, ctx),
-                )?;
-            }
-            Ok::<(), EffectError>(())
-        })?;
-
+    fn shutdown(&mut self) -> Result<(), EffectError> {
+        self.abort_pipeline();
         Ok(())
     }
 

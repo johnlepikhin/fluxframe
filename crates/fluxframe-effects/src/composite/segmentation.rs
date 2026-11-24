@@ -11,13 +11,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use fluxframe_core::Counters;
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::{EffectError, InferenceError};
 use fluxframe_core::frame::{PixelFormat, VideoFrame};
 use fluxframe_core::metrics::StageKey;
-use fluxframe_core::traits::{InferenceEngine, InferenceInput};
+use fluxframe_core::traits::{InferenceEngine, InferenceInput, InferenceOutput};
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -161,6 +162,10 @@ pub struct SegmentationBase {
 
     // Fallback tracking.
     consecutive_failures: u32,
+
+    /// When the pass started by [`Self::begin`] was submitted; `None`
+    /// when nothing is in flight.
+    in_flight: Option<Instant>,
 }
 
 impl SegmentationBase {
@@ -181,6 +186,7 @@ impl SegmentationBase {
             model_w: 0,
             model_h: 0,
             consecutive_failures: 0,
+            in_flight: None,
         }
     }
 
@@ -243,6 +249,7 @@ impl SegmentationBase {
     /// `None` if no engine is currently held.
     #[must_use]
     pub fn take_engine(&mut self) -> Option<Box<dyn InferenceEngine + Send>> {
+        self.abort();
         self.engine.take()
     }
 
@@ -305,8 +312,13 @@ impl SegmentationBase {
                     source: e,
                 }
             })?;
+        let mut model_config = model_config;
+        model_config.resolve_input_size(context.width, context.height);
         self.model_w = model_config.input_width;
         self.model_h = model_config.input_height;
+        // A pass of the engine being replaced is waited out when that
+        // engine drops; its result belongs to the old session.
+        self.in_flight = None;
 
         let engine = build_engine(
             self.inference_factory.take(),
@@ -342,7 +354,7 @@ impl SegmentationBase {
             InputLayout::Nhwc => [1, self.model_h as usize, self.model_w as usize, 3],
             InputLayout::Nchw => [1, 3, self.model_h as usize, self.model_w as usize],
         };
-        let warmup_start = std::time::Instant::now();
+        let warmup_start = Instant::now();
         if let Some(engine) = self.engine.as_mut() {
             match engine.infer(InferenceInput {
                 data: &self.model_input_f32,
@@ -355,19 +367,32 @@ impl SegmentationBase {
                 ),
                 Err(e) => warn!(error = %e, "inference engine pre-warm failed; continuing anyway"),
             }
+            // The warm-up frame is not part of the stream.
+            engine.reset_state();
         }
 
         info!(
             model = %self.config.model.display(),
             frame = ?(context.width, context.height),
             model_input = ?(self.model_w, self.model_h),
+            pipelined = self.pipelined(),
             "segmentation prepared",
         );
         Ok(())
     }
 
-    /// Run inference on `frame`. On success the mask at model
-    /// resolution lives in [`Self::mask`].
+    /// Whether inference runs one frame ahead of the rest of the
+    /// pipeline ([`Self::begin`] / [`Self::finish`]): the model asks for
+    /// it (`pipeline = true` in its sidecar) and the engine can run a
+    /// pass without blocking.  Valid after [`Self::prepare`].
+    #[must_use]
+    pub fn pipelined(&self) -> bool {
+        self.model_config.as_ref().is_some_and(|c| c.pipeline)
+            && self.engine.as_ref().is_some_and(|e| e.supports_async())
+    }
+
+    /// Run inference on `frame` and wait for it. On success the mask at
+    /// model resolution lives in [`Self::mask`].
     ///
     /// Sequence:
     /// 1. Bilinear resize frame → `model_input_u8`.
@@ -380,14 +405,122 @@ impl SegmentationBase {
     /// returns [`SegmentationOutcome::Fallback`] until the threshold
     /// is crossed.
     pub fn process(&mut self, frame: &VideoFrame, ctx: &mut FrameContext) -> SegmentationOutcome {
+        let shape = match self.preprocess(frame, ctx) {
+            Ok(shape) => shape,
+            Err(fatal) => return SegmentationOutcome::Fatal(fatal),
+        };
+        let Some(engine) = self.engine.as_mut() else {
+            return SegmentationOutcome::Fatal(process_err("process called before prepare"));
+        };
+        let t_inf = Instant::now();
+        let result = engine.infer(InferenceInput {
+            data: &self.model_input_f32,
+            shape: &shape,
+        });
+        match result {
+            Ok(output) => {
+                ctx.telemetry.record_inference(t_inf.elapsed());
+                self.decode_output(&output, ctx)
+            }
+            Err(e) => self.on_inference_failure(e),
+        }
+    }
+
+    /// First half of a pipelined pass: preprocess `frame` and start
+    /// inference on it without waiting.  Collect the mask with
+    /// [`Self::finish`].
+    ///
+    /// Returns `Ok(true)` when the pass is in flight, `Ok(false)` when
+    /// it failed transiently (counted towards `fallback_threshold`;
+    /// the frame goes out unprocessed).
+    ///
+    /// # Errors
+    ///
+    /// The failure budget is exhausted, the frame does not match the
+    /// prepared size, or a pass is already in flight.
+    pub fn begin(
+        &mut self,
+        frame: &VideoFrame,
+        ctx: &mut FrameContext,
+    ) -> Result<bool, EffectError> {
+        if self.in_flight.is_some() {
+            return Err(process_err("begin called with a pass already in flight"));
+        }
+        let t_submit = Instant::now();
+        let shape = self.preprocess(frame, ctx)?;
+        let Some(engine) = self.engine.as_mut() else {
+            return Err(process_err("begin called before prepare"));
+        };
+        let started = engine.start(InferenceInput {
+            data: &self.model_input_f32,
+            shape: &shape,
+        });
+        ctx.telemetry
+            .record_stage(StageKey::new(SEG_SCOPE, "submit"), t_submit.elapsed());
+        match started {
+            Ok(()) => {
+                self.in_flight = Some(Instant::now());
+                Ok(true)
+            }
+            Err(e) => match self.on_inference_failure(e) {
+                SegmentationOutcome::Fatal(err) => Err(err),
+                _ => Ok(false),
+            },
+        }
+    }
+
+    /// Second half of a pipelined pass: wait for the pass started by
+    /// [`Self::begin`] and decode its mask.  Same outcomes as
+    /// [`Self::process`].
+    pub fn finish(&mut self, ctx: &mut FrameContext) -> SegmentationOutcome {
+        let Some(submitted) = self.in_flight.take() else {
+            return SegmentationOutcome::Fatal(process_err("finish called with no pass in flight"));
+        };
+        let Some(engine) = self.engine.as_mut() else {
+            return SegmentationOutcome::Fatal(process_err("finish called without an engine"));
+        };
+        let t_wait = Instant::now();
+        let result = engine.wait();
+        ctx.telemetry
+            .record_stage(StageKey::new(SEG_SCOPE, "wait"), t_wait.elapsed());
+        // Submission to completion; an upper bound of the pass itself,
+        // which may have finished well before `wait` was called.
+        ctx.telemetry
+            .record_stage(StageKey::new(SEG_SCOPE, "in_flight"), submitted.elapsed());
+        match result {
+            Ok(output) => {
+                ctx.telemetry.record_inference(submitted.elapsed());
+                self.decode_output(&output, ctx)
+            }
+            Err(e) => self.on_inference_failure(e),
+        }
+    }
+
+    /// Drop the pass in flight, if any, and the state a recurrent
+    /// model carries between frames: the next pass starts afresh.
+    /// Blocks for at most the remainder of the pass in flight.
+    pub fn abort(&mut self) {
+        self.in_flight = None;
+        if let Some(engine) = self.engine.as_mut() {
+            engine.reset_state();
+        }
+    }
+
+    /// Validate `frame`, resize it to the model input and pack it into
+    /// `model_input_f32`.  Returns the input tensor shape.
+    fn preprocess(
+        &mut self,
+        frame: &VideoFrame,
+        ctx: &mut FrameContext,
+    ) -> Result<[usize; 4], EffectError> {
         if frame.format != PixelFormat::Rgb {
-            return SegmentationOutcome::Fatal(process_err(format!(
+            return Err(process_err(format!(
                 "unexpected pixel format {:?}",
                 frame.format
             )));
         }
         if frame.width != self.frame_w || frame.height != self.frame_h {
-            return SegmentationOutcome::Fatal(process_err(format!(
+            return Err(process_err(format!(
                 "frame {}x{} differs from prepared {}x{}",
                 frame.width, frame.height, self.frame_w, self.frame_h
             )));
@@ -397,12 +530,10 @@ impl SegmentationBase {
             .as_ref()
             .map(|c| (c.input_scale, c.input_zero_point, c.input_layout))
         else {
-            return SegmentationOutcome::Fatal(process_err("process called before prepare"));
+            return Err(process_err("process called before prepare"));
         };
 
-        // 1. Resize frame → model_input_u8 (bilinear stretch) and
-        // 2. normalise + pack.  Timed together as `seg/preprocess`.
-        let t_pre = std::time::Instant::now();
+        let t_pre = Instant::now();
         resize_rgb_bilinear(
             frame.data.as_slice(),
             frame.width,
@@ -423,54 +554,52 @@ impl SegmentationBase {
         ctx.telemetry
             .record_stage(StageKey::new(SEG_SCOPE, "preprocess"), t_pre.elapsed());
 
-        // 3. Build input shape.
-        let shape: [usize; 4] = match layout {
+        Ok(match layout {
             InputLayout::Nhwc => [1, self.model_h as usize, self.model_w as usize, 3],
             InputLayout::Nchw => [1, 3, self.model_h as usize, self.model_w as usize],
-        };
+        })
+    }
 
-        // 4. Infer.
-        let Some(engine) = self.engine.as_mut() else {
-            return SegmentationOutcome::Fatal(process_err("process called before prepare"));
-        };
-        let t_inf = std::time::Instant::now();
-        let output = match engine.infer(InferenceInput {
-            data: &self.model_input_f32,
-            shape: &shape,
-        }) {
-            Ok(out) => {
-                self.consecutive_failures = 0;
-                out
-            }
-            Err(e) => {
-                self.consecutive_failures += 1;
-                let fails = self.consecutive_failures;
-                if fails.is_power_of_two() {
-                    warn!(
-                        error = %e,
-                        consecutive = fails,
-                        threshold = self.config.fallback_threshold,
-                        "inference failed; passing frame through"
-                    );
-                }
-                if fails >= self.config.fallback_threshold {
-                    return SegmentationOutcome::Fatal(EffectError::Inference {
-                        name: "segmentation".to_string(),
-                        source: e,
-                    });
-                }
-                return SegmentationOutcome::Fallback;
-            }
-        };
-        ctx.telemetry.record_inference(t_inf.elapsed());
+    /// Count a failed pass: [`SegmentationOutcome::Fallback`] until the
+    /// failure budget is exhausted, then [`SegmentationOutcome::Fatal`].
+    /// A recurrent model's state is dropped — the frame it would have
+    /// carried over was never seen.
+    fn on_inference_failure(&mut self, e: InferenceError) -> SegmentationOutcome {
+        if let Some(engine) = self.engine.as_mut() {
+            engine.reset_state();
+        }
+        self.consecutive_failures += 1;
+        let fails = self.consecutive_failures;
+        if fails.is_power_of_two() {
+            warn!(
+                error = %e,
+                consecutive = fails,
+                threshold = self.config.fallback_threshold,
+                "inference failed; passing frame through"
+            );
+        }
+        if fails >= self.config.fallback_threshold {
+            return SegmentationOutcome::Fatal(EffectError::Inference {
+                name: "segmentation".to_string(),
+                source: e,
+            });
+        }
+        SegmentationOutcome::Fallback
+    }
 
-        // 5. Decode output into mask_raw.
+    /// Decode a successful pass into `mask_raw`.
+    fn decode_output(
+        &mut self,
+        output: &InferenceOutput,
+        ctx: &mut FrameContext,
+    ) -> SegmentationOutcome {
+        self.consecutive_failures = 0;
         let Some(model_config) = self.model_config.as_ref() else {
             return SegmentationOutcome::Fatal(process_err(
                 "model_config missing — process called before prepare",
             ));
         };
-        let t_dec = std::time::Instant::now();
+        let t_dec = Instant::now();
         let decoded = decode_mask(
             &output.data,
             &output.shape,
@@ -482,7 +611,6 @@ impl SegmentationBase {
         if let Err(err) = decoded {
             return SegmentationOutcome::Fatal(err);
         }
-
         SegmentationOutcome::Ok {
             width: self.model_w,
             height: self.model_h,

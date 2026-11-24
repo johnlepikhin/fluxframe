@@ -352,6 +352,18 @@ impl OpenVinoEngine {
     }
 }
 
+impl Drop for OpenVinoEngine {
+    /// Wait out a pass still in flight: it writes into tensors this
+    /// engine owns.
+    fn drop(&mut self) {
+        if self.in_flight
+            && let Err(e) = self.request.wait(WAIT_TIMEOUT_MS)
+        {
+            warn!(error = %e, "in-flight pass did not finish before the engine was dropped");
+        }
+    }
+}
+
 /// Check that the sidecar's state pairs name real ports and do not
 /// collide with the frame input or the consumed output.
 fn check_state_names(

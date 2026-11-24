@@ -116,6 +116,11 @@ impl EffectChain {
                 .telemetry
                 .record_stage(StageKey::new("chain", effect.name()), start.elapsed());
             result?;
+            // Nothing to emit this time: later effects would only
+            // process a frame that is never published.
+            if context.output_withheld {
+                break;
+            }
         }
         Ok(())
     }
@@ -273,6 +278,7 @@ mod tests {
         log: Arc<Mutex<Vec<&'static str>>>,
         fail_on_process: bool,
         fail_on_shutdown: bool,
+        withhold_output: bool,
     }
 
     impl RecordingEffect {
@@ -282,6 +288,7 @@ mod tests {
                 log,
                 fail_on_process: false,
                 fail_on_shutdown: false,
+                withhold_output: false,
             }
         }
     }
@@ -303,9 +310,10 @@ mod tests {
         fn process(
             &mut self,
             _frame: &mut VideoFrame,
-            _context: &mut FrameContext,
+            context: &mut FrameContext,
         ) -> Result<(), EffectError> {
             self.log.lock().unwrap().push(self.label);
+            context.output_withheld |= self.withhold_output;
             if self.fail_on_process {
                 return Err(EffectError::ProcessFailed {
                     name: self.label.to_string(),
@@ -384,6 +392,27 @@ mod tests {
         let res = chain.process(&mut frame, &mut frame_context);
 
         assert!(res.is_err(), "expected error propagation");
+        assert_eq!(*log.lock().unwrap(), vec!["A", "B"]);
+    }
+
+    #[test]
+    fn process_stops_after_an_effect_withholds_its_output() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut holding_b = RecordingEffect::new("B", Arc::clone(&log));
+        holding_b.withhold_output = true;
+        let chain_effects: Vec<Box<dyn VideoEffect>> = vec![
+            Box::new(RecordingEffect::new("A", Arc::clone(&log))),
+            Box::new(holding_b),
+            Box::new(RecordingEffect::new("C", Arc::clone(&log))),
+        ];
+        let mut chain = EffectChain::new(chain_effects);
+
+        let mut frame = make_frame();
+        let mut frame_context = FrameContext::default();
+        chain
+            .process(&mut frame, &mut frame_context)
+            .expect("withholding is not an error");
+        assert!(frame_context.output_withheld);
         assert_eq!(*log.lock().unwrap(), vec!["A", "B"]);
     }
 

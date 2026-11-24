@@ -2864,6 +2864,7 @@ fn process_one_frame(
     state.frame_context.frame_sequence = frame.meta.sequence;
     state.frame_context.frame_timestamp = frame.meta.timestamp;
     state.frame_context.fallback_active = false;
+    state.frame_context.output_withheld = false;
 
     let pre_process = Instant::now();
     let region = state.framing_region;
@@ -2894,6 +2895,12 @@ fn process_one_frame(
         return Err(FluxError::from(e));
     }
     metrics.processing.record_duration(pre_process.elapsed());
+    if state.frame_context.output_withheld {
+        // A pipelined effect took the frame and has none to give back
+        // yet (first frame after a start or reset).  The window stays;
+        // the frame is neither published nor dropped.
+        return Ok(());
+    }
     // A pass that fell back (no fresh mask) keeps the window; a normal
     // pass without a framing request — no `auto_frame` in the preset, or
     // it is disabled — returns to the full view.

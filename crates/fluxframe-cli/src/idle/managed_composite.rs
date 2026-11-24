@@ -124,6 +124,9 @@ impl ManagedComposite {
     /// sees `ready = true` without an engine.
     pub(crate) fn unload(&mut self) {
         self.engine_ready.store(false, Ordering::Release);
+        // The held frame and the model state belong to the stream that
+        // is stopping; resume starts the pipeline afresh.
+        self.inner.abort_pipeline();
         let _ = self.inner.segmentation_mut().take_engine();
         tracing::info!(
             target: "fluxframe::idle",
