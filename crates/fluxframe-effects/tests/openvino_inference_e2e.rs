@@ -87,7 +87,7 @@ fn openvino_cpu_infers_selfie_segmentation_end_to_end() {
     );
     let cfg = model_config();
 
-    let mut engine = OpenVinoEngine::load(&path, cfg, "CPU").expect("OpenVINO loads");
+    let mut engine = OpenVinoEngine::load(&path, &cfg, "CPU").expect("OpenVINO loads");
 
     let data = synthetic_input();
     let shape = [1_usize, 256, 256, 3];

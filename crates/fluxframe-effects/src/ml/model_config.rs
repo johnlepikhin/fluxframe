@@ -132,6 +132,32 @@ pub enum OutputType {
     CategoryMask,
 }
 
+/// How the model's input resolution is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum InputSize {
+    /// Fixed `input_width × input_height`; frames are resized to it.
+    #[default]
+    Fixed,
+    /// The processed frame size.  The model is reshaped to it at load,
+    /// frames go in unresized and the mask comes out at frame size.
+    /// `input_width` / `input_height` must be omitted.
+    Frame,
+}
+
+/// One piece of state a recurrent model carries between frames: the
+/// output tensor produced by one pass is fed to the input tensor of the
+/// next.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatePair {
+    /// Model output that carries the state out of a pass.
+    pub output: String,
+    /// Model input that takes it back in on the next pass.
+    pub input: String,
+}
+
 // ---------------------------------------------------------------------------
 // ModelConfig
 // ---------------------------------------------------------------------------
@@ -144,10 +170,17 @@ pub struct ModelConfig {
     /// Human-readable model identifier.
     pub name: String,
 
-    /// Expected input tensor width in pixels.
+    /// Expected input tensor width in pixels.  With
+    /// [`InputSize::Frame`] it is omitted in the sidecar and filled in
+    /// by [`Self::resolve_input_size`].
+    #[serde(default)]
     pub input_width: u32,
-    /// Expected input tensor height in pixels.
+    /// Expected input tensor height in pixels; see [`Self::input_width`].
+    #[serde(default)]
     pub input_height: u32,
+    /// Whether the input resolution is fixed or follows the frame.
+    #[serde(default)]
+    pub input_size: InputSize,
     /// Memory layout the model expects for its input tensor.
     #[serde(default = "default_input_layout")]
     pub input_layout: InputLayout,
@@ -188,6 +221,25 @@ pub struct ModelConfig {
     /// post-processing.  None ⇒ effect-default.
     #[serde(default)]
     pub threshold: Option<f32>,
+
+    /// State the model carries between frames (recurrent models such
+    /// as Robust Video Matting).  The frame goes to model input 0,
+    /// which must not be a state input.  Needs the OpenVINO backend.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state: Vec<StatePair>,
+    /// Run inference one frame ahead of the rest of the pipeline: the
+    /// pass for frame N overlaps the processing of frame N-1, and the
+    /// output is delayed by one frame.  For models too slow to run
+    /// inline within a frame interval.
+    #[serde(default)]
+    pub pipeline: bool,
+    /// OpenVINO devices the model may run on, in order of preference
+    /// (`["NPU"]`).  When set, the global device choice is ignored and
+    /// a model that none of them can run fails with
+    /// [`InferenceError::AcceleratorUnavailable`] instead of falling
+    /// back to the CPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devices: Option<Vec<String>>,
 }
 
 fn default_input_layout() -> InputLayout {
@@ -223,6 +275,7 @@ impl ModelConfig {
             name: name.into(),
             input_width,
             input_height,
+            input_size: InputSize::Fixed,
             input_layout: default_input_layout(),
             input_dtype: default_input_dtype(),
             input_color: default_input_color(),
@@ -233,7 +286,25 @@ impl ModelConfig {
             output_type: default_output_type(),
             person_class_index: None,
             threshold: None,
+            state: Vec::new(),
+            pipeline: false,
+            devices: None,
         }
+    }
+
+    /// Fill in the input resolution for [`InputSize::Frame`] models from
+    /// the processed frame size.  No-op for fixed-size models.
+    pub fn resolve_input_size(&mut self, frame_width: u32, frame_height: u32) {
+        if self.input_size == InputSize::Frame {
+            self.input_width = frame_width;
+            self.input_height = frame_height;
+        }
+    }
+
+    /// Whether the model carries state between frames.
+    #[must_use]
+    pub fn is_recurrent(&self) -> bool {
+        !self.state.is_empty()
     }
 
     /// Parse a TOML document into a [`ModelConfig`] and validate.
@@ -278,10 +349,47 @@ impl ModelConfig {
     /// Returns [`InferenceError::InvalidModelConfig`] when invariants
     /// are violated.
     pub fn validate(&self) -> Result<(), InferenceError> {
-        if self.input_width == 0 || self.input_height == 0 {
-            return Err(InferenceError::InvalidModelConfig {
-                reason: "input_width and input_height must be > 0".into(),
-            });
+        let invalid = |reason: String| Err(InferenceError::InvalidModelConfig { reason });
+        match self.input_size {
+            InputSize::Fixed if self.input_width == 0 || self.input_height == 0 => {
+                return invalid("input_width and input_height must be > 0".into());
+            }
+            InputSize::Frame if self.input_width != 0 || self.input_height != 0 => {
+                return invalid(
+                    "input_width and input_height must be omitted when input_size = \"frame\"; \
+                     the model takes the processed frame size"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+        // Engines feed f32 tensors only; quantised inputs are not wired.
+        if self.input_dtype != TensorDType::F32 {
+            return invalid(format!(
+                "input_dtype {:?} is not supported; only \"f32\" models can be run",
+                self.input_dtype
+            ));
+        }
+        for (i, pair) in self.state.iter().enumerate() {
+            if pair.input.is_empty() || pair.output.is_empty() {
+                return invalid(format!(
+                    "state[{i}]: input and output names must be non-empty"
+                ));
+            }
+            let dup = self.state[..i]
+                .iter()
+                .any(|p| p.input == pair.input || p.output == pair.output);
+            if dup {
+                return invalid(format!(
+                    "state[{i}]: `{}` / `{}` already used by another state pair",
+                    pair.output, pair.input
+                ));
+            }
+        }
+        if let Some(devices) = &self.devices {
+            if devices.is_empty() || devices.iter().any(String::is_empty) {
+                return invalid("devices must list at least one non-empty device name".into());
+            }
         }
         // Note: `input_layout = HW` is intentionally impossible by types
         // — see [`InputLayout`]'s invariants doc.
@@ -461,5 +569,111 @@ threshold = 0.0
         )
         .expect("0.0 ok");
         assert_eq!(cfg.threshold, Some(0.0));
+    }
+
+    /// The sidecar of a prepared Robust Video Matting model.
+    const RVM_SIDECAR: &str = r#"
+name = "rvm"
+input_size = "frame"
+input_layout = "NCHW"
+output_layout = "NCHW"
+output_type = "mask"
+pipeline = true
+devices = ["NPU"]
+state = [
+  { output = "r1o", input = "r1i" },
+  { output = "r2o", input = "r2i" },
+]
+"#;
+
+    #[test]
+    fn frame_sized_recurrent_model_parses() {
+        let cfg = ModelConfig::from_toml_str(RVM_SIDECAR).expect("rvm sidecar");
+        assert_eq!(cfg.input_size, InputSize::Frame);
+        assert!(cfg.is_recurrent());
+        assert!(cfg.pipeline);
+        assert_eq!(cfg.devices.as_deref(), Some(&["NPU".to_string()][..]));
+        assert_eq!(
+            cfg.state[1],
+            StatePair {
+                output: "r2o".into(),
+                input: "r2i".into()
+            }
+        );
+        // Unresolved until the frame size is known.
+        assert_eq!((cfg.input_width, cfg.input_height), (0, 0));
+    }
+
+    #[test]
+    fn resolve_input_size_fills_frame_models_only() {
+        let mut frame = ModelConfig::from_toml_str(RVM_SIDECAR).expect("rvm sidecar");
+        frame.resolve_input_size(800, 448);
+        assert_eq!((frame.input_width, frame.input_height), (800, 448));
+
+        let mut fixed = ModelConfig::new("fixed", 256, 256);
+        fixed.resolve_input_size(800, 448);
+        assert_eq!((fixed.input_width, fixed.input_height), (256, 256));
+        assert!(!fixed.is_recurrent() && !fixed.pipeline && fixed.devices.is_none());
+    }
+
+    #[test]
+    fn frame_sized_model_rejects_explicit_dimensions() {
+        let err = ModelConfig::from_toml_str(
+            r#"
+name = "x"
+input_size = "frame"
+input_width = 256
+"#,
+        )
+        .expect_err("dimensions with input_size = frame must fail");
+        assert!(format!("{err}").contains("omitted"), "got: {err}");
+    }
+
+    #[test]
+    fn fixed_model_still_requires_dimensions() {
+        let err = ModelConfig::from_toml_str("name = \"x\"\n").expect_err("no dims must fail");
+        assert!(format!("{err}").contains("input_width"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_non_f32_input_dtype() {
+        let err = ModelConfig::from_toml_str(
+            r#"
+name = "x"
+input_width = 1
+input_height = 1
+input_dtype = "u8"
+"#,
+        )
+        .expect_err("u8 input must fail");
+        assert!(format!("{err}").contains("f32"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_duplicate_state_names() {
+        let err = ModelConfig::from_toml_str(
+            r#"
+name = "x"
+input_width = 1
+input_height = 1
+state = [{ output = "a", input = "b" }, { output = "c", input = "b" }]
+"#,
+        )
+        .expect_err("reused state input must fail");
+        assert!(format!("{err}").contains("state[1]"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_device_list() {
+        let err = ModelConfig::from_toml_str(
+            r#"
+name = "x"
+input_width = 1
+input_height = 1
+devices = []
+"#,
+        )
+        .expect_err("empty devices must fail");
+        assert!(format!("{err}").contains("devices"), "got: {err}");
     }
 }

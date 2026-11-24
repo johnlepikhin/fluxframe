@@ -21,7 +21,9 @@ pub mod onnx;
 pub mod openvino_engine;
 
 pub use loader::load_sidecar_or_placeholder;
-pub use model_config::{InputLayout, ModelConfig, OutputLayout, OutputType, TensorDType};
+pub use model_config::{
+    InputLayout, InputSize, ModelConfig, OutputLayout, OutputType, StatePair, TensorDType,
+};
 pub use onnx::OnnxEngine;
 #[cfg(feature = "openvino")]
 pub use openvino_engine::OpenVinoEngine;

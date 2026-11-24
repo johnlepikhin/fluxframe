@@ -26,12 +26,12 @@ use std::sync::Arc;
 use fluxframe_core::error::InferenceError;
 use fluxframe_core::traits::{InferenceEngine, InferenceInput, InferenceOutput, ModelInfo};
 use openvino::{
-    CompiledModel, Core, DeviceType, ElementType, InferRequest, PropertyKey, SetupError, Shape,
-    Tensor,
+    CompiledModel, Core, DeviceType, ElementType, InferRequest, Model, PartialShape, PropertyKey,
+    RwPropertyKey, SetupError, Shape, Tensor,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::ml::ModelConfig;
+use crate::ml::{InputLayout, InputSize, ModelConfig};
 
 /// Hint surfaced when `libopenvino_c.so` cannot be dlopened.
 ///
@@ -51,21 +51,20 @@ const LIBRARY_HINT: &str = "ensure the OpenVINO runtime is on the loader path. \
 /// One instance owns one compiled model + infer request pair.  The
 /// type is `Send` (matching the [`InferenceEngine`] trait bound) but
 /// not `Sync` — wrap in `Arc<Mutex<…>>` for sharing across threads.
+///
+/// Every pass runs through `infer_async` + `wait`, so [`Self::start`] /
+/// [`Self::wait`] can overlap a pass with other work; [`Self::infer`]
+/// is the two back to back.
 pub struct OpenVinoEngine {
     /// Cached `ModelInfo` snapshot — built from the supplied
     /// [`ModelConfig`] up front so the hot path does not touch any
     /// OpenVINO API for static metadata.
     info: ModelInfo,
     /// OpenVINO core handle.  Held for the lifetime of the engine
-    /// so the dynamically-loaded library stays mapped.  We don't
-    /// touch the core after `load` in the production hot path; the
-    /// reference is kept so future stages can call
-    /// `core.set_property` for performance tuning without rebuilding
-    /// the engine.
+    /// so the dynamically-loaded library stays mapped.
     #[allow(
         dead_code,
-        reason = "Kept alive so libopenvino.so stays mapped for the InferRequest's lifetime; \
-                  future stages may call core.set_property for runtime tuning."
+        reason = "Kept alive so libopenvino.so stays mapped for the InferRequest's lifetime."
     )]
     core: Core,
     /// Compiled model — owns the device-side pipeline that the
@@ -89,42 +88,52 @@ pub struct OpenVinoEngine {
     /// heap churn under the AUTO/CPU plugin (multi-GB RSS over a run).
     /// `Some` is the invariant "allocated AND successfully bound".
     input_tensor: Option<CachedInputTensor>,
-    /// Tensor name expected by the loaded model on its single input
-    /// port (e.g. `"input_1:0"` for SelfieSegmentation).  Captured
-    /// once at load so the hot path does not call OpenVINO metadata
-    /// APIs.
+    /// Tensor name of the frame input (model input 0).  Captured once
+    /// at load so the hot path does not call OpenVINO metadata APIs.
     input_name: String,
     /// Same as [`Self::input_name`] but for the model's chosen
     /// output port (`config.output_index`).
     output_name: String,
-    /// Target device string for diagnostics — `"CPU"`, `"GPU"`,
-    /// `"NPU"`, `"AUTO:NPU,GPU,CPU"`, etc.
-    #[allow(
-        dead_code,
-        reason = "Reserved for future telemetry — Stage 9/10 surface the active device in the \
-                  periodic metrics reporter."
-    )]
-    device: String,
-    /// User-supplied model config.  Held so `infer()` can validate
-    /// shape against expectations and so diagnostics can include
-    /// the operator-visible model name.
-    #[allow(
-        dead_code,
-        reason = "Held for diagnostic + future validation paths; the hot path consumes only \
-                  `input_name` / `output_name`."
-    )]
-    config: ModelConfig,
+    /// State carried between passes of a recurrent model; empty for
+    /// stateless models.
+    state: RecurrentState,
+    /// A pass was started and not yet collected by [`Self::wait`].
+    in_flight: bool,
 }
 
 /// The reused input tensor plus the shape it was allocated for.
 ///
 /// `shape` is the OpenVINO `i64` form (matching the `shape_i64` built in
-/// [`OpenVinoEngine::infer`]) so the per-frame "do we need to
+/// [`OpenVinoEngine::start`]) so the per-frame "do we need to
 /// reallocate?" check is a plain slice compare with no conversion.
 struct CachedInputTensor {
     shape: Vec<i64>,
     tensor: Tensor,
 }
+
+/// Double-buffered recurrent state.
+///
+/// Each [`StatePair`] owns two tensors of the state's shape.  One is
+/// bound to the pair's model input, the other to its model output; after
+/// every pass the roles swap, so the output of pass N becomes the input
+/// of pass N+1 without copying.  `current` is the index of the buffers
+/// bound to the inputs (shared by all pairs — they always swap
+/// together).
+struct RecurrentState {
+    slots: Vec<StateSlot>,
+    current: usize,
+}
+
+struct StateSlot {
+    input: String,
+    output: String,
+    buffers: [Tensor; 2],
+}
+
+/// Upper bound for one pass.  A pass that takes longer means the device
+/// hung; failing it lets the segmentation fallback take over instead of
+/// freezing the worker.
+const WAIT_TIMEOUT_MS: i64 = 2_000;
 
 /// Whether the cached input tensor must be (re)allocated for `shape`.
 ///
@@ -135,28 +144,97 @@ fn needs_realloc(cached_shape: Option<&[i64]>, shape: &[i64]) -> bool {
     cached_shape != Some(shape)
 }
 
+/// Static shape of the frame input for a frame-sized model.
+fn frame_input_shape(config: &ModelConfig) -> [i64; 4] {
+    let (w, h) = (
+        i64::from(config.input_width),
+        i64::from(config.input_height),
+    );
+    match config.input_layout {
+        InputLayout::Nchw => [1, 3, h, w],
+        // `InputLayout` is non-exhaustive; NHWC is the schema default.
+        _ => [1, h, w, 3],
+    }
+}
+
+/// Static dimensions of a state tensor from the partial shape OpenVINO
+/// infers for its output once the frame input is static.  A dynamic
+/// leading (batch) dimension becomes 1; any other dynamic dimension
+/// means the state shape does not follow from the frame size.
+fn static_state_dims(name: &str, shape: &PartialShape) -> Result<Vec<i64>, InferenceError> {
+    shape
+        .get_dimensions()
+        .iter()
+        .enumerate()
+        .map(|(i, d)| match (d.is_dynamic(), i) {
+            (false, _) => Ok(d.get_min()),
+            (true, 0) => Ok(1),
+            (true, _) => Err(InferenceError::ModelLoadFailed {
+                reason: format!(
+                    "state output `{name}` has a dynamic dimension {i} even with a static \
+                     frame input"
+                ),
+            }),
+        })
+        .collect()
+}
+
+fn load_err(what: &str) -> impl FnOnce(openvino::InferenceError) -> InferenceError + '_ {
+    move |e| InferenceError::ModelLoadFailed {
+        reason: format!("{what}: {e}"),
+    }
+}
+
+fn infer_err(what: &str) -> impl FnOnce(openvino::InferenceError) -> InferenceError + '_ {
+    move |e| InferenceError::InferenceFailed {
+        reason: format!("{what}: {e}"),
+    }
+}
+
 impl OpenVinoEngine {
     /// Load a model from disk and prepare an inference request.
     ///
     /// `device` is the OpenVINO device string — passed verbatim to
-    /// `Core::compile_model` (`"CPU"` for Stage 8, anything in
-    /// `"GPU"`, `"NPU"`, `"AUTO:NPU,GPU,CPU"` for later stages).
+    /// `Core::compile_model` (`"CPU"`, `"GPU"`, `"NPU"`,
+    /// `"AUTO:NPU,GPU,CPU"`, …).
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::load_with_cache`].
+    pub fn load(
+        model_path: &Path,
+        config: &ModelConfig,
+        device: &str,
+    ) -> Result<Self, InferenceError> {
+        Self::load_with_cache(model_path, config, device, None)
+    }
+
+    /// [`Self::load`] with an optional compiled-model cache directory
+    /// (OpenVINO `CACHE_DIR`).  A cache hit skips device compilation,
+    /// which takes seconds on the NPU.  `device` must then be a single
+    /// device such as `"NPU"`; a cache directory that cannot be set is
+    /// logged and ignored.
+    ///
+    /// Frame-sized models ([`InputSize::Frame`]) are reshaped to the
+    /// resolved input size, and the inputs of recurrent models' state
+    /// to the shapes their outputs take at that size, so the model is
+    /// fully static — the NPU compiles nothing else.
     ///
     /// # Errors
     ///
     /// * [`InferenceError::BackendUnavailable`] — `libopenvino_c.so`
-    ///   cannot be loaded.  Carries [`LIBRARY_HINT`] for the §27-style
-    ///   CLI diagnostics.
+    ///   cannot be loaded.  Carries [`LIBRARY_HINT`].
     /// * [`InferenceError::ModelNotFound`] — `model_path` does not
     ///   exist.
-    /// * [`InferenceError::ModelLoadFailed`] — `read_model_from_file`
-    ///   accepts the file but `compile_model` / metadata extraction
-    ///   subsequently fails (unsupported op, device not supported,
-    ///   shape mismatch).
-    pub fn load(
+    /// * [`InferenceError::ModelLoadFailed`] — the model cannot be read,
+    ///   reshaped or compiled for `device`.
+    /// * [`InferenceError::InvalidModelConfig`] — the sidecar names
+    ///   outputs or state the model does not have.
+    pub fn load_with_cache(
         model_path: &Path,
-        config: ModelConfig,
+        config: &ModelConfig,
         device: &str,
+        cache_dir: Option<&Path>,
     ) -> Result<Self, InferenceError> {
         // Fail fast with a clear ModelNotFound rather than letting
         // OpenVINO surface a generic "cannot read model" with the
@@ -176,7 +254,7 @@ impl OpenVinoEngine {
         // Second argument is the weights file path; for `.onnx`
         // files OpenVINO ignores it (everything is in the model
         // file itself), so passing `""` is canonical.
-        let model = core.read_model_from_file(model_path_str, "").map_err(|e| {
+        let mut model = core.read_model_from_file(model_path_str, "").map_err(|e| {
             InferenceError::ModelLoadFailed {
                 reason: format!("read_model_from_file({}): {e}", model_path.display()),
             }
@@ -184,28 +262,40 @@ impl OpenVinoEngine {
         let input_name = model
             .get_input_by_index(0)
             .and_then(|node| node.get_name())
-            .map_err(|e| InferenceError::ModelLoadFailed {
-                reason: format!("cannot read input port name: {e}"),
-            })?;
+            .map_err(load_err("cannot read input port name"))?;
+        let output_names = (0..model.get_outputs_len().map_err(load_err("outputs_len"))?)
+            .map(|i| model.get_output_by_index(i).and_then(|n| n.get_name()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(load_err("cannot read output port names"))?;
         let output_index = config.output_index;
-        let output_name = model
-            .get_output_by_index(output_index)
-            .and_then(|node| node.get_name())
-            .map_err(|e| InferenceError::InvalidModelConfig {
-                reason: format!("cannot read output port name at index {output_index}: {e}"),
-            })?;
+        let output_name = output_names.get(output_index).cloned().ok_or_else(|| {
+            InferenceError::InvalidModelConfig {
+                reason: format!(
+                    "output_index {output_index} out of range: the model has {} outputs",
+                    output_names.len()
+                ),
+            }
+        })?;
+        check_state_names(config, &input_name, &output_name, &output_names)?;
+
+        let state_shapes = make_static(&mut model, config, &input_name)?;
+
         let device_type: DeviceType = device.into();
+        if let Some(dir) = cache_dir {
+            let dir = dir.to_string_lossy();
+            if let Err(e) = core.set_property(&device_type, &RwPropertyKey::CacheDir, &dir) {
+                warn!(device, cache_dir = %dir, error = %e, "openvino model cache not enabled");
+            }
+        }
         let mut compiled = core.compile_model(&model, device_type).map_err(|e| {
             InferenceError::ModelLoadFailed {
                 reason: format!("compile_model(device={device}): {e}"),
             }
         })?;
-        let request =
-            compiled
-                .create_infer_request()
-                .map_err(|e| InferenceError::ModelLoadFailed {
-                    reason: format!("create_infer_request: {e}"),
-                })?;
+        let mut request = compiled
+            .create_infer_request()
+            .map_err(load_err("create_infer_request"))?;
+        let state = RecurrentState::bind(config, &state_shapes, &mut request)?;
         let info = ModelInfo {
             name: Arc::<str>::from(config.name.as_str()),
             input_width: config.input_width,
@@ -244,6 +334,8 @@ impl OpenVinoEngine {
             model_path = %model_path.display(),
             input_port = %input_name,
             output_port = %output_name,
+            input_size = ?(config.input_width, config.input_height),
+            state_tensors = state.slots.len(),
             "openvino backend ready",
         );
         Ok(Self {
@@ -254,9 +346,157 @@ impl OpenVinoEngine {
             input_tensor: None,
             input_name,
             output_name,
-            device: device.to_string(),
-            config,
+            state,
+            in_flight: false,
         })
+    }
+}
+
+/// Check that the sidecar's state pairs name real ports and do not
+/// collide with the frame input or the consumed output.
+fn check_state_names(
+    config: &ModelConfig,
+    input_name: &str,
+    output_name: &str,
+    output_names: &[String],
+) -> Result<(), InferenceError> {
+    for pair in &config.state {
+        let reason = if pair.input == input_name {
+            format!(
+                "state input `{}` is the frame input (model input 0)",
+                pair.input
+            )
+        } else if pair.output == output_name {
+            format!(
+                "state output `{}` is the consumed output (output_index)",
+                pair.output
+            )
+        } else if !output_names.contains(&pair.output) {
+            format!("state output `{}` is not a model output", pair.output)
+        } else {
+            continue;
+        };
+        return Err(InferenceError::InvalidModelConfig { reason });
+    }
+    Ok(())
+}
+
+/// Reshape frame-sized and recurrent models to static shapes.  Returns
+/// the static shape of every state input, in `config.state` order.
+fn make_static(
+    model: &mut Model,
+    config: &ModelConfig,
+    input_name: &str,
+) -> Result<Vec<Vec<i64>>, InferenceError> {
+    let mut shapes: Vec<(String, PartialShape)> = Vec::new();
+    if config.input_size == InputSize::Frame {
+        let dims = frame_input_shape(config);
+        let shape = PartialShape::new_static(4, &dims).map_err(load_err("frame input shape"))?;
+        model
+            .reshape_input_by_name(input_name, &shape)
+            .map_err(load_err("reshape frame input"))?;
+        shapes.push((input_name.to_owned(), shape));
+    }
+    if !config.is_recurrent() {
+        return Ok(Vec::new());
+    }
+    // With the frame input static OpenVINO propagates the state outputs'
+    // shapes; the matching inputs take the same shapes.
+    let outputs_len = model.get_outputs_len().map_err(load_err("outputs_len"))?;
+    let mut state_dims = Vec::with_capacity(config.state.len());
+    for pair in &config.state {
+        let mut found = None;
+        for i in 0..outputs_len {
+            let node = model.get_output_by_index(i).map_err(load_err("output"))?;
+            if node.get_name().map_err(load_err("output name"))? == pair.output {
+                found = Some(node.get_partial_shape().map_err(load_err("state shape"))?);
+                break;
+            }
+        }
+        let partial = found.ok_or_else(|| InferenceError::InvalidModelConfig {
+            reason: format!("state output `{}` is not a model output", pair.output),
+        })?;
+        let dims = static_state_dims(&pair.output, &partial)?;
+        let rank = i64::try_from(dims.len()).unwrap_or(i64::MAX);
+        let shape = PartialShape::new_static(rank, &dims).map_err(load_err("state shape"))?;
+        shapes.push((pair.input.clone(), shape));
+        state_dims.push(dims);
+    }
+    let refs: Vec<(&str, &PartialShape)> = shapes.iter().map(|(n, s)| (n.as_str(), s)).collect();
+    model
+        .reshape(&refs)
+        .map_err(load_err("reshape state inputs"))?;
+    Ok(state_dims)
+}
+
+impl RecurrentState {
+    /// Allocate zeroed double buffers for every state pair and bind
+    /// buffer 0 to the inputs, buffer 1 to the outputs.
+    fn bind(
+        config: &ModelConfig,
+        shapes: &[Vec<i64>],
+        request: &mut InferRequest,
+    ) -> Result<Self, InferenceError> {
+        let mut slots = Vec::with_capacity(config.state.len());
+        for (pair, dims) in config.state.iter().zip(shapes) {
+            let shape = Shape::new(dims).map_err(load_err("state tensor shape"))?;
+            let make = || -> Result<Tensor, InferenceError> {
+                let mut t =
+                    Tensor::new(ElementType::F32, &shape).map_err(load_err("state tensor"))?;
+                t.get_data_mut::<f32>()
+                    .map_err(load_err("state tensor data"))?
+                    .fill(0.0);
+                Ok(t)
+            };
+            slots.push(StateSlot {
+                input: pair.input.clone(),
+                output: pair.output.clone(),
+                buffers: [make()?, make()?],
+            });
+        }
+        let state = Self { slots, current: 0 };
+        state
+            .rebind(request)
+            .map_err(|e| InferenceError::ModelLoadFailed {
+                reason: e.to_string(),
+            })?;
+        Ok(state)
+    }
+
+    /// Bind `buffers[current]` to the state inputs and the other buffer
+    /// to the state outputs.
+    fn rebind(&self, request: &mut InferRequest) -> Result<(), InferenceError> {
+        let next = 1 - self.current;
+        for slot in &self.slots {
+            request
+                .set_tensor(&slot.input, &slot.buffers[self.current])
+                .map_err(infer_err("bind state input"))?;
+            request
+                .set_tensor(&slot.output, &slot.buffers[next])
+                .map_err(infer_err("bind state output"))?;
+        }
+        Ok(())
+    }
+
+    /// After a pass: what was written to the outputs becomes the next
+    /// pass's input.
+    fn advance(&mut self, request: &mut InferRequest) -> Result<(), InferenceError> {
+        if self.slots.is_empty() {
+            return Ok(());
+        }
+        self.current = 1 - self.current;
+        self.rebind(request)
+    }
+
+    /// Zero the buffers the next pass reads.
+    fn clear(&mut self) {
+        let current = self.current;
+        for slot in &mut self.slots {
+            match slot.buffers[current].get_data_mut::<f32>() {
+                Ok(data) => data.fill(0.0),
+                Err(e) => warn!(state = %slot.input, error = %e, "cannot clear model state"),
+            }
+        }
     }
 }
 
@@ -278,6 +518,20 @@ impl InferenceEngine for OpenVinoEngine {
     }
 
     fn infer(&mut self, input: InferenceInput<'_>) -> Result<InferenceOutput, InferenceError> {
+        self.start(input)?;
+        self.wait()
+    }
+
+    fn supports_async(&self) -> bool {
+        true
+    }
+
+    fn start(&mut self, input: InferenceInput<'_>) -> Result<(), InferenceError> {
+        if self.in_flight {
+            return Err(InferenceError::InferenceFailed {
+                reason: "a pass is already in flight; call wait() first".into(),
+            });
+        }
         let expected: usize = input.shape.iter().product();
         if input.data.len() != expected {
             return Err(InferenceError::InferenceFailed {
@@ -301,8 +555,8 @@ impl InferenceEngine for OpenVinoEngine {
                 reason: format!("shape dimension overflow: {e}"),
             })?;
         // (Re)allocate + bind the input tensor only when the shape
-        // changes (once, for the static selfie model). The hot path
-        // below just overwrites its buffer — no per-frame allocation.
+        // changes (once, for a static model). The hot path below just
+        // overwrites its buffer — no per-frame allocation.
         if needs_realloc(
             self.input_tensor.as_ref().map(|c| c.shape.as_slice()),
             &shape_i64,
@@ -315,7 +569,7 @@ impl InferenceEngine for OpenVinoEngine {
                     reason: format!("Tensor::new(F32, {:?}): {e}", input.shape),
                 }
             })?;
-            // Bind once. OpenVINO reads the tensor lazily at `infer()`
+            // Bind once. OpenVINO reads the tensor lazily at inference
             // time, so in-place overwrites of its buffer are picked up
             // without re-calling `set_tensor` per frame.
             self.request
@@ -341,15 +595,25 @@ impl InferenceEngine for OpenVinoEngine {
             .expect("input_tensor is Some after the (re)alloc block")
             .tensor
             .get_data_mut::<f32>()
-            .map_err(|e| InferenceError::InferenceFailed {
-                reason: format!("tensor.get_data_mut: {e}"),
-            })?
+            .map_err(infer_err("tensor.get_data_mut"))?
             .copy_from_slice(input.data);
         self.request
-            .infer()
-            .map_err(|e| InferenceError::InferenceFailed {
-                reason: format!("infer: {e}"),
-            })?;
+            .infer_async()
+            .map_err(infer_err("infer_async"))?;
+        self.in_flight = true;
+        Ok(())
+    }
+
+    fn wait(&mut self) -> Result<InferenceOutput, InferenceError> {
+        if !self.in_flight {
+            return Err(InferenceError::InferenceFailed {
+                reason: "wait() without a pass in flight".into(),
+            });
+        }
+        self.in_flight = false;
+        self.request
+            .wait(WAIT_TIMEOUT_MS)
+            .map_err(infer_err("wait"))?;
         let out_tensor = self.request.get_tensor(&self.output_name).map_err(|e| {
             InferenceError::InferenceFailed {
                 reason: format!("get_tensor({}): {e}", self.output_name),
@@ -357,30 +621,31 @@ impl InferenceEngine for OpenVinoEngine {
         })?;
         let out_shape = out_tensor
             .get_shape()
-            .map_err(|e| InferenceError::InferenceFailed {
-                reason: format!("output tensor get_shape: {e}"),
-            })?;
+            .map_err(infer_err("output tensor get_shape"))?;
         let out_shape_usize: Vec<usize> = out_shape
             .get_dimensions()
             .iter()
             .map(|&d| d.max(0) as usize)
             .collect();
-        let out_slice =
-            out_tensor
-                .get_data::<f32>()
-                .map_err(|e| InferenceError::InferenceFailed {
-                    reason: format!("output tensor get_data: {e}"),
-                })?;
-        debug!(
-            input_shape = ?input.shape,
-            output_shape = ?out_shape_usize,
-            output_elems = out_slice.len(),
-            "openvino infer ok"
-        );
+        let data = out_tensor
+            .get_data::<f32>()
+            .map_err(infer_err("output tensor get_data"))?
+            .to_vec();
+        self.state.advance(&mut self.request)?;
         Ok(InferenceOutput {
-            data: out_slice.to_vec(),
+            data,
             shape: out_shape_usize,
         })
+    }
+
+    fn reset_state(&mut self) {
+        if self.in_flight {
+            self.in_flight = false;
+            if let Err(e) = self.request.wait(WAIT_TIMEOUT_MS) {
+                warn!(error = %e, "dropping in-flight pass on state reset failed");
+            }
+        }
+        self.state.clear();
     }
 }
 
@@ -420,7 +685,7 @@ mod tests {
         }
         let cfg = ModelConfig::new("mediapipe-selfie-segmentation", 256, 256);
         let engine =
-            OpenVinoEngine::load(&model_path, cfg, "CPU").expect("openvino CPU load on this host");
+            OpenVinoEngine::load(&model_path, &cfg, "CPU").expect("openvino CPU load on this host");
         assert_eq!(&*engine.model_info().name, "mediapipe-selfie-segmentation");
     }
 
@@ -438,7 +703,7 @@ mod tests {
             return;
         }
         let cfg = ModelConfig::new("mediapipe-selfie-segmentation", 256, 256);
-        let mut engine = OpenVinoEngine::load(&model_path, cfg, "CPU").expect("openvino load");
+        let mut engine = OpenVinoEngine::load(&model_path, &cfg, "CPU").expect("openvino load");
         // SelfieSegmentation NHWC: [1, 256, 256, 3].  Mid-grey f32.
         let shape = [1_usize, 256, 256, 3];
         let pixels: usize = shape.iter().product();
@@ -494,7 +759,7 @@ mod tests {
             return;
         }
         let cfg = ModelConfig::new("mediapipe-selfie-segmentation", 256, 256);
-        let mut engine = OpenVinoEngine::load(&model_path, cfg, "CPU").expect("openvino load");
+        let mut engine = OpenVinoEngine::load(&model_path, &cfg, "CPU").expect("openvino load");
         let shape = [1_usize, 256, 256, 3];
         let pixels: usize = shape.iter().product();
         for i in 0..5 {
@@ -511,6 +776,78 @@ mod tests {
         assert!(
             engine.input_tensor.is_some(),
             "input tensor should be cached after inference"
+        );
+    }
+
+    /// Recurrent state round trip on a real Robust Video Matting model:
+    /// the second pass on the same frame differs from the first (state
+    /// fed back through the swapped buffers), and after `reset_state`
+    /// a pass reproduces the first one.
+    ///
+    /// ```sh
+    /// FLUXFRAME_RVM_MODEL=/path/rvm.onnx [FLUXFRAME_RVM_DEVICE=NPU] \
+    ///   cargo test -p fluxframe-effects --lib rvm_state -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "requires OpenVINO and a prepared RVM model in FLUXFRAME_RVM_MODEL"]
+    fn rvm_state_carries_between_passes_and_resets() {
+        let Some(model_path) = std::env::var_os("FLUXFRAME_RVM_MODEL").map(PathBuf::from) else {
+            eprintln!("skipping: FLUXFRAME_RVM_MODEL not set");
+            return;
+        };
+        let device = std::env::var("FLUXFRAME_RVM_DEVICE").unwrap_or_else(|_| "CPU".into());
+        let mut cfg = ModelConfig::from_toml_str(
+            r#"
+name = "rvm"
+input_size = "frame"
+input_layout = "NCHW"
+output_layout = "NCHW"
+state = [
+  { output = "r1o", input = "r1i" },
+  { output = "r2o", input = "r2i" },
+  { output = "r3o", input = "r3i" },
+  { output = "r4o", input = "r4i" },
+]
+"#,
+        )
+        .expect("sidecar");
+        let (w, h) = (320_usize, 192_usize);
+        cfg.resolve_input_size(w as u32, h as u32);
+        let mut engine =
+            OpenVinoEngine::load(&model_path, &cfg, &device).expect("rvm loads with static shapes");
+        let shape = [1, 3, h, w];
+        // Deterministic noise: plain shapes segment to all-zero alpha,
+        // on which the state has no visible effect; noise gets a
+        // partial alpha that the fed-back state measurably shifts.
+        let mut seed = 0x2545_f491_u32;
+        let frame: Vec<f32> = (0..3 * w * h)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                (seed >> 8) as f32 / (1 << 24) as f32
+            })
+            .collect();
+        let input = InferenceInput {
+            data: &frame,
+            shape: &shape,
+        };
+        let first = engine.infer(input.clone()).expect("pass 1");
+        assert_eq!(first.shape, vec![1, 1, h, w], "alpha at frame size");
+        engine.start(input.clone()).expect("async start");
+        let second = engine.wait().expect("pass 2");
+        let diff = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len() as f32
+        };
+        assert!(
+            diff(&first.data, &second.data) > 1e-5,
+            "state must influence the second pass"
+        );
+        engine.reset_state();
+        let after_reset = engine.infer(input).expect("pass after reset");
+        assert!(
+            diff(&first.data, &after_reset.data) < 1e-4,
+            "reset must reproduce the first pass"
         );
     }
 }

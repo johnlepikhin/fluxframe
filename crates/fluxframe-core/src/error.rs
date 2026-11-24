@@ -101,6 +101,13 @@ pub enum InferenceError {
     /// The model loaded successfully but a specific `infer` call failed.
     #[error("inference failed: {reason}")]
     InferenceFailed { reason: String },
+
+    /// The model is restricted to accelerator devices (its sidecar lists
+    /// `devices`) and none of them could run it.  Distinct from
+    /// [`Self::BackendUnavailable`] so a preset can fall back to another
+    /// preset instead of failing.
+    #[error("no allowed inference device can run this model: {reason}")]
+    AcceleratorUnavailable { reason: String },
 }
 
 /// Errors raised from the capture/output transport (GStreamer) layer.
@@ -335,10 +342,20 @@ impl FluxError {
             //     single permanent failure in the batch must not be
             //     silently retried just because the primary happens to
             //     be retryable.
+            //   * AcceleratorUnavailable — the model may only run on
+            //     devices this machine cannot provide; retrying does not
+            //     add an NPU.  Callers switch to a fallback preset.
             FluxError::Pipeline(PipelineError::MissingElement { .. })
+            | FluxError::Inference(InferenceError::AcceleratorUnavailable { .. })
+            | FluxError::Effect(
+                EffectError::Inference {
+                    source: InferenceError::AcceleratorUnavailable { .. },
+                    ..
+                }
+                | EffectError::InvalidConfig { .. },
+            )
             | FluxError::Config { .. }
             | FluxError::ConfigParse { .. }
-            | FluxError::Effect(EffectError::InvalidConfig { .. })
             | FluxError::Aggregated { .. } => false,
 
             // Default: prefer retry. Covers device hot-unplug, IO

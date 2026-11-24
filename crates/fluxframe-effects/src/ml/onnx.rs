@@ -104,6 +104,13 @@ impl OnnxEngine {
     /// * [`InferenceError::InvalidModelConfig`] — `config.output_index`
     ///   refers to an output the model does not expose.
     pub fn load(model_path: &Path, config: ModelConfig) -> Result<Self, InferenceError> {
+        if config.is_recurrent() {
+            return Err(InferenceError::InvalidModelConfig {
+                reason: "models with `state` need the OpenVINO backend; ONNX Runtime does not \
+                         carry state between passes"
+                    .into(),
+            });
+        }
         ensure_runtime_initialised();
         let canonical = std::fs::canonicalize(model_path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => InferenceError::ModelNotFound {
@@ -346,5 +353,21 @@ input_height = 1
             ) => {}
             Err(other) => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_recurrent_models() {
+        let mut cfg = ModelConfig::new("rvm", 1, 1);
+        cfg.state.push(crate::ml::StatePair {
+            output: "r1o".into(),
+            input: "r1i".into(),
+        });
+        let err = OnnxEngine::load(Path::new("/nonexistent/model.onnx"), cfg)
+            .err()
+            .expect("recurrent model must be rejected");
+        assert!(
+            matches!(err, InferenceError::InvalidModelConfig { .. }),
+            "got: {err:?}"
+        );
     }
 }

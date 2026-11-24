@@ -109,16 +109,20 @@ pub fn build_inference_engine(
 ) -> Result<Box<dyn InferenceEngine + Send>, InferenceError> {
     let _ = &counters;
     let choice = overrides.inference;
-    let (engine, backend_name) = match choice {
-        InferenceBackendChoice::Cpu => {
-            let engine = OnnxEngine::load(model_path, config)?;
-            (
-                Box::new(engine) as Box<dyn InferenceEngine + Send>,
-                "cpu".to_string(),
-            )
+    let (engine, backend_name) = if let Some(devices) = config.devices.clone() {
+        build_restricted(model_path, &config, &devices, choice)?
+    } else {
+        match choice {
+            InferenceBackendChoice::Cpu => {
+                let engine = OnnxEngine::load(model_path, config)?;
+                (
+                    Box::new(engine) as Box<dyn InferenceEngine + Send>,
+                    "cpu".to_string(),
+                )
+            }
+            InferenceBackendChoice::OpenVino => build_openvino_forced(model_path, &config)?,
+            InferenceBackendChoice::Auto => build_auto(model_path, config)?,
         }
-        InferenceBackendChoice::OpenVino => build_openvino_forced(model_path, config)?,
-        InferenceBackendChoice::Auto => build_auto(model_path, config)?,
     };
     info!(
         component = "inference",
@@ -127,6 +131,108 @@ pub fn build_inference_engine(
         "selected inference backend",
     );
     Ok(engine)
+}
+
+/// Models whose sidecar lists `devices` run only on those OpenVINO
+/// devices, tried in order with explicit device names (no `AUTO`, which
+/// could start on the CPU while an accelerator compiles).  The global
+/// device choice (`FLUXFRAME_OPENVINO_DEVICE`) does not apply.
+///
+/// Anything that keeps all of them from running the model — the CPU
+/// backend forced, OpenVINO missing, every device failing to compile —
+/// is [`InferenceError::AcceleratorUnavailable`], so the caller can
+/// switch to a fallback preset.  A missing model file or a sidecar that
+/// does not match the model stays a configuration error.
+fn build_restricted(
+    model_path: &Path,
+    config: &ModelConfig,
+    devices: &[String],
+    choice: InferenceBackendChoice,
+) -> Result<(Box<dyn InferenceEngine + Send>, String), InferenceError> {
+    let allowed = devices.join(", ");
+    if choice == InferenceBackendChoice::Cpu {
+        return Err(InferenceError::AcceleratorUnavailable {
+            reason: format!("the CPU backend is forced, but this model may only run on {allowed}"),
+        });
+    }
+    build_restricted_openvino(model_path, config, devices, &allowed)
+}
+
+#[cfg(feature = "openvino")]
+fn build_restricted_openvino(
+    model_path: &Path,
+    config: &ModelConfig,
+    devices: &[String],
+    allowed: &str,
+) -> Result<(Box<dyn InferenceEngine + Send>, String), InferenceError> {
+    let cache_dir = openvino_cache_dir();
+    let mut failures = Vec::with_capacity(devices.len());
+    for device in devices {
+        match OpenVinoEngine::load_with_cache(model_path, config, device, cache_dir.as_deref()) {
+            Ok(engine) => return Ok((Box::new(engine), format!("openvino[{device}]"))),
+            Err(InferenceError::BackendUnavailable { reason, .. }) => {
+                return Err(InferenceError::AcceleratorUnavailable {
+                    reason: format!("the OpenVINO runtime is unavailable ({reason})"),
+                });
+            }
+            Err(
+                e @ (InferenceError::ModelNotFound { .. }
+                | InferenceError::InvalidModelConfig { .. }),
+            ) => {
+                return Err(e);
+            }
+            Err(e) => {
+                warn!(device = %device, error = %e, "device cannot run the model");
+                failures.push(format!("{device}: {e}"));
+            }
+        }
+    }
+    Err(InferenceError::AcceleratorUnavailable {
+        reason: format!(
+            "none of {allowed} can run the model: {}",
+            failures.join("; ")
+        ),
+    })
+}
+
+#[cfg(not(feature = "openvino"))]
+fn build_restricted_openvino(
+    _model_path: &Path,
+    _config: &ModelConfig,
+    _devices: &[String],
+    allowed: &str,
+) -> Result<(Box<dyn InferenceEngine + Send>, String), InferenceError> {
+    Err(InferenceError::AcceleratorUnavailable {
+        reason: format!(
+            "this build has no OpenVINO support, but the model may only run on {allowed}"
+        ),
+    })
+}
+
+/// Directory for OpenVINO's compiled-model cache:
+/// `$XDG_CACHE_HOME/fluxframe/openvino` (or `~/.cache/…`).  A cache hit
+/// turns a multi-second NPU compile into a few tens of milliseconds,
+/// which matters on every idle wake-up.  `None` (cache disabled) when
+/// no base directory is known or it cannot be created.
+#[cfg(feature = "openvino")]
+fn openvino_cache_dir() -> Option<std::path::PathBuf> {
+    let non_empty = |v: std::ffi::OsString| (!v.is_empty()).then_some(v);
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .and_then(non_empty)
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .and_then(non_empty)
+                .map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })?;
+    let dir = base.join("fluxframe").join("openvino");
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => Some(dir),
+        Err(e) => {
+            warn!(dir = %dir.display(), error = %e, "openvino model cache disabled");
+            None
+        }
+    }
 }
 
 /// `Auto` branch: try OpenVINO with the env-configured device (or
@@ -141,7 +247,7 @@ fn build_auto(
     config: ModelConfig,
 ) -> Result<(Box<dyn InferenceEngine + Send>, String), InferenceError> {
     let device = openvino_device_from_env();
-    match OpenVinoEngine::load(model_path, config.clone(), &device) {
+    match OpenVinoEngine::load(model_path, &config, &device) {
         Ok(engine) => Ok((Box::new(engine), format!("openvino[{device}]"))),
         Err(ov_err) => {
             warn!(
@@ -169,7 +275,7 @@ fn build_auto(
 #[cfg(feature = "openvino")]
 fn build_openvino_forced(
     model_path: &Path,
-    config: ModelConfig,
+    config: &ModelConfig,
 ) -> Result<(Box<dyn InferenceEngine + Send>, String), InferenceError> {
     let device = openvino_device_from_env();
     let engine = OpenVinoEngine::load(model_path, config, &device)?;
@@ -179,7 +285,7 @@ fn build_openvino_forced(
 #[cfg(not(feature = "openvino"))]
 fn build_openvino_forced(
     _model_path: &Path,
-    _config: ModelConfig,
+    _config: &ModelConfig,
 ) -> Result<(Box<dyn InferenceEngine + Send>, String), InferenceError> {
     Err(InferenceError::BackendUnavailable {
         reason: "FLUXFRAME_FORCE_INFERENCE_BACKEND=openvino but the `openvino` Cargo \
@@ -398,6 +504,48 @@ mod tests {
                 InferenceError::ModelNotFound { .. } | InferenceError::BackendUnavailable { .. },
             ) => {}
             Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    /// A model restricted to accelerators must not quietly fall back to
+    /// the CPU when the CPU backend is forced.
+    #[test]
+    fn restricted_model_with_forced_cpu_is_accelerator_unavailable() {
+        use crate::backend::overrides::InferenceBackendChoice;
+        let mut cfg = ModelConfig::new("rvm", 1, 1);
+        cfg.devices = Some(vec!["NPU".into()]);
+        let overrides = BackendOverrides::default().with_inference(InferenceBackendChoice::Cpu);
+        match build_inference_engine(Path::new("/nonexistent/model.onnx"), cfg, overrides, None) {
+            Ok(_) => panic!("must not run on the CPU"),
+            Err(InferenceError::AcceleratorUnavailable { reason }) => {
+                assert!(
+                    reason.contains("NPU"),
+                    "reason names the allowed devices: {reason}"
+                );
+            }
+            Err(other) => panic!("expected AcceleratorUnavailable, got: {other:?}"),
+        }
+    }
+
+    /// A missing model is a configuration error, not a device problem:
+    /// it must not trigger a fallback preset.
+    #[test]
+    fn restricted_model_missing_file_is_not_accelerator_unavailable() {
+        let mut cfg = ModelConfig::new("rvm", 1, 1);
+        cfg.devices = Some(vec!["NPU".into()]);
+        match build_inference_engine(
+            Path::new("/nonexistent/model.onnx"),
+            cfg,
+            BackendOverrides::default(),
+            None,
+        ) {
+            Ok(_) => panic!("nonexistent model must not succeed"),
+            // Without the openvino feature every restricted load is
+            // AcceleratorUnavailable by construction.
+            Err(InferenceError::ModelNotFound { .. }) => {}
+            Err(InferenceError::AcceleratorUnavailable { .. })
+                if cfg!(not(feature = "openvino")) => {}
+            Err(other) => panic!("expected ModelNotFound, got: {other:?}"),
         }
     }
 

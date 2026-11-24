@@ -202,6 +202,47 @@ pub trait InferenceEngine: Send {
     /// Returns [`InferenceError`] on shape mismatch, backend failure, or
     /// resource exhaustion.
     fn infer(&mut self, input: InferenceInput<'_>) -> Result<InferenceOutput, InferenceError>;
+
+    /// Whether [`Self::start`] / [`Self::wait`] run inference without
+    /// blocking the caller.  Callers that want to overlap inference with
+    /// other work check this and otherwise call [`Self::infer`].
+    fn supports_async(&self) -> bool {
+        false
+    }
+
+    /// Start a forward pass on `input` and return without waiting for
+    /// it.  At most one pass may be in flight; collect it with
+    /// [`Self::wait`].  `input` is copied before this returns.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation always fails: engines that return
+    /// `true` from [`Self::supports_async`] override it.
+    fn start(&mut self, input: InferenceInput<'_>) -> Result<(), InferenceError> {
+        let _ = input;
+        Err(InferenceError::InferenceFailed {
+            reason: "asynchronous inference is not supported by this engine".into(),
+        })
+    }
+
+    /// Wait for the pass started by [`Self::start`] and return its
+    /// output.
+    ///
+    /// # Errors
+    ///
+    /// Fails when nothing is in flight, on backend failure, and — in the
+    /// default implementation — always.
+    fn wait(&mut self) -> Result<InferenceOutput, InferenceError> {
+        Err(InferenceError::InferenceFailed {
+            reason: "asynchronous inference is not supported by this engine".into(),
+        })
+    }
+
+    /// Forget the state a recurrent model carries from one pass to the
+    /// next, so the next pass starts as if it saw its first frame.  A
+    /// pass still in flight is waited for and its result dropped.
+    /// Stateless engines need not override this.
+    fn reset_state(&mut self) {}
 }
 
 /// Abstraction over video capture backends (V4L2, testsrc, …).

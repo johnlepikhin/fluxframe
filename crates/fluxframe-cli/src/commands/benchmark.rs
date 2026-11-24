@@ -24,7 +24,11 @@ pub fn run(args: BenchmarkArgs) -> Result<(), FluxError> {
     // for missing files.  We don't pre-check exists() here — it would just
     // duplicate the syscall.
 
-    let config = fluxframe_effects::ml::load_sidecar_or_placeholder(&model_path)?;
+    let mut config = fluxframe_effects::ml::load_sidecar_or_placeholder(&model_path)?;
+    // A frame-sized model has no input size of its own; benchmark it at
+    // the default processing size.
+    let processing = fluxframe_core::config::InputConfig::default();
+    config.resolve_input_size(processing.width, processing.height);
 
     // Snapshot fields that we still need after `config` is moved into
     // `OnnxEngine::load`.  This avoids relying on `ModelConfig: Clone`
