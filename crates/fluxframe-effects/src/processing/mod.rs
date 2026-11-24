@@ -14,6 +14,7 @@ pub mod image_loader;
 pub mod mask;
 pub mod parallel;
 pub mod resize;
+pub mod soft_mask;
 pub mod subject_tracker;
 
 pub use blur::box_blur_rgb;

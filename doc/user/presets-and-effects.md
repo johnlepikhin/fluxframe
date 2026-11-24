@@ -289,6 +289,24 @@ of tones rather than flicker.
 The pattern is the same on every run. It is rebuilt when `cell_size`,
 `irregularity`, `line_width` or the frame size changes.
 
+### `shadow`
+
+Casts a soft shadow of the person on the plane, shifted by an offset, as if a
+lamp in front of you threw it on the wall behind. Uses the mask. On the
+background the shadow shows only beside the person; the person's own pixels
+come from the foreground.
+
+| Parameter  | Type    | Default | Range       | Description                                          |
+| ---------- | ------- | ------- | ----------- | ---------------------------------------------------- |
+| `offset_x` | integer | 14      | -128 to 128 | Horizontal shift in pixels; positive moves it right. |
+| `offset_y` | integer | 8       | -128 to 128 | Vertical shift in pixels; positive moves it down.    |
+| `blur`     | integer | 12      | 0 to 64     | Softness of the shadow's edge, in pixels.            |
+| `strength` | float   | 0.35    | 0 to 1      | Darkening where the shadow is full: 0 none, 1 black. |
+
+The mask is blurred at a quarter of the frame size, so even `blur = 0` leaves
+an edge a few pixels soft. Placed before `stained_glass`, the shadow is
+averaged into the glass cells; placed after it, the shadow lies over the glass.
+
 ### `passthrough`
 
 Leaves the plane unchanged. No parameters.

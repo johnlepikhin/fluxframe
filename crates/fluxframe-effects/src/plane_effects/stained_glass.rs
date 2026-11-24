@@ -14,29 +14,23 @@
 
 use fluxframe_core::context::{FrameContext, ProcessingContext};
 use fluxframe_core::error::EffectError;
-use fluxframe_core::metadata::{
-    CommitStrategy, DEBOUNCE_HEAVY_MS, DEBOUNCE_STANDARD_MS, EffectMetadata, ParamDescriptor,
-    ParamKind, Scale,
-};
+use fluxframe_core::metadata::{DEBOUNCE_HEAVY_MS, DEBOUNCE_STANDARD_MS, EffectMetadata};
 use fluxframe_core::plane::{FramePlane, MaskPlane, PlaneEffect};
 use fluxframe_core::traits::RawEffectParams;
 use serde::Deserialize;
 
-use super::helpers::reject_out_of_range;
+use super::helpers::{float_param, integer_param, reject_int_out_of_range, reject_out_of_range};
 use crate::processing::parallel::{for_each_row_mut, map_reduce_chunks_indexed};
 
 /// Smallest accepted `cell_size`: below it cells are a few pixels wide
 /// and the pattern reads as noise.
-const MIN_CELL_SIZE: u32 = 8;
-const MIN_CELL_SIZE_I64: i64 = MIN_CELL_SIZE as i64; // used by METADATA below
+const MIN_CELL_SIZE: i64 = 8;
 /// Largest accepted `cell_size`.  Also keeps the per-cell `u32` colour
 /// sums far from overflow: a cell spans at most two grid steps per
 /// axis, `512² × 255 ≈ 6.7e7 < u32::MAX`.
-const MAX_CELL_SIZE: u32 = 256;
-const MAX_CELL_SIZE_I64: i64 = MAX_CELL_SIZE as i64; // used by METADATA below
+const MAX_CELL_SIZE: i64 = 256;
 /// Largest accepted `line_width`, in pixels.
-const MAX_LINE_WIDTH: u32 = 8;
-const MAX_LINE_WIDTH_I64: i64 = MAX_LINE_WIDTH as i64; // used by METADATA below
+const MAX_LINE_WIDTH: i64 = 8;
 /// Upper bound on `smoothing`; `1.0` would freeze the colours.
 const MAX_SMOOTHING: f32 = 0.99;
 
@@ -200,49 +194,6 @@ pub struct StainedGlassEffect {
     colors_u8: Vec<[u8; 3]>,
 }
 
-const fn integer_param(
-    name: &'static str,
-    default: u32,
-    min: i64,
-    max: i64,
-    debounce_ms: u32,
-    help: &'static str,
-) -> ParamDescriptor {
-    ParamDescriptor {
-        name,
-        kind: ParamKind::Integer {
-            default: default as i64,
-            min,
-            max,
-            step: 1,
-            scale: Scale::Linear,
-        },
-        help,
-        commit: CommitStrategy::Live { debounce_ms },
-    }
-}
-
-const fn float_param(
-    name: &'static str,
-    default: f32,
-    max: f32,
-    debounce_ms: u32,
-    help: &'static str,
-) -> ParamDescriptor {
-    ParamDescriptor {
-        name,
-        kind: ParamKind::Float {
-            default,
-            min: 0.0,
-            max,
-            step: 0.05,
-            scale: Scale::Linear,
-        },
-        help,
-        commit: CommitStrategy::Live { debounce_ms },
-    }
-}
-
 impl StainedGlassEffect {
     /// Effect name as registered in the plane registry.
     pub const NAME: &'static str = "stained_glass";
@@ -254,15 +205,16 @@ impl StainedGlassEffect {
         params: &[
             integer_param(
                 "cell_size",
-                DEFAULT_CELL_SIZE,
-                MIN_CELL_SIZE_I64,
-                MAX_CELL_SIZE_I64,
+                DEFAULT_CELL_SIZE as i64,
+                MIN_CELL_SIZE,
+                MAX_CELL_SIZE,
                 DEBOUNCE_HEAVY_MS,
                 "Mean cell size, in pixels.",
             ),
             float_param(
                 "irregularity",
                 DEFAULT_IRREGULARITY,
+                0.0,
                 1.0,
                 DEBOUNCE_HEAVY_MS,
                 "0 gives a regular grid, 1 the most irregular cells.",
@@ -270,21 +222,23 @@ impl StainedGlassEffect {
             float_param(
                 "smoothing",
                 DEFAULT_SMOOTHING,
+                0.0,
                 MAX_SMOOTHING,
                 DEBOUNCE_STANDARD_MS,
                 "Per-frame inertia of the cell colours.",
             ),
             integer_param(
                 "line_width",
-                DEFAULT_LINE_WIDTH,
+                DEFAULT_LINE_WIDTH as i64,
                 0,
-                MAX_LINE_WIDTH_I64,
+                MAX_LINE_WIDTH,
                 DEBOUNCE_HEAVY_MS,
                 "Width of the lines between cells, in pixels; 0 draws none.",
             ),
             float_param(
                 "line_strength",
                 DEFAULT_LINE_STRENGTH,
+                0.0,
                 1.0,
                 DEBOUNCE_STANDARD_MS,
                 "How much darker the lines are: 0 invisible, 1 black.",
@@ -427,24 +381,20 @@ impl PlaneEffect for StainedGlassEffect {
         let cfg: StainedGlassConfig = params
             .try_into()
             .map_err(|e: toml::de::Error| super::invalid_config(Self::NAME, e.to_string()))?;
-        if !(MIN_CELL_SIZE..=MAX_CELL_SIZE).contains(&cfg.cell_size) {
-            return Err(super::invalid_config(
-                Self::NAME,
-                format!(
-                    "cell_size must be in {MIN_CELL_SIZE}..={MAX_CELL_SIZE}, got {}",
-                    cfg.cell_size
-                ),
-            ));
-        }
-        if cfg.line_width > MAX_LINE_WIDTH {
-            return Err(super::invalid_config(
-                Self::NAME,
-                format!(
-                    "line_width must be in 0..={MAX_LINE_WIDTH}, got {}",
-                    cfg.line_width
-                ),
-            ));
-        }
+        reject_int_out_of_range(
+            Self::NAME,
+            "cell_size",
+            cfg.cell_size.into(),
+            MIN_CELL_SIZE,
+            MAX_CELL_SIZE,
+        )?;
+        reject_int_out_of_range(
+            Self::NAME,
+            "line_width",
+            cfg.line_width.into(),
+            0,
+            MAX_LINE_WIDTH,
+        )?;
         reject_out_of_range(Self::NAME, "irregularity", cfg.irregularity, 0.0, 1.0)?;
         reject_out_of_range(Self::NAME, "smoothing", cfg.smoothing, 0.0, MAX_SMOOTHING)?;
         reject_out_of_range(Self::NAME, "line_strength", cfg.line_strength, 0.0, 1.0)?;
