@@ -11,6 +11,7 @@ mod passthrough;
 mod pixelate;
 mod registry;
 mod sharpen;
+mod stained_glass;
 mod vignette;
 
 pub use blur::BlurPlaneEffect;
@@ -22,6 +23,7 @@ pub use passthrough::PassthroughPlaneEffect;
 pub use pixelate::PixelateEffect;
 pub use registry::{PlaneEffectRegistry, default_registry};
 pub use sharpen::SharpenEffect;
+pub use stained_glass::StainedGlassEffect;
 pub use vignette::VignetteEffect;
 
 use fluxframe_core::EffectError;

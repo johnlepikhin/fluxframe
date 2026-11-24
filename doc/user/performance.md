@@ -120,6 +120,19 @@ and running the mask chain on a frame-sized mask (about 1 ms).
 On the CPU, RVM takes several times longer than a frame and is not supported;
 the sidecar restricts it to the NPU.
 
+### Background effects
+
+Synthetic source at 800x448 with the output discarded, MediaPipe on the NPU,
+`auto_frame` and `mirror`, interleaved runs; only the background effect
+differs.
+
+| Background effect                 | Effect time per frame (mean / p95) |
+| --------------------------------- | ---------------------------------- |
+| `pixelate`, `block_size = 14`     | 0.35 / 0.7-1.2 ms                  |
+| `stained_glass`, `cell_size = 48` | 0.72 / 1.3-1.7 ms                  |
+
+The difference in process CPU was within the run-to-run spread.
+
 ### Idle
 
 With idle mode enabled and no application reading the virtual camera, the daemon

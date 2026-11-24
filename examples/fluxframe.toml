@@ -178,6 +178,35 @@ deadband = 0.12
 hold_secs = 1.0
 glide_secs = 0.8
 
+# Stained glass: the room becomes fixed irregular cells in its own,
+# averaged colours, with thin dark lines between them.
+[presets.glass.mask]
+model = "./models/selfie_segmentation.onnx"
+chain = ["smooth_temporal", "threshold", "largest_blob", "feather"]
+
+[presets.glass.mask.smooth_temporal]
+factor = 0.85
+
+[presets.glass.mask.threshold]
+level = 0.8
+
+[presets.glass.mask.largest_blob]
+level = 0.5
+
+[presets.glass.mask.feather]
+radius = 3
+
+[presets.glass.background]
+chain = ["stained_glass"]
+
+[presets.glass.background.stained_glass]
+cell_size = 48
+irregularity = 0.8
+# Higher values turn movement behind you into slower colour shifts.
+smoothing = 0.9
+line_width = 2
+line_strength = 0.6
+
 # Robust Video Matting on an Intel NPU: soft hair edges and a steadier
 # mask, with the video delayed by one frame. Prepare the model first with
 # `tools/prepare-rvm.py --output-dir models` (see doc/user/installation.md),

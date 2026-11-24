@@ -267,6 +267,25 @@ on the foreground.
 When the image already uses most of the brightness range, the effect leaves it
 unchanged.
 
+### `stained_glass`
+
+Draws the plane as stained glass: fixed, irregular cells, each filled with the
+averaged colour of the area it covers, separated by thin dark lines. The room's
+own colours are kept but lose all detail. The cell pattern never changes and
+each cell's colour changes slowly, so movement behind you becomes a slow shift
+of tones rather than flicker.
+
+| Parameter       | Type    | Default | Range     | Description                                                    |
+| --------------- | ------- | ------- | --------- | -------------------------------------------------------------- |
+| `cell_size`     | integer | 48      | 8 to 256  | Mean cell size in pixels.                                      |
+| `irregularity`  | float   | 0.8     | 0 to 1    | 0 gives a regular grid of squares, 1 the most irregular cells. |
+| `smoothing`     | float   | 0.9     | 0 to 0.99 | Per-frame inertia of the cell colours. 0 follows the frame.    |
+| `line_width`    | integer | 2       | 0 to 8    | Width of the lines between cells in pixels. 0 draws none.      |
+| `line_strength` | float   | 0.6     | 0 to 1    | How much darker the lines are: 0 invisible, 1 black.           |
+
+The pattern is the same on every run. It is rebuilt when `cell_size`,
+`irregularity`, `line_width` or the frame size changes.
+
 ### `passthrough`
 
 Leaves the plane unchanged. No parameters.
@@ -400,6 +419,24 @@ chain = ["auto_frame", "mirror"]
 [presets.framed.post.auto_frame]
 smoothing = 0.95
 zoom_max = 1.3
+```
+
+Stained-glass background that keeps the colours of the room:
+
+```toml
+[presets.glass.mask]
+model = "./models/selfie_segmentation.onnx"
+chain = ["smooth_temporal", "threshold", "largest_blob", "feather"]
+[presets.glass.mask.threshold]
+level = 0.8
+[presets.glass.mask.feather]
+radius = 3
+
+[presets.glass.background]
+chain = ["stained_glass"]
+[presets.glass.background.stained_glass]
+cell_size = 48
+line_strength = 0.6
 ```
 
 Robust Video Matting on the NPU over a blurred background, with MediaPipe as

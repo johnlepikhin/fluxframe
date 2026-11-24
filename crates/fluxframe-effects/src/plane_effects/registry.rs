@@ -103,7 +103,7 @@ pub fn default_registry() -> PlaneEffectRegistry {
     use crate::plane_effects::ImageFillEffect;
     use crate::plane_effects::{
         BlurPlaneEffect, ColorFillEffect, ExposureCorrectEffect, PassthroughPlaneEffect,
-        PixelateEffect, SharpenEffect, VignetteEffect,
+        PixelateEffect, SharpenEffect, StainedGlassEffect, VignetteEffect,
     };
     let mut registry = PlaneEffectRegistry::new();
     registry.register(
@@ -125,6 +125,11 @@ pub fn default_registry() -> PlaneEffectRegistry {
         PixelateEffect::NAME,
         Box::new(|| -> Box<dyn PlaneEffect> { Box::new(PixelateEffect::new()) }),
         &PixelateEffect::METADATA,
+    );
+    registry.register(
+        StainedGlassEffect::NAME,
+        Box::new(|| -> Box<dyn PlaneEffect> { Box::new(StainedGlassEffect::new()) }),
+        &StainedGlassEffect::METADATA,
     );
     registry.register(
         SharpenEffect::NAME,
@@ -163,6 +168,7 @@ mod tests {
         assert!(names.contains(&"passthrough"));
         assert!(names.contains(&"pixelate"));
         assert!(names.contains(&"sharpen"));
+        assert!(names.contains(&"stained_glass"));
         assert!(names.contains(&"vignette"));
         assert!(names.contains(&"exposure_correct"));
         #[cfg(feature = "image-fill")]

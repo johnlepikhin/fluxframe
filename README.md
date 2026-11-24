@@ -6,7 +6,7 @@ A companion GTK application, `fluxframe-gui`, edits the running daemon live and 
 
 ## Features
 
-- Background blur, pixelation, solid colour or image replacement, and foreground corrections (exposure, sharpening, vignette).
+- Background blur, pixelation, stained glass, solid colour or image replacement, and foreground corrections (exposure, sharpening, vignette).
 - Automatic framing that follows the person, and horizontal mirroring.
 - Named presets in a single TOML file, switchable at runtime.
 - Live reconfiguration over a local UNIX socket, with write-back to the configuration file.

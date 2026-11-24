@@ -114,15 +114,39 @@ where
     M: Fn(&[E]) -> T + Sync,
     R: Fn(T, T) -> T + Sync,
 {
+    map_reduce_chunks_indexed(data, chunk_len, identity, |_, chunk| map(chunk), merge)
+}
+
+/// [`map_reduce_chunks`] whose `map` also receives the chunk's start
+/// index in `data`, for kernels that look up per-element side tables
+/// (a label map, a per-pixel LUT) by position.
+pub fn map_reduce_chunks_indexed<E, T, I, M, R>(
+    data: &[E],
+    chunk_len: usize,
+    identity: I,
+    map: M,
+    merge: R,
+) -> T
+where
+    E: Sync,
+    T: Send,
+    I: Fn() -> T + Sync,
+    M: Fn(usize, &[E]) -> T + Sync,
+    R: Fn(T, T) -> T + Sync,
+{
     if chunk_len == 0 || data.is_empty() {
         return identity();
     }
     if should_parallelize(data.len()) {
         data.par_chunks(chunk_len)
-            .map(&map)
+            .enumerate()
+            .map(|(i, chunk)| map(i * chunk_len, chunk))
             .reduce(&identity, &merge)
     } else {
-        data.chunks(chunk_len).map(&map).fold(identity(), &merge)
+        data.chunks(chunk_len)
+            .enumerate()
+            .map(|(i, chunk)| map(i * chunk_len, chunk))
+            .fold(identity(), &merge)
     }
 }
 
@@ -221,6 +245,28 @@ mod tests {
             );
             let expected: u64 = data.iter().map(|&x| u64::from(x)).sum();
             assert_eq!(total, expected, "len={len}");
+        }
+    }
+
+    #[test]
+    fn map_reduce_indexed_supplies_chunk_offsets_in_both_paths() {
+        // Summing `offset + i` over each chunk reconstructs the global
+        // index of every element, so the total is the sum 0..len.
+        for len in [30_usize, MIN_PARALLEL_ELEMS * 2 + 5] {
+            let data = vec![0_u8; len];
+            let total: u64 = map_reduce_chunks_indexed(
+                &data,
+                8,
+                || 0_u64,
+                |offset, chunk| {
+                    (0..chunk.len())
+                        .map(|i| u64::try_from(offset + i).unwrap())
+                        .sum::<u64>()
+                },
+                |a, b| a + b,
+            );
+            let n = u64::try_from(len).unwrap();
+            assert_eq!(total, n * (n - 1) / 2, "len={len}");
         }
     }
 
