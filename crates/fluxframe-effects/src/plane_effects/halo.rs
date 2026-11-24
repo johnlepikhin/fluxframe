@@ -19,7 +19,7 @@ use serde::Deserialize;
 use super::helpers::{
     check_mask_size, float_param, integer_param, reject_int_out_of_range, reject_out_of_range,
 };
-use crate::processing::soft_mask::{SoftMask, shade};
+use crate::processing::soft_mask::{SoftMask, closeness, shade};
 
 const MIN_RADIUS: i64 = 8;
 const MAX_RADIUS: i64 = 256;
@@ -71,13 +71,6 @@ impl Default for HaloConfig {
             dim: default_dim(),
         }
     }
-}
-
-/// Halo intensity for a blurred mask value: the blurred mask is about
-/// one half right at the silhouette's edge, so it is doubled to make the
-/// halo full there and fade out over `radius`.
-fn closeness(soft: f32) -> f32 {
-    (2.0 * soft).min(1.0)
 }
 
 /// `PlaneEffect` lighting the plane around the person.

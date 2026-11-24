@@ -201,16 +201,82 @@ fn shifted_taps(taps: &[Tap], shift: i32) -> impl Iterator<Item = &Tap> {
         .chain(std::iter::repeat_n(&taps[len - 1], trail))
 }
 
-/// Multiply every pixel of a packed-RGB `plane` (`width` pixels wide,
-/// same size as the frame `soft` was built from) by an 8.8 fixed-point
-/// gain derived from the soft mask sampled at `(x - shift_x,
-/// y - shift_y)`. `gain` maps a mask value in `[0, 1]` to the factor
-/// (`256` = unchanged); results above `255` saturate.
+/// How close a pixel is to the person, from a blurred mask value: the
+/// blurred mask is about one half right at the silhouette's edge, so it
+/// is doubled — `1` at the edge and inside, falling to `0` at the blur
+/// radius outside.
+#[must_use]
+pub fn closeness(soft: f32) -> f32 {
+    (2.0 * soft).min(1.0)
+}
+
+/// Apply a per-pixel operation to a packed-RGB `plane` (`width` pixels
+/// wide, same size as the frame `soft` was built from), driven by the
+/// soft mask sampled at `(x - shift_x, y - shift_y)`.
 ///
-/// `gain` is evaluated on the quarter-size grid (once per grid column
-/// and frame row) and the gains are interpolated along the row in
-/// fixed point, which keeps the per-pixel work to a few integer
+/// `eval` maps a mask value in `[0, 1]` to an integer parameter (at
+/// most `2^23`); it runs on the quarter-size grid, once per grid column
+/// and frame row, and the results are interpolated along the row in
+/// fixed point. `apply` then receives each pixel (3 bytes) with its
+/// interpolated parameter, so the per-pixel work stays a few integer
 /// operations.
+///
+/// # Panics
+///
+/// Panics if `plane` does not match the size of the last
+/// [`SoftMask::update`].
+pub fn map_rows<E, A>(
+    plane: &mut [u8],
+    width: usize,
+    soft: &SoftMask,
+    shift: (i32, i32),
+    eval: E,
+    apply: A,
+) where
+    E: Fn(f32) -> u32 + Sync,
+    A: Fn(&mut [u8], u32) + Sync,
+{
+    assert_eq!(width, soft.frame_w, "plane width must match the mask");
+    assert_eq!(plane.len(), soft.frame_w * soft.frame_h * 3);
+    if plane.is_empty() {
+        return;
+    }
+    let (shift_x, shift_y) = shift;
+    // Compact form for the per-pixel loop, materialised once per call (a
+    // chained iterator in the loop would defeat the optimiser): index of
+    // the left value and the 8.8 weight of the right one. The values row
+    // gets one padding entry, so `i + 1` is always valid (clamped taps
+    // have weight 0).
+    let x_taps: Vec<(u32, u32)> = shifted_taps(&soft.x_taps, shift_x)
+        .map(|t| (t.i0 as u32, t.w1_q8))
+        .collect();
+    for_each_row_mut(plane, width * 3, |y, row| {
+        let tap = soft.y_taps[shifted(y, shift_y, soft.frame_h)];
+        let small_row = |i: usize| &soft.small[i * soft.small_w..(i + 1) * soft.small_w];
+        let mut values: Vec<u32> = small_row(tap.i0)
+            .iter()
+            .zip(small_row(tap.i1))
+            .map(|(&top, &bottom)| eval(top + (bottom - top) * tap.w1))
+            .collect();
+        values.push(*values.last().expect("non-empty row"));
+        // Interpolate first, then apply in a plain loop the compiler can
+        // keep tight.
+        let row_values: Vec<u32> = x_taps
+            .iter()
+            .map(|&(i, w)| {
+                let i = i as usize;
+                (values[i] * (256 - w) + values[i + 1] * w + 128) >> 8
+            })
+            .collect();
+        for (px, &v) in row.chunks_exact_mut(3).zip(&row_values) {
+            apply(px, v);
+        }
+    });
+}
+
+/// Multiply every pixel by an 8.8 fixed-point gain derived from the soft
+/// mask (see [`map_rows`]): `gain` maps a mask value in `[0, 1]` to the
+/// factor (`256` = unchanged); results above `255` saturate.
 ///
 /// # Panics
 ///
@@ -220,42 +286,9 @@ pub fn shade<G>(plane: &mut [u8], width: usize, soft: &SoftMask, shift: (i32, i3
 where
     G: Fn(f32) -> u32 + Sync,
 {
-    assert_eq!(width, soft.frame_w, "plane width must match the mask");
-    assert_eq!(plane.len(), soft.frame_w * soft.frame_h * 3);
-    if plane.is_empty() {
-        return;
-    }
-    let (shift_x, shift_y) = shift;
-    // Materialised once per call: a chained iterator in the per-pixel
-    // loop would defeat the optimiser.
-    // Compact form for the per-pixel loop: index of the left gain and
-    // the 8.8 weight of the right one. The gains row gets one padding
-    // entry, so `i + 1` is always valid (clamped taps have weight 0).
-    let x_taps: Vec<(u32, u32)> = shifted_taps(&soft.x_taps, shift_x)
-        .map(|t| (t.i0 as u32, t.w1_q8))
-        .collect();
-    for_each_row_mut(plane, width * 3, |y, row| {
-        let tap = soft.y_taps[shifted(y, shift_y, soft.frame_h)];
-        let small_row = |i: usize| &soft.small[i * soft.small_w..(i + 1) * soft.small_w];
-        let mut gains: Vec<u32> = small_row(tap.i0)
-            .iter()
-            .zip(small_row(tap.i1))
-            .map(|(&top, &bottom)| gain(top + (bottom - top) * tap.w1))
-            .collect();
-        gains.push(*gains.last().expect("non-empty row"));
-        // Interpolate first, then apply in a plain loop the compiler can
-        // keep tight.
-        let row_gains: Vec<u32> = x_taps
-            .iter()
-            .map(|&(i, w)| {
-                let i = i as usize;
-                (gains[i] * (256 - w) + gains[i + 1] * w + 128) >> 8
-            })
-            .collect();
-        for (px, &g) in row.chunks_exact_mut(3).zip(&row_gains) {
-            for c in px {
-                *c = ((u32::from(*c) * g + 128) >> 8).min(255) as u8;
-            }
+    map_rows(plane, width, soft, shift, gain, |px, g| {
+        for c in px {
+            *c = ((u32::from(*c) * g + 128) >> 8).min(255) as u8;
         }
     });
 }
@@ -319,6 +352,31 @@ mod tests {
             let slow: Vec<Tap> = (0..23).map(|x| taps[shifted(x, shift, 23)]).collect();
             assert_eq!(fast, slow, "shift {shift}");
         }
+    }
+
+    #[test]
+    fn map_rows_passes_the_interpolated_value_to_each_pixel() {
+        let (w, h) = (12_u32, 8_u32);
+        let mut soft = SoftMask::new();
+        soft.update(&[0.5; 96], w, h, 0);
+        let mut plane = vec![0_u8; 12 * 8 * 3];
+        map_rows(
+            &mut plane,
+            12,
+            &soft,
+            (0, 0),
+            |s| (s * 200.0) as u32,
+            |px, v| px.fill(v as u8),
+        );
+        assert!(plane.iter().all(|&v| v == 100));
+    }
+
+    #[test]
+    fn closeness_is_full_at_the_edge_and_zero_far_away() {
+        assert!((closeness(0.5) - 1.0).abs() < 1e-6);
+        assert!((closeness(0.9) - 1.0).abs() < 1e-6);
+        assert!((closeness(0.25) - 0.5).abs() < 1e-6);
+        assert!(closeness(0.0).abs() < 1e-6);
     }
 
     #[test]
