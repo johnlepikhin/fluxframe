@@ -335,7 +335,9 @@ impl SegmentationBase {
         // Use clear()+resize() instead of `vec![...]` so existing capacity
         // is reused on re-prepare; saves an allocation per reconfigure.
         self.model_input_u8.clear();
-        self.model_input_u8.resize(model_pixels * 3, 0);
+        if (self.model_w, self.model_h) != (context.width, context.height) {
+            self.model_input_u8.resize(model_pixels * 3, 0);
+        }
         self.model_input_f32.clear();
         self.model_input_f32.resize(model_pixels * 3, 0.0);
         self.mask_raw.clear();
@@ -534,16 +536,23 @@ impl SegmentationBase {
         };
 
         let t_pre = Instant::now();
-        resize_rgb_bilinear(
-            frame.data.as_slice(),
-            frame.width,
-            frame.height,
-            &mut self.model_input_u8,
-            self.model_w,
-            self.model_h,
-        );
+        // A frame-sized model takes the frame as is; others get it
+        // resized into `model_input_u8` first.
+        let rgb: &[u8] = if (self.model_w, self.model_h) == (frame.width, frame.height) {
+            frame.data.as_slice()
+        } else {
+            resize_rgb_bilinear(
+                frame.data.as_slice(),
+                frame.width,
+                frame.height,
+                &mut self.model_input_u8,
+                self.model_w,
+                self.model_h,
+            );
+            &self.model_input_u8
+        };
         pack_input(
-            &self.model_input_u8,
+            rgb,
             &mut self.model_input_f32,
             layout,
             self.model_h,
@@ -668,16 +677,17 @@ fn pack_input(
             }
         }
         InputLayout::Nchw => {
-            for c in 0..3 {
-                let plane = c * pixels;
-                for y in 0..h {
-                    let row_src = y * w * 3;
-                    let row_dst = plane + y * w;
-                    for x in 0..w {
-                        let v = src_hwc_u8[row_src + x * 3 + c];
-                        dst_f32[row_dst + x] = (f32::from(v) - zero) * scale;
-                    }
-                }
+            // One sequential pass over the source, three sequential
+            // write streams — not three strided passes.
+            let (red, rest) = dst_f32.split_at_mut(pixels);
+            let (green, blue) = rest.split_at_mut(pixels);
+            for (px, ((out_r, out_g), out_b)) in src_hwc_u8
+                .chunks_exact(3)
+                .zip(red.iter_mut().zip(green.iter_mut()).zip(blue.iter_mut()))
+            {
+                *out_r = (f32::from(px[0]) - zero) * scale;
+                *out_g = (f32::from(px[1]) - zero) * scale;
+                *out_b = (f32::from(px[2]) - zero) * scale;
             }
         }
     }

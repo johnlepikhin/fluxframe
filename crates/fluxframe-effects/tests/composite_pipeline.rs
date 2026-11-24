@@ -316,3 +316,28 @@ fn shutdown_aborts_the_pipeline() {
     c.shutdown().expect("shutdown");
     assert_eq!(log.lock().unwrap().resets, resets_before + 1);
 }
+
+#[test]
+fn framing_jump_resets_model_state_but_keeps_the_stream() {
+    let sidecar = Sidecar::new("jump", true);
+    let log = Arc::new(Mutex::new(EngineLog::default()));
+    let mut c = composite(&sidecar, &log);
+    run(&mut c, 1);
+    run(&mut c, 2);
+    let resets_before = log.lock().unwrap().resets;
+
+    // A one-pixel glide per frame (as in `ctx_for`) is not a jump.
+    run(&mut c, 3);
+    assert_eq!(log.lock().unwrap().resets, resets_before);
+
+    // The window leaps by 20 px of a 50 px window.
+    let mut f = frame(4);
+    let mut ctx = ctx_for(4);
+    if let Some(source) = ctx.framing.source.as_mut() {
+        source.region.x = 24.0;
+    }
+    c.process(&mut f, &mut ctx).expect("process");
+    assert_eq!(log.lock().unwrap().resets, resets_before + 1, "state reset");
+    assert!(!ctx.output_withheld, "the held frame is still emitted");
+    assert_eq!(f.data.as_slice(), composed(3).as_slice());
+}

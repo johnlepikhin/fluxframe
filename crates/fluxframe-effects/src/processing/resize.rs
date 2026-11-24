@@ -155,6 +155,12 @@ pub fn resize_rgb_bilinear(
     dst_w: u32,
     dst_h: u32,
 ) {
+    // Same size: with half-pixel centres every tap lands on a source
+    // pixel with zero weight on its neighbour, so the resize is a copy.
+    if (src_w, src_h) == (dst_w, dst_h) {
+        dst.copy_from_slice(src);
+        return;
+    }
     let full = Region::full(src_w, src_h);
     resize_rgb_bilinear_region(src, src_w, src_h, &full, dst, dst_w, dst_h);
 }
@@ -286,6 +292,11 @@ pub fn resize_mask_bilinear(
     debug_assert_eq!(src.len(), (src_w * src_h) as usize);
     debug_assert_eq!(dst.len(), (dst_w * dst_h) as usize);
     if dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0 {
+        return;
+    }
+    // Same size (a frame-sized model): the resize is a copy.
+    if (src_w, src_h) == (dst_w, dst_h) {
+        dst.copy_from_slice(src);
         return;
     }
     let xs = axis_taps(src_w, dst_w);

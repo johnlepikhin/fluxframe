@@ -13,12 +13,13 @@ use std::time::{Duration, Instant};
 use fluxframe_core::context::{FrameContext, FramingSource, ProcessingContext};
 use fluxframe_core::error::EffectError;
 use fluxframe_core::frame::{PixelFormat, VideoFrame};
+use fluxframe_core::geometry::Region;
 use fluxframe_core::metrics::StageKey;
 use fluxframe_core::plane::{
     FramePlane, MaskEffect, MaskPlane, PlaneEffect, PostEffect, SubchainKind,
 };
 use fluxframe_core::traits::{RawEffectParams, VideoEffect};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::composite::segmentation::{SegmentationBase, SegmentationOutcome};
 use crate::processing::compose::alpha_composite_rgb_in_place;
@@ -31,6 +32,12 @@ const SCOPE: &str = "composite";
 /// (camera recovery, idle, a slow control command) and both the frame
 /// and the recurrent model state it was computed with are stale.
 const STALE_HELD_FRAME: Duration = Duration::from_millis(500);
+
+/// A framing window whose edge moved by more than this share of its
+/// smaller side since the previous segmented frame has jumped rather
+/// than glided: a recurrent model's state no longer matches the image
+/// and is reset.  `auto_frame` glides by about 1 % per frame.
+const FRAMING_JUMP: f32 = 0.05;
 
 /// Time `f` and publish the elapsed wall-clock under `key` through the
 /// frame's telemetry sink (a no-op sink costs one `Instant::now`
@@ -86,6 +93,9 @@ pub struct CompositeEffect {
     /// Pipelined segmentation only: the frame whose inference is in
     /// flight, emitted on the next call.
     held: Option<HeldFrame>,
+    /// Framing window of the last frame handed to segmentation, to
+    /// detect window jumps ([`FRAMING_JUMP`]).
+    last_seg_region: Option<Region>,
 }
 
 /// A frame waiting for its mask while the next one is captured.
@@ -172,6 +182,7 @@ impl CompositeEffect {
             frame_h: 0,
             processing_ctx: None,
             held: None,
+            last_seg_region: None,
         }
     }
 
@@ -217,7 +228,27 @@ impl CompositeEffect {
     /// framing window.  No-op beyond the state reset when not pipelined.
     pub fn abort_pipeline(&mut self) {
         self.held = None;
+        self.last_seg_region = None;
         self.segmentation.abort();
+    }
+
+    /// Reset the segmentation model's recurrent state when the framing
+    /// window of the frame about to be segmented jumped.  Call with no
+    /// pass in flight.
+    fn reset_on_framing_jump(&mut self, source: Option<FramingSource>) {
+        let region = source.map(|s| s.region);
+        if let (Some(prev), Some(next)) = (self.last_seg_region, region) {
+            let tolerance = FRAMING_JUMP * prev.width.min(prev.height);
+            if !prev.approx_eq(&next, tolerance) {
+                debug!(
+                    ?prev,
+                    ?next,
+                    "framing window jumped; segmentation state reset"
+                );
+                self.segmentation.abort();
+            }
+        }
+        self.last_seg_region = region;
     }
 
     /// Frames by which the output trails the input: 1 when segmentation
@@ -321,6 +352,7 @@ impl CompositeEffect {
         if let SegmentationOutcome::Fatal(err) = outcome {
             return Err(err);
         }
+        self.reset_on_framing_jump(ctx.framing.source);
         frame.data.make_owned();
         let submitted = self.segmentation.begin(frame, ctx)?;
         ctx.telemetry
@@ -577,6 +609,7 @@ impl VideoEffect for CompositeEffect {
         }
 
         self.held = None;
+        self.last_seg_region = None;
         self.segmentation.prepare(context)?;
         // Disabled effects are prepared too, so enabling one is instant.
         for slot in &mut self.mask_chain {
@@ -626,6 +659,7 @@ impl VideoEffect for CompositeEffect {
         if self.segmentation.pipelined() {
             return self.process_pipelined(frame, ctx);
         }
+        self.reset_on_framing_jump(ctx.framing.source);
         // 1. Segmentation produces a mask at model resolution.
         let seg_result = timed(ctx, StageKey::new(SCOPE, "seg"), |ctx| {
             self.segmentation.process(frame, ctx)
