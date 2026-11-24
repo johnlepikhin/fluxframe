@@ -61,6 +61,14 @@ const LOST_SECS: f32 = 2.0;
 /// A subject edge within this fraction of the frame size from a frame
 /// edge counts as cut off there.
 const EDGE_TOUCH: f32 = 0.02;
+/// A window edge within this fraction of the captured size from the
+/// captured frame's edge shows all there is: a few pixels beyond it are
+/// not worth revealing.  The full view itself stops short of the edges
+/// when its aspect differs from the capture's (a 1280 x 720 capture shown
+/// at 800 x 448 leaves 1.6 px above and below), and a subject touching
+/// such an edge must not count as cut off: every frame would then be an
+/// urgent move from a guess, and the subject would never be measured.
+const WINDOW_AT_EDGE: f32 = 0.02;
 /// How far beyond a cut-off edge the subject is assumed to extend, as a
 /// fraction of the window size on that axis.  Generous on purpose: the
 /// window then moves out far enough to reveal the real extent, after
@@ -354,12 +362,14 @@ fn to_capture(
         frame_h,
     );
     let (tol_x, tol_y) = (EDGE_TOUCH * fw, EDGE_TOUCH * fh);
-    // A window edge more than half a pixel inside the captured frame has
-    // more picture beyond it.
-    let more_left = r.x > 0.5;
-    let more_top = r.y > 0.5;
-    let more_right = r.x + r.width < source.width as f32 - 0.5;
-    let more_bottom = r.y + r.height < source.height as f32 - 0.5;
+    // A window edge clearly inside the captured frame has more picture
+    // beyond it.
+    let (cw, ch) = (source.width as f32, source.height as f32);
+    let (gap_x, gap_y) = (WINDOW_AT_EDGE * cw, WINDOW_AT_EDGE * ch);
+    let more_left = r.x > gap_x;
+    let more_top = r.y > gap_y;
+    let more_right = r.x + r.width < cw - gap_x;
+    let more_bottom = r.y + r.height < ch - gap_y;
     let mut cut_off = false;
     if more_left && subject.cx - subject.hw <= tol_x {
         left -= CUT_OFF_EXTENSION * r.width;
@@ -704,6 +714,102 @@ mod tests {
         let (boxed, cut_off) = to_capture(subject, &full, W, H);
         assert!(!cut_off);
         assert!((boxed.cx - 6.0).abs() < 1e-3, "{boxed:?}");
+    }
+
+    /// The full view of a capture whose aspect differs slightly from the
+    /// processed frame's stops 1.6 px short of the top and bottom.  A
+    /// seated subject touching the bottom of that view is not cut off:
+    /// there is nothing to reveal, and treating it as cut off kept the
+    /// window from ever zooming in.
+    #[test]
+    fn subject_at_the_edge_of_a_banded_full_view_is_not_cut_off() {
+        let full_band = FramingSource {
+            width: 1280,
+            height: 720,
+            region: Region {
+                x: 0.0,
+                y: 1.6,
+                width: 1280.0,
+                height: 716.8,
+            },
+        };
+        // Touches the bottom of the 800 x 448 processed frame.
+        let seated = SubjectBox {
+            cx: 400.0,
+            cy: 300.0,
+            hw: 150.0,
+            hh: 148.0,
+        };
+        let (boxed, cut_off) = to_capture(seated, &full_band, 800, 448);
+        assert!(!cut_off, "{boxed:?}");
+        assert!((boxed.cy + boxed.hh - 718.4).abs() < 0.5, "{boxed:?}");
+    }
+
+    /// Closed loop, as in the runtime: each frame is cut from the window
+    /// the previous one requested.  Live geometry: a 1280 x 720 capture
+    /// processed at 800 x 448, whose full view stops 1.6 px short of the
+    /// capture's top and bottom.  The person first sits, then leaves
+    /// (the window returns to that full view), then sits down again,
+    /// filling the capture down to its bottom edge.  The window must zoom
+    /// in on the person again and stay there.
+    #[test]
+    fn seated_subject_at_the_bottom_edge_is_zoomed_in_on() {
+        const CW: u32 = 1280;
+        const CH: u32 = 720;
+        const FW: u32 = 800;
+        const FH: u32 = 448;
+        // The person in capture coordinates, as measured live; the body
+        // continues below the capture.
+        let (px0, py0, px1, py1) = (403.0_f32, 223.0_f32, 891.0_f32, CH as f32);
+        let mut effect = AutoFrameEffect::new();
+        effect
+            .configure(parse("padding = 0.1\nsmoothing = 0.85\nzoom_max = 1.3"))
+            .expect("configure");
+        effect.prepare(&ctx(FW, FH)).expect("prepare");
+        let mut region = Region {
+            x: 0.0,
+            y: 1.6,
+            width: 1280.0,
+            height: 716.8,
+        };
+        let mut frame = vec![0u8; (FW * FH * 3) as usize];
+        let mut widths = Vec::new();
+        for i in 0..900 {
+            let present = !(200..400).contains(&i);
+            // Render the person as this window shows it.
+            let to_x = |x: f32| ((x - region.x) / region.width * FW as f32).clamp(0.0, FW as f32);
+            let to_y = |y: f32| ((y - region.y) / region.height * FH as f32).clamp(0.0, FH as f32);
+            let (x0, x1) = (to_x(px0).round() as u32, to_x(px1).round() as u32);
+            let (y0, y1) = (to_y(py0).round() as u32, to_y(py1).round() as u32);
+            let mut mask = vec![0.0_f32; (FW * FH) as usize];
+            for y in (y0..y1).filter(|_| present) {
+                for x in x0..x1 {
+                    mask[(y * FW + x) as usize] = 1.0;
+                }
+            }
+            let mut fctx = framed(CW, CH, region);
+            let mut plane = FramePlane::new(&mut frame, FW, FH);
+            effect
+                .process(&mut plane, &MaskPlane::new(&mut mask, FW, FH), &mut fctx)
+                .expect("ok");
+            region = fctx.framing.request.expect("a request");
+            widths.push(region.width);
+        }
+        let zoomed = CW as f32 / 1.3;
+        assert!(
+            (region.width - zoomed).abs() < 2.0,
+            "not zoomed in to 1.3: {region:?}"
+        );
+        assert!(
+            widths[399] > CW as f32 - 2.0,
+            "the window must return to the full view while nobody is there"
+        );
+        // Settled: the last few seconds hold still.
+        let tail = &widths[widths.len() - 150..];
+        assert!(
+            tail.iter().all(|w| (w - tail[0]).abs() < 1e-3),
+            "the window keeps moving"
+        );
     }
 
     #[test]

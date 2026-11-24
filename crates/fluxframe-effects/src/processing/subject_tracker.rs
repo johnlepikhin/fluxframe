@@ -32,6 +32,9 @@ const MIN_COVERAGE: f32 = 0.002;
 /// mask width (the mask is an upscaled model output, so denser sampling
 /// adds no information).
 const SAMPLE_COLUMNS: usize = 320;
+/// Smallest deviation worth a move for a cut-off subject, which skips
+/// the dead zone; below it the window already shows what it can.
+const URGENT_MIN_DEVIATION: f32 = 0.005;
 
 /// Box a subject occupies, as centre and half-extents in mask pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -179,6 +182,11 @@ pub struct SubjectTracker {
     hold: u32,
     /// Consecutive frames without a subject.
     lost: u32,
+    /// The window was placed for a cut-off subject, from a guess at its
+    /// extent rather than a measurement.  The dead zone does not hold
+    /// such a window: once the subject is measured in full, the window
+    /// settles on it even when the correction is small.
+    provisional: bool,
 }
 
 impl SubjectTracker {
@@ -196,6 +204,7 @@ impl SubjectTracker {
             glide: None,
             hold: 0,
             lost: 0,
+            provisional: false,
         }
     }
 
@@ -211,6 +220,7 @@ impl SubjectTracker {
         self.glide = None;
         self.hold = 0;
         self.lost = 0;
+        self.provisional = false;
     }
 
     /// The largest window (no zoom).
@@ -265,7 +275,22 @@ impl SubjectTracker {
             return glide.from.lerp(&target, smoothstep(t));
         }
 
-        if deviation(&locked, &target) < self.params.deadband {
+        // The dead zone applies to a window placed from a measurement.
+        // A cut-off subject's true extent is unknown until the window
+        // reveals it, and a window placed from a guess at that extent
+        // has to settle once the subject is measured: either kept still
+        // by the dead zone would stay off for good.
+        let dev = deviation(&locked, &target);
+        let dead_zone = if urgent || self.provisional {
+            URGENT_MIN_DEVIATION
+        } else {
+            self.params.deadband
+        };
+        if dev <= dead_zone {
+            // Only a full measurement confirms the window.
+            if !urgent {
+                self.provisional = false;
+            }
             self.hold = 0;
             return locked;
         }
@@ -276,6 +301,7 @@ impl SubjectTracker {
             return locked;
         }
         self.hold = 0;
+        self.provisional = urgent;
         debug!(
             from = ?locked,
             to = ?target,
@@ -467,6 +493,63 @@ mod tests {
             })
             .expect("urgent move must start within a few frames");
         assert!(moved_at < 5, "moved after {moved_at} frames");
+    }
+
+    /// A window that leaves a subject cut off must move even when the
+    /// target is within the dead zone.  Otherwise a seated person cut off
+    /// at the bottom keeps the window still: the extended box puts the
+    /// target near the window, the true extent is never measured, and the
+    /// window never zooms back in.
+    #[test]
+    fn cut_off_subject_moves_the_window_within_the_dead_zone() {
+        let mut t = tracker();
+        run(&mut t, 30, |_| Some(subject(400.0, 250.0)));
+        let start = t.update(Some(subject(400.0, 250.0)), false);
+        // 20 px off a 400 px window: 5 %, well inside the 12 % dead zone.
+        let near = Some(subject(420.0, 250.0));
+        assert!(
+            (0..60).all(|_| t.update(near, false).approx_eq(&start, 1e-3)),
+            "a plain shift inside the dead zone must not move the window"
+        );
+        let moved = (0..10).any(|_| !t.update(near, true).approx_eq(&start, 1e-3));
+        assert!(moved, "a cut-off subject must move the window");
+    }
+
+    /// A window placed for a cut-off subject comes from a guess at its
+    /// extent.  Once the subject is measured in full, the window settles
+    /// on it even when the correction is inside the dead zone; otherwise
+    /// it stays at whatever zoom the guess produced.
+    #[test]
+    fn window_placed_for_a_cut_off_subject_settles_within_the_dead_zone() {
+        let mut t = tracker();
+        run(&mut t, 30, |_| Some(subject(400.0, 250.0)));
+        let exact = t.update(Some(subject(400.0, 250.0)), false);
+        // The guess: taller than the subject, so the window is 440 px
+        // wide instead of 400 — 10 % off, inside the 12 % dead zone.
+        let guess = Some(SubjectBox {
+            hh: 107.0,
+            ..subject(400.0, 250.0)
+        });
+        let mut placed = exact;
+        for _ in 0..60 {
+            placed = t.update(guess, true);
+        }
+        assert!(!t.is_gliding());
+        assert!((placed.width - 440.0).abs() < 5.0, "{placed:?}");
+        // Measured in full again: the window must return to the exact fit.
+        let mut last = placed;
+        for _ in 0..120 {
+            last = t.update(Some(subject(400.0, 250.0)), false);
+        }
+        assert!(last.approx_eq(&exact, 1.0), "{last:?} vs {exact:?}");
+        // Settled: jitter inside the dead zone no longer moves it.
+        let (moves, _) = run(&mut t, 120, |i| {
+            Some(subject(
+                400.0 + if i % 2 == 0 { 10.0 } else { -10.0 },
+                250.0,
+            ))
+        });
+        assert_eq!(moves, 0);
     }
 
     #[test]
